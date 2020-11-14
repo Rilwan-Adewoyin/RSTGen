@@ -1,0 +1,4 @@
+#gitignore file for MasteringConversation
+
+#Ignore DataFiles
+[Dd]ataset/
