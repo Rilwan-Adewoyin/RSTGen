@@ -2,3 +2,12 @@
 
 #Ignore DataFiles
 [Dd]ataset/
+rl_conv/pretrain/DialogueAct/combined_data
+rl_conv/pretrain/DialogueAct/MRDA-Corpus
+rl_conv/pretrain/DialogueAct/Switchboard-Corpus
+rl_conv/pretrain/DialogueAct/models
+rl_conv/pretrain/.ipynb_checkpoints
+*bash.exe.stackdump
+*.ipynb
+*temp.py
+*.ipynb_checkpoints
