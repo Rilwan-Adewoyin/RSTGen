@@ -19,7 +19,7 @@ def get_path(_path,_dir=False):
 
 
 def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, tokenizer=False):
-    _dir_transformer = os.path.join( get_path("./models"),model_name )
+    _dir_transformer = os.path.join( get_path("./models"), model_name )
 
     exists = os.path.isdir(_dir_transformer)
 
