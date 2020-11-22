@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ from functools import lru_cache
 
 from typing import List
 
-import numpy as np
+
 
 
 from itertools import cycle, islice
