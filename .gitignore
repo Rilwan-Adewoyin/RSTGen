@@ -14,3 +14,4 @@ rl_conv/pretrain/.ipynb_checkpoints
 *.ipynb_checkpoints
 *_pycache_*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
+rl_conv/pretrain/NLG/dataset_opensubs
