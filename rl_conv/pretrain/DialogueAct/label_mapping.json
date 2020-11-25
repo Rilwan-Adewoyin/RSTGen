@@ -205,7 +205,8 @@
         },
         "removed":["Interrupted-Abandoned-Uninterpretable", 
             "Hold-Before-Answer-Agreement","3rd-party-talk",
-            "Self-talk","Continuer","Mimic-Other","Floor-Holder"]
+            "Self-talk","Continuer","Mimic-Other","Floor-Holder",
+            "other","Humorous-Material"]
     },
 
     "MCONV":{

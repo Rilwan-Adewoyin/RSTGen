@@ -1,4 +1,8 @@
 import numpy as np
+import warnings
+import sklearn
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +16,7 @@ from functools import lru_cache
 
 from typing import List
 
-
+import pickle
 
 
 from itertools import cycle, islice
@@ -22,7 +26,11 @@ from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 
 import pytorch_lightning as pl
+
+
+
 from sklearn import preprocessing as sklp
+
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -32,6 +40,8 @@ import random
 
 import gc
 from pytorch_lightning import loggers as pl_loggers
+
+#from pytorch_lightning.loggers import TensorBoardLogger
 
 class Mish(nn.Module):
     def __init__(self):
@@ -47,6 +57,7 @@ class TrainingModule(pl.LightningModule):
                     model, context_history_len,
                     learning_rate,
                     warmup_proportion,
+                    workers,
                     **kwargs):
         super().__init__()
 
@@ -62,22 +73,22 @@ class TrainingModule(pl.LightningModule):
             'max_epochs', 'context_history_len', 'learning_rate',
             'warmup_proportion')
         self.save_hyperparameters(model.return_params())
-
+        self.workers = workers
         self.model = model
         
         self.loss = nn.BCEWithLogitsLoss()
         self.dict_acc = {
-            k:pl.metrics.classification.Accuracy() for k in ["train",
+            k:pl.metrics.classification.Accuracy( ) for k in ["train",
                 "val","test"] }
         self.dict_prec = {
-            k:pl.metrics.classification.Precision() for k in ["train",
+            k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in ["train",
                 "val","test"] }
         self.dict_recall =  {
-            k:pl.metrics.classification.Recall() for k in ["train",
+            k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
                 "val","test"] }
                 
 
-        self.create_data_loaders()
+        self.create_data_loaders(self.workers)
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
@@ -85,48 +96,63 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--config_file', default=None, help="Path to the \
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
-        parser.add_argument('--gpus', default=None)
-        parser.add_argument('--max_epochs', default=30)
-        parser.add_argument('--accumulate_grad_batches', default=1)
-        parser.add_argument('--context_history_len', default=1)
-        parser.add_argument('--batch_size', default=2)
-        parser.add_argument('--learning_rate', default=1e-4)
+        #parser.add_argument('--gpus', default=None)
+        parser.add_argument('--max_epochs', default=50, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--context_history_len', default=1, type=int)
+        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('--learning_rate', default=1e-3)
         parser.add_argument('--warmup_proportion', default=0.15)
-        #parser.add_argument('--')
+        parser.add_argument('--workers', default=0, type=int)
+        parser.add_argument('--gpus', default=0, type=int)
+        parser.add_argument('--test_only',default=False, type=bool)
+        parser.add_argument('--version_name', default='', required=False)
         #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
-        tparams = parser.parse_args()
+        tparams = parser.parse_known_args()[0]
         if tparams.config_file != None:
-            tparams = json.load(open(utils.get_path(path)),"r" )
+            tparams = json.load(open(utils.get_path(tparams.config_file)),"r" )
 
         return tparams
 
     def step(self, batch, step_name="train"):
         target = batch.pop('da')
+       
         input_= batch
-
         output = self.forward(input_)
-        loss = self.loss( output, target)
+
+        keep_mask = torch.sum(target, dim=1, dtype=bool )
         
+        target = target[keep_mask]
+        output = output[keep_mask]
+
+        
+        loss = self.loss( output, target)
         loss_key = f"{step_name}_loss"
         
-        self.log(loss_key, loss, True)
-        self.dict_acc[step_name](output, target)
-        self.dict_prec[step_name](output, target)
-        self.dict_recall[step_name](output, target)
+        
+        output =  output.to('cpu')
+        target  = target.to('cpu')
+
+        self.dict_acc[step_name].update(output, target )
+        self.dict_prec[step_name].update(output, target)
+        self.dict_recall[step_name].update(output, target)
         
         if step_name == 'train':
-            self.log(f'{step_name}_acc', self.dict_acc[step_name], on_step=True, on_epoch=False)
-            self.log(f'{step_name}_rec', self.dict_recall[step_name], on_step=True, on_epoch=False)
-            self.log(f'{step_name}_prec', self.dict_prec[step_name], on_step=True, on_epoch=False)
+            self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=True, on_epoch=False)
+            self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=True, on_epoch=False)
+            self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=True, on_epoch=False)
             
-            return  { "loss": loss }
+            return  { "loss": loss }#, f'rec':self.dict_recall[step_name].compute() , f'prec':self.dict_prec[step_name].compute() }
         
         else:
-            self.log(f'{step_name}_acc', self.dict_acc[step_name], on_step=False, on_epoch=True)
-            self.log(f'{step_name}_rec', self.dict_recall[step_name], on_step=False, on_epoch=True)
-            self.log(f'{step_name}_prec', self.dict_prec[step_name], on_step=False, on_epoch=True)
-            return {loss_key: loss}
+            #self.log(loss_key, loss, False, True)
+
+            self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=False, on_epoch=True)
+            self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=False, on_epoch=True)
+            self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=False, on_epoch=True)
+
+            return {loss_key: loss} #, f'{step_name}_rec':self.dict_recall[step_name].compute() , f'{step_name}_prec':self.dict_prec[step_name].compute() }
         #return self.log(loss_key, loss, on_step=True, on_epoch=True, prog_bar=True, 'log':tensorboard_logs)
 
     def forward(self, input_, *args):
@@ -140,6 +166,9 @@ class TrainingModule(pl.LightningModule):
 
     def validation_epoch_end(self, outputs: List[dict]):
         loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+
+        #TODO: Implement varied batch sizing
+    
         self.log("val_loss", loss)
     
     def test_step(self, batch, batch_idx):
@@ -149,14 +178,14 @@ class TrainingModule(pl.LightningModule):
         loss = torch.stack([x["test_loss"] for x in outputs]).mean()
         self.log("test_loss", loss)
 
-    def create_data_loaders(self, shuffle=False):
+    def create_data_loaders(self, shuffle=False, **kwargs):
         dir_train_set = os.path.join(self.dir_data,"train") #"./combined_data/train/"
         dir_val_set = os.path.join(self.dir_data,"val")
         dir_val_set = os.path.join(self.dir_data,"test")
-        batch_size = 2
+        
 
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
-            dir_val_set, batch_size, self.model.tokenizer )
+            dir_val_set, self.batch_size, self.model.tokenizer, workers=self.workers)
         
         self.train_dl, self.val_dl, self.test_dl = dg()
 
@@ -201,6 +230,12 @@ class TrainingModule(pl.LightningModule):
 
         return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
+    def get_progress_bar_dict(self):
+        # don't show the version number
+        items = super().get_progress_bar_dict()
+        items.pop("v_num", None)
+        return items
+
 class DaNet(nn.Module):
     """Transformer Based Model for DA classfication Task
     """
@@ -210,7 +245,8 @@ class DaNet(nn.Module):
 
         super(DaNet, self).__init__()
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
-        D_in, H, D_out = 768, 50, 12
+        #D_in, H, D_out = 768, 50, 12 #transformer frozer
+        D_in, H, D_out = 768, 56, 12
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
@@ -226,10 +262,13 @@ class DaNet(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Dropout(self.dropout),
-            nn.Linear(D_in, H),
+            nn.Linear(D_in, int(H*2) ),
             Mish(),
             nn.Dropout(self.dropout),
-            nn.Linear(H, D_out)
+            nn.Linear(int(H*2), int(H//2) ),
+            Mish(),
+            nn.Dropout(self.dropout),
+            nn.Linear(int(H//2), D_out)
         )
         
         for layer in self.classifier:
@@ -246,14 +285,14 @@ class DaNet(nn.Module):
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
-        parser.add_argument('--dropout', default=0.05, required=False, help="dropout")
-        parser.add_argument('--freeze_transformer', default=True, required=False)
+        parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
+        parser.add_argument('--freeze_transformer', default=True, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
             mparams = json.load(open(utils.get_path(path)),"r" )
-
+        
         return mparams
 
     def forward(self, input_, *args):
@@ -378,7 +417,13 @@ class SingleDataset(torch.utils.data.Dataset):
         speaker, utterances, da = datum.T.values
         
         encoded_input = self.encode_tokenize( utterances.tolist() )
-        binarized_target = self.target_binarizer.transform( [ da[-1].split() ] )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                binarized_target = self.target_binarizer.transform( [ da[-1].split(" ") ] )
+        except AttributeError as e:
+            binarized_target = np.zeros((1,12))
+
 
         map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
         return map_datum
@@ -396,48 +441,76 @@ def main(tparams, mparams):
     gc.collect()
     torch.cuda.empty_cache()
 
-    version_name = utils.get_version_name(mparams.model_name)
-    utils.save_version_params(tparams, mparams, version_name )
-    
-    # Setting up callbacks and loggers
-    early_stop_callback = EarlyStopping(
-        monitor='val_loss',
-        min_delta=0.00,
-        patience=5,
-        verbose=False,
-        mode='auto'
-    )
-    checkpoint_callback = ModelCheckpoint(monitor='val_loss',save_top_k=3, mode='min', 
-        dirpath=utils.get_path(f'./models/{version_name}/logs') )
-
-    tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{version_name}/logs'))
-    
+    tparams.version_name =  tparams.version_name if tparams.version_name!= '' else utils.get_version_name(mparams.model_name)
+    utils.save_version_params(tparams, mparams, tparams.version_name )
+    model_dir = utils.get_path(f'./models/{tparams.version_name}')
+    checkpoint_dir = f'{model_dir}/logs'
     # Setting up model, training_module and Trainer
+
+
+    if tparams.version_name != "":
+        checkpoint_path = utils.get_best_ckpt_path(checkpoint_dir)
+        mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
+        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
+    
     danet = DaNet(**vars(mparams))
+    
+    tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{tparams.version_name}/logs'))
 
-    training_module = TrainingModule(**vars(tparams), model=danet )
-    #training_module.save_hyperparameters(vars(mparams))
+    if tparams.test_only:
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+        training_module = TrainingModule(**vars(tparams), model=danet )
+        training_module.load_state_dict(checkpoint['state_dict'])
+                
+                
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=5,
+                    check_val_every_n_epoch=1, logger=tb_logger,
+                    default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
+                    precision=16,
+                    #fast_dev_run=True, 
+                    #log_gpu_memory=True
+                    )
 
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=5,
-                     callbacks=[early_stop_callback,checkpoint_callback],
-                     check_val_every_n_epoch=1, logger=tb_logger,
-                     default_root_dir=utils.get_path(f"./models/{version_name}"),
-                     fast_dev_run=True, 
-                     #log_gpu_memory=True
-                     )
+        training_module.eval() 
+        training_module.freeze() 
+        #trainer.ckpt_path = checkpoint_path
+        #trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
+        trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
 
-    trainer.fit(training_module)
-    trainer.test()
+    
+    else:
+        training_module = TrainingModule(**vars(tparams), model=danet )
+            # Setting up callbacks and loggers
+        early_stop_callback = EarlyStopping(
+            monitor='val_loss',
+            min_delta=0.00,
+            patience=5,
+            verbose=False,
+            mode='auto'
+        )
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss',save_top_k=3, mode='min', 
+        dirpath=checkpoint_dir )
+
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=5,
+                        callbacks=[early_stop_callback,checkpoint_callback],
+                        check_val_every_n_epoch=1, logger=tb_logger,
+                        default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
+                        precision=16,
+                        #fast_dev_run=True, 
+                        #log_gpu_memory=True
+                        )
+
+    
+        trainer.fit(training_module)
+        trainer.test(test_dataloaders=training_module.test_dl )
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     #parent_parser2 = argparse.ArgumentParser(add_help=False)    
     
-    parser_program = parent_parser.add_argument_group("program")
+    #parser_program = parent_parser.add_argument_group("program")
 
     # add PROGRAM level args
-    #parser_program.add_argument('--conda_env', type=str, default='some_name')
-    #parser_program.add_argument('--notification_email', type=str, default='johnsmith@email.com')
     
     # add model specific args
     mparams = DaNet.parse_model_specific_args(parent_parser)

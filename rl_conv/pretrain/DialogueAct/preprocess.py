@@ -53,12 +53,12 @@ def parse_args(argv=None):
 
     parser.add_argument(
         "--dir_mrda",
-        default= utils.get_file_path("MRDA-Corpus/mrda_data"), type=str,
+        default= utils.get_path("MRDA-Corpus/mrda_data"), type=str,
         help="The directory for MRDA data")
     
     parser.add_argument(
         "--dir_swda",
-        default= utils.get_file_path("Switchboard-Corpus/swda_data"), type=str,
+        default= utils.get_path("Switchboard-Corpus/swda_data"), type=str,
         help="The directory for MRDA data")
 
     # parser.add_argument(
@@ -73,7 +73,7 @@ def parse_args(argv=None):
 
     parser.add_argument(
         "--output_dir", required=False,
-        default= utils.get_file_path("combined_data/"),
+        default= utils.get_path("combined_data/"),
         help="Output directory to write the dataset.")
 
     # parser.add_argument(
@@ -128,7 +128,7 @@ def preprocess(args, str_subset):
     li_fns_mrda = _get_fns( os.path.join(dir_mrda_dset,"*") ) # [fn for fn in glob.glob(pattern) ]
     li_fns_swda = _get_fns( os.path.join(dir_swda_dset,"*") ) # [fn for fn in glob.glob(pattern) ]
 
-    dict_da_map = json.load( open(utils.get_file_path("label_mapping.json"),"r") )
+    dict_da_map = json.load( open(utils.get_path("label_mapping.json"),"r") )
     
         
     dataset_names = ['MRDA','SWDB-DAMSL']
@@ -191,6 +191,10 @@ def _annotate_dialog_act(df_conv, ds_name, dict_da_map):
         _li = sum( [ dict_da_map[ds_name]['MCONV'][word] for word in da.split() ], [])
         _set = set(_li)
         _set = sorted(_set)
+
+        if "other" in _set:
+            a = 1
+
         _str = " ".join(_set)
         return _str
 
