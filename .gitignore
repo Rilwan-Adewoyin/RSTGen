@@ -18,3 +18,4 @@ rl_conv/pretrain/NLG/dataset_opensubs
 *vscode/*
 *src*
 rl_conv/pretrain/DialogueAct/log
+.vscode/launch.json

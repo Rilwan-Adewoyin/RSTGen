@@ -77,7 +77,7 @@ def get_best_ckpt_path(dir_path):
 
     li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
 
-    li_versions = [ int(fname[-7:-5]) for fname in li_files ]
+    li_versions = [ int(fname[6:9]) for fname in li_files ]
 
     index = li_versions.index( max(li_versions) )
 

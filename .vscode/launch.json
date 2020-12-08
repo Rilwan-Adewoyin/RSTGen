@@ -4,12 +4,31 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+        
         {
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: testing DaNet train",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": ["--workers","0", "--gpus","1", "--batch_size","400","--freeze_transformer","True", "--version_name","DaNet_v003","--test_only","True"]
+
+        },
+        {
+            "name": "Python: testing DaNet train 1",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": ["--workers","0", "--gpus","1", "--batch_size","400","--freeze_transformer","True","--mode","train_new"]
+
         }
     ]
 }
