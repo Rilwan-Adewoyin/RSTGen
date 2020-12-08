@@ -9,8 +9,13 @@ import train
 import pytorch_lightning as pl
 import emoji
 from transformers import AutoTokenizer, AutoModel
+import docker
 
-def main(checkpoint_path,**kwargs):
+def main(checkpoint_path, 
+            danet_vname,
+            
+            rst_method,
+            **kwargs):
 
     # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
@@ -38,7 +43,7 @@ def main(checkpoint_path,**kwargs):
     li_id_dictconv = random.shuffle(li_id_dictconv )
     
     # setting up model for Da prediction
-    danet_version_name =  'DaNet_v003'
+    danet_version_name =  danet_vname #'DaNet_v003'
     model_dir = utils.get_path(f'../DialogueAct/models/{tparams.version_name}')
     checkpoint_dir = f'{model_dir}/logs'
 
@@ -51,9 +56,40 @@ def main(checkpoint_path,**kwargs):
     torch.set_grad_enabled(False)
     tokenizer = AutoTokenizer.from_pretrained('../DialogueAct/models/bert-base-cased')
 
+    os.system('docker build -t C:\\Users\Rilwa\01_Mcv\RST_FH_service\akanni-feng-hirst-service .') #change to build from a docker link
+    os.system('docker run -it --rm ubuntu bash') 
 
-    # Use the mp workers here
+    # setting up docker image for rst
+    client = docker.from_env(timeout=int(60*60))
+    dir_docker_images =  utils1.get_path("../DockerImages",_dir=True)
+    image_name = akanni-feng-hirst-parser
 
+    image_list = client.images.list()
+
+        # (building)docker image
+    #TODO: fix naming strategy
+    if image_name not in image_name_list:
+        image = client.images.pull("akanni96/feng-hirst-parser")
+    else:
+        image = client.images.get(image_name)
+    
+        #(building) docker container
+    container_list = client.containers.list():
+    
+        
+        #TODO: Need to spin up a container per multi-process so maybe dont do it this way
+    entrypoint=
+    command =
+    container  = client.containers.create(image_name, entrypoint= ,command= )
+        
+    # output type of this docker env: trees.parse_tree.ParseTree, Tree.fromstring(str)
+    client.containers.prune()
+
+    # Use the mp workers at different stages, so for rst and entity selection but not da
+
+    
+    
+    #region DA assignment
     for id_dictconv  in li_id_dictconv:
         conv_id  = id_dictconv[0]
         dictconv = id_dictconv[1]
@@ -78,24 +114,19 @@ def main(checkpoint_path,**kwargs):
             'speaker_id':utt.speaker.id
             } for utt in a_conv.get_chronological_utterance_list()]
         
-        # Add Dialog Acts
-            # Preprocess each utterance -> txt_preproc
+
+        # 1) Preprocess each utterance -> txt_preproc
         li_thread_utterances = [
             _dict.update({'txt_preproc':_preprocess(_dict.txt)}) for _dict in 
             li_thread_utterances
         ]
-        
-        #     # Tokenize each utterance -> txt_tokenize
-        #     # drop preproc
-        # li_thread_utterances = [
-        #     _dict.update( {'text_tokenize': tokenizer(_dict.txt_preproc) } ) for _dict in 
-        #     li_thread_utterances
-        ]
 
-        # Get a list of each txt_tokenize and its preceeding txt_tokenize
-        # Feed to model
+        # 2) Predicting Dialog Act
+
+            # Get a list of utterance and its preceeding utterance
         def select_utt_by_reply(reply_to_id, li_thread_utterances ):
-            prev_utterance = next(_dict['txt_preproc'] for _dict in li_thread_utterances 
+            prev_utterance = next(_dict['txt_preproc'] for 
+                _dict in li_thread_utterances 
                 if _dict['speakder_id'] == reply_to_id )
             
             return prev_utterance
@@ -105,13 +136,27 @@ def main(checkpoint_path,**kwargs):
             for _dict in li_thread_utterances
         ]
 
-        #here
-        _input =  tokenizer(li_utt+prevutt)
         
-        DaNet_module.forward()
+        tknzd_seqs =  tokenizer(li_utt_prevutt)
+        pred_das = DaNet_module.forward(tknzd_seqs, output_mode = "class names") 
+            #right now - logit scores for the probability of each class
+            #TODO- add output_mode options to DaNet module. should be a list of 
 
-        # remove repeated consecutive words in utterance
+        li_thread_utterances = [
+            _dict.update({'da': pred }) for _dict in 
+            zip( li_thread_utterances, pred_das)
+        ]
+    #endregion
 
+    # 3) Predicting the RST Tag
+    for id_dictconv  in li_id_dictconv:
+
+        if rst_method == "feng-hirst":
+            
+            
+            
+            
+        elif rst_method == "akanni":
 
 
 
@@ -128,9 +173,6 @@ def main(checkpoint_path,**kwargs):
 
         # Save them to files
             # format = subreddit/
-
-
-
 
 def load_data():
     # Donwload reddit-corpus-small if it doesnt exist
@@ -179,6 +221,8 @@ if __name__ == '__main__':
     #parent_parser2 = argparse.ArgumentParser(add_help=False)    
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
+
+
     parser.add_argument('--checkpoint_path', default=None, help="Path to the \
         DA model checkpoint file)" )        
 
