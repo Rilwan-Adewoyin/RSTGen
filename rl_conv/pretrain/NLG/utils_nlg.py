@@ -1,6 +1,6 @@
 import os
 import json
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 dirname = os.path.dirname(__file__)
 from datetime import date
 import glob
@@ -22,6 +22,7 @@ def get_path(_path,_dir=False):
     return _path
 
 
+
 def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, tokenizer=False):
     _dir_transformer = os.path.join( get_path("./models"), model_name )
 
@@ -31,7 +32,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
 
     if exists == False:    
         model_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
         
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
@@ -59,29 +60,3 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     json.dump( vars(m_params), open(mp_fp,"w") )
 
     return True    
-
-def get_version_name(model_name):
-    _dir_models = get_path("./models")
-    li_modelversions = glob.glob( os.path.join(_dir_models,model_name+"_v*") )
-
-    li_versioncodes = [ int(modelversion[-3:]) for modelversion in li_modelversions ]
-    
-    new_version_code = max( li_versioncodes, default=-1 ) + 1
-
-    new_version_name = f"{model_name}_v{str(new_version_code).zfill(3)}" 
-
-    return new_version_name 
-
-
-def get_best_ckpt_path(dir_path):
-    dir_path = get_path(dir_path)
-
-    li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
-
-    li_versions = [ re.findall( r"epoch=[\d]{3}" ,fname)[0][-3:] for fname in li_files ]
-
-    index = li_versions.index( max(li_versions) )
-
-    ckpt_path = li_files[index]
-
-    return ckpt_path

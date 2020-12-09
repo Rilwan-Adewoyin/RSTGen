@@ -17,7 +17,6 @@ from typing import List
 
 import pickle
 
-from itertools import chain
 
 from itertools import cycle, islice
 from torch.utils.data._utils.collate import default_convert, default_collate
@@ -33,15 +32,17 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 import argparse
-import utils
+import utils_nlg as utils
 import random 
 
-import gc
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
 
-#from pytorch_lightning.loggers import TensorBoardLogger
+
+#TODO:
+# Write DataLoader
+# Writer New Model 
 
 class Mish(nn.Module):
     def __init__(self):
@@ -51,17 +52,15 @@ class Mish(nn.Module):
         return input_ * torch.tanh(F.softplus(input_))
 
 
-class DaNet(nn.Module):
-    """Transformer Based Model for DA classfication Task
+class NLG(nn.Module):
+    """NLG unit
     """
 
-    def __init__(self, freeze_transformer=True, dropout=0.1, 
-        base_model_name='bert-base-cased', model_name="DaNet", **kwargs):
+    def __init__(self, freeze_transformer=False, dropout=0.1, 
+        base_model_name='microsoft/DialoGPT-small', model_name="NLG", **kwargs):
 
-        super(DaNet, self).__init__()
-        # Specify hidden size of BERT, hidden size of our classifier, and number of labels
-        #D_in, H, D_out = 768, 50, 12 #transformer frozer
-        D_in, H, D_out = 768, 56, 12
+        super(NLG, self).__init__()
+
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
@@ -74,24 +73,12 @@ class DaNet(nn.Module):
         if self.freeze_transformer:
             for param in self.transformer.parameters():
                 param.requires_grad = False
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(self.dropout),
-            nn.Linear(D_in, int(H*2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H*2), int(H//2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H//2), D_out),
-            #nn.Sigmoid()
-        )
         
-        for layer in self.classifier:
-            if isinstance(layer, nn.Linear):
-                layer.weight.data.normal_(mean=0.0, std=0.02)
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
+        # for layer in self.classifier:
+        #     if isinstance(layer, nn.Linear):
+        #         layer.weight.data.normal_(mean=0.0, std=0.02)
+        #         if layer.bias is not None:
+        #             layer.bias.data.zero_()
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -100,10 +87,10 @@ class DaNet(nn.Module):
         parser.add_argument('--config_file', default=None, help="Path to the \
             training hyperameters for this model ")
         
-        parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
+        parser.add_argument('--base_model_name', default='microsoft/DialoGPT-small', required=False)
         parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
-        parser.add_argument('--freeze_transformer', default=True, required=False, type=bool)
-        parser.add_argument('--model_name', default='DaNet', required=False)
+        parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
+        parser.add_argument('--model_name', default='NLG', required=False)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
@@ -129,20 +116,16 @@ class DaNet(nn.Module):
         """
         #input_ids, attention_mask, token_type_ids = input_
         input_ids = torch.squeeze(input_['input_ids'])
-        attention_mask = torch.squeeze(input_['attention_mask'])
-        token_type_ids = torch.squeeze(input_['token_type_ids'])
+        attention_mask = torch.squeeze(input_['attention_mask']) #
+        token_type_ids = torch.squeeze(input_['token_type_ids']) #extend to rst, da, topics, [prev topic vectors, prev rst topics]
+        #TODO: add new two new tokens, one after rst and one after da, topics
 
-        # Feed input to BERT
+
+        # Feed input to small DialoGPT
         outputs = self.transformer(input_ids=input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids)
         
-        # Extract the last hidden state of the token `[CLS]` for classification task
-        last_hidden_state_cls = outputs[0][:, 0, :]
-        #cls_for_nsp = outputs[1][:, 0, :]
-
-        # Feed input to classifier to compute logits
-        logits = self.classifier(last_hidden_state_cls)
 
         return logits
 
@@ -156,12 +139,11 @@ class DaNet(nn.Module):
 
 class TrainingModule(pl.LightningModule):
 
-    def __init__(self, model=DaNet(), batch_size=20, 
+    def __init__(self, model=NLG(), batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
                     max_epochs=100,
                     gpus=1, 
-                    context_history_len=1,
                     learning_rate=1e-3,
                     warmup_proportion=0.1,
                     workers=1,
@@ -172,30 +154,19 @@ class TrainingModule(pl.LightningModule):
         super().__init__()
 
         self.batch_size = batch_size
-        
-
         self.gpus =  gpus
-        
-        self.context_history_len = context_history_len
-        
-        
         self.save_hyperparameters('batch_size', 'accumulate_grad_batches', 
-            'max_epochs', 'context_history_len', 'learning_rate',
+            'max_epochs', 'learning_rate',
             'warmup_proportion')
         
         self.model = model
         self.mode = mode
-
-        
         self.workers = workers
-        
-        self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
+        #self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
                 
         if self.mode in ['train_new','train_cont','test']:
             self.max_epochs = max_epochs
-
             self.warmup_proportion = warmup_proportion
-
             self.lr_schedule = lr_schedule
         
             self.loss = nn.BCEWithLogitsLoss()
@@ -210,18 +181,18 @@ class TrainingModule(pl.LightningModule):
 
             self.accumulate_grad_batches = accumulate_grad_batches
 
-            self.dict_acc = {
-                k:pl.metrics.classification.Accuracy( ) for k in ["train",
-                    "val","test"] }
-            self.dict_acc_micro = {
-                k:pl.metrics.classification.Accuracy( ) for k in ["train",
-                    "val","test"] }
-            self.dict_prec = {
-                k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in ["train",
-                    "val","test"] }
-            self.dict_recall =  {
-                k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
-                    "val","test"] }
+            # self.dict_acc = {
+            #     k:pl.metrics.classification.Accuracy( ) for k in ["train",
+            #         "val","test"] }
+            # self.dict_acc_micro = {
+            #     k:pl.metrics.classification.Accuracy( ) for k in ["train",
+            #         "val","test"] }
+            # self.dict_prec = {
+            #     k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in ["train",
+            #         "val","test"] }
+            # self.dict_recall =  {
+            #     k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
+            #         "val","test"] }
                     
 
         
@@ -628,3 +599,5 @@ if __name__ == '__main__':
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
     main(tparams, mparams)
+
+

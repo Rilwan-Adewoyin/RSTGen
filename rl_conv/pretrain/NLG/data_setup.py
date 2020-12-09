@@ -1,13 +1,21 @@
-import sys
-sys.path.append("DialogueAct") # Adds higher directory to python modules path
+# -*- coding: utf-8 -*-
+import sys, os
+#sys.stdout = codecs.getwriter(encoding)(sys.stdout)
+os.environ["PYTHONIOENCODING"] = 'utf_8'
+# sys.setdefaultencoding('utf-8')
+#setx PYTHONENCODING=utf-8
+import convokit
+from convokit.model import ConvoKitMeta
+sys.path.append(os.path.dirname(sys.path[0])) # Adds higher directory to python modules path
+sys.path.append( os.path.join( os.path.dirname(sys.path[0]),"DialogueAct" ) ) 
 import numpy
 import os
 import convokit
 from convokit import Corpus, download
 import argparse
-import utils
+import utils_nlg
 import random
-from DialogueAct.train import TrainingModule
+from train import TrainingModule, DaNet
 import pytorch_lightning as pl
 import emoji
 from transformers import AutoTokenizer, AutoModel
@@ -18,7 +26,7 @@ import itertools
 import nltk
 nltk.download('stopwords')
 import rake_nltk
-
+import json
 import pytextrank
 import spacy
 import en_core_web_sm
@@ -27,8 +35,14 @@ tr = pytextrank.TextRank()
 nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
 
 import csv
+import pickle
 
-from DialogueAct.utils import get_best_ckpt_path
+import torch
+
+from utils import get_best_ckpt_path
+from utils import get_path
+
+import regex as re
 
 # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
@@ -63,49 +77,71 @@ def main(danet_vname,
         rst_method (str, optional): [description]. Defaults to "feng-hirst".
     """
     
-    #region Setup
-    corpus = _load_data()
-
-    li_id_dictconv  = list(corpus.conversations.items())
-    #li_id_dictconv = random.shuffle(li_id_dictconv )
-    
+    #region  Setup    
     # setting up model for Da prediction
-    danet_version_name =  danet_vname 
-    model_dir = utils.get_path(f'../DialogueAct/models/{tparams.version_name}')
+    model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
     checkpoint_dir = f'{model_dir}/logs'
 
     checkpoint_path = get_best_ckpt_path(checkpoint_dir) #TOdO: need to insert changes from da branch into nlg branch
+    
+    if torch.cuda.is_available():
+        checkpoint = torch.load(checkpoint_path)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    
+    # init_params = checkpoint['hyper_parameters']
+    # init_params.pop('mode')
     mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
     tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
 
-    DaNet_module = TrainingModule.load_from_checkpoint( utils.get_path(checkpoint_path) )
-    DaNet_module.eval()    
-    torch.set_grad_enabled(False)
-    tokenizer = AutoTokenizer.from_pretrained('../DialogueAct/models/bert-base-cased')
+    danet = DaNet(**vars(mparams))
 
-    os.system('docker build -t C:\\Users\Rilwa\01_Mcv\RST_FH_service\akanni-feng-hirst-service .') #TODO:change to build from a docker link
-    os.system('docker run -it --rm ubuntu bash') 
+    # danet_module = TrainingModule( resume_from_checkpoint=utils_nlg.get_path(checkpoint_path)
+    #                 , mode='inference' ) #model=danet,
+    
+    danet_module = TrainingModule(mode='inference', model=danet)
+    danet_module.load_state_dict(checkpoint['state_dict'] )
+
+    # danet_module = TrainingModule.load( resume_from_checkpoint=utils_nlg.get_path(checkpoint_path), 
+    #                 model=DaNet, mode='inference', )
+    danet_module.eval()
+    danet_module.model.eval()
+    torch.set_grad_enabled(False)
+    tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
+
+    # os.system('docker build -t C:\\Users\Rilwa\01_Mcv\RST_FH_service\akanni-feng-hirst-service .') #TODO:change to build from a docker link
+    # os.system('docker run -it --rm ubuntu bash') 
 
     # setting up docker image for rst
     client = docker.from_env(timeout=int(60*60))
-    dir_docker_images =  utils.get_path("../DockerImages",_dir=True)
-    image_name = 'akanni96/feng-hirst-parser'
-
-    image_li = client.images.list('akanni96/feng-hirst-rst-parser')[0]
+    #
+    dir_path =  utils_nlg.get_path("../DockerImages",_dir=True)
+    image_name = 'akanni96/feng-hirst-rst-parser'
+    image_li = client.images.list('akanni96/feng-hirst-rst-parser')
     
         # (building)docker image
     if len(image_li)==0: 
-        image = client.images.pull(image_name)
+        #image = client.images.pull(image_name)
+        image = client.images.build(path=os.path.abspath(r"..\..\..\..\RST_FH"),
+            nocache=True, pull=True, rm=True,
+            tag="akanni96/feng-hirst-rst-parser")[0]
+        #image = client.images.build(utils.get_path("..\"))
     else:
         image = client.images.get(image_name)
     
-        #saving directory
-        dir_save_dataset = utils.get_path("./dataset/reddit_small_mc")
+    #Creating Save directory
+    dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_mc",_dir=True)
+    
+    # setting up corpus data
+    if os.path.isfile("./_temp_li_id_dictconv.pkl"):
+        li_id_dictconv = pickle.load( open("./_temp_li_id_dictconv.pkl","rb") )
+    else:
+        corpus = _load_data()
+        li_id_dictconv  = list(corpus.conversations.items())
+        #pickle.dump( li_id_dictconv[:200], open("_temp_li_id_dictconv.pkl","wb") )
     # endregion
     
     #region operating in batches
-        # Use the mp workers at different stages, so for rst and entity selection but not da
-        # TODO - Add method of incrementally saving li_thread_utterances
     while len(li_id_dictconv) > 0:
         
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
@@ -116,20 +152,21 @@ def main(danet_vname,
             conv_id  = id_dictconv[0]
             dictconv = id_dictconv[1]
             tree_conv_paths = dictconv.get_root_to_leaf_paths() 
-            paths_count = len(paths)
+            paths_count = len(tree_conv_paths)
 
             # Gathering utterances in thread
             li_thread_utterances = [
-                {'text': utt.text, 'subreddit':utt.subreddit,
+                {'text': utt.text, 'subreddit':utt.meta['subreddit'],
                 'reply_to':utt.reply_to, 'id_utt':utt.id,
                 'speaker_id':utt.speaker.id
-                } for utt in a_conv.get_chronological_utterance_list()]
+                } for utt in dictconv.get_chronological_utterance_list()]
             
             # Preprocess each utterance -> txt_preproc
-            li_thread_utterances = [
-                _dict.update({'txt_preproc':_preprocess(_dict.txt)}) for _dict in 
+            [
+                _dict.update({'txt_preproc':_preprocess(_dict['text'])}) for _dict in 
                 li_thread_utterances]
             batch_li_li_thread_utterances.append(li_thread_utterances)
+            
         #endregion
         
         #region DA assignment
@@ -142,25 +179,32 @@ def main(danet_vname,
                 for _dict in li_thread_utterances
             ]
 
-            tknzd_seqs =  tokenizer(li_utt_prevutt)
-            pred_das = DaNet_module.forward(tknzd_seqs, output_mode = "class names") 
-                #sequence of vectors, vector=logit score for each da class
-            pred_das = pred_das.tolist()
+            encoded_input =  tokenizer(li_utt_prevutt, add_special_tokens=True, padding='max_length', 
+            truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True)
             
+            pred_da = danet_module.forward(encoded_input)
+            li_li_da, li_dict_da = danet_module.format_preds(pred_da)
+            
+                #sequence of vectors, vector=logit score for each da class
+            #pred_das = pred_das.tolist()
+            
+            #TODO consider removing dialogues that 'reply_to'==None
 
-            li_thread_utterances = [
-                _dict.update({'da': da }) for _dict, da in 
-                zip( li_thread_utterances, pred_das)
+            [
+                _dict.update({'li_da': li_da,'dict_da':dict_da }) for _dict, li_da, dict_da in 
+                zip( li_thread_utterances, li_li_da, li_dict_da)
             ]
 
             batch_li_li_thread_utterances[i] = li_thread_utterances
+                #results for dialog acts imply model is not being loaded in properly
         #endregion
 
         #region Predicting the RST Tag
         if rst_method == "feng-hirst":
             # multiprocessing use here
-            fh_container  = client.containers.run(image_name, detach=True, stream=False, socket=False)
-            logs = fh_container.attach
+            fh_container  = client.containers.run(image, detach=True, 
+                entrypoint=None,command="/bin/bash",auto_remove=True,tty=True)    
+            
 
             for i, _ in enumerate(batch_li_li_thread_utterances):
                 li_thread_utterances = batch_li_li_thread_utterances[i]
@@ -171,22 +215,24 @@ def main(danet_vname,
                     #       'da':
                     #     }
 
-                li_utterance  = [ thread_utt.txt_preproc for thread_utt in li_thread_utterances ]
+                li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]
                 json_li_utterance = json.dumps(li_utterance)
                 
                 #response = fh_container.run( entrypoint=entrypoint, command=command )
                 cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
-                exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, demux=True) #stream=False,  )
+                exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
+                                    demux=True) #stream=False,  )
                 stdout, stderr = output
+                stdout = str(stdout,'utf-8')
 
                 li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in json.loads(stdout) ] 
 
                 # Creating two versions of the li_rst_methods
                 li_rst_dict = [ _tree_to_rst_code(_tree, method=0) for _tree in li_trees ]
 
-                li_thread_utterances = [
-                    _dict.update(rst_dict) for thread_utterance, rst_dict in 
-                    zip( li_thread_utterances, li_rst_dicts)
+                [
+                    thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
+                    zip( li_thread_utterances, li_rst_dict)
                 ]
 
                 batch_li_li_thread_utterances[i] = li_thread_utterances
@@ -203,28 +249,39 @@ def main(danet_vname,
         for i, _ in enumerate(batch_li_li_thread_utterances):
             li_thread_utterances = batch_li_li_thread_utterances[i]
 
-            li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance.txt_preproc),
-                                        'topic_textrank':_textrank_extractor(thread_utterance.txt_preproc)}
+            li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
+                                        'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
                     for thread_utterance in li_thread_utterances]
 
-            li_thread_utterances = [
-                _dict.update(dict_kw) for thread_utterance, dict_kw in 
+            [
+                thread_utterance.update(dict_kw) for thread_utterance, dict_kw in 
                 zip( li_thread_utterances, li_rakekw_textankkw)
             ]
 
             batch_li_li_thread_utterances[i] = li_thread_utterances
         #endregion
 
+        # region Drop keys
+        for i, _ in enumerate(batch_li_li_thread_utterances):
+            li_thread_utterances = batch_li_li_thread_utterances[i]
+            for idx in range(len(li_thread_utterances)):
+                li_thread_utterances[idx].pop('reply_to')
+            
+            batch_li_li_thread_utterances[i] = li_thread_utterances
+        # end region
+
         #region Saving Batches
             # format = subreddit/convo_code
-        _save_data(batch_li_li_thread_utterances, batch_save_size, dir_save_dataset)
+        li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
+        _save_data(li_utterances, batch_save_size, dir_save_dataset)
+
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         #end region    
 
 
 def _load_data():
     # Donwload reddit-corpus-small if it doesnt exist
-    _dir_path = utils.get_path("dataset\\reddit_small")
+    _dir_path = utils_nlg.get_path("dataset\\reddit_small")
     if os.path.exists(_dir_path):
         use_local = True
     else:
@@ -235,7 +292,7 @@ def _load_data():
     
     return corpus
 
-def _preprocess(txt):
+def _preprocess(text):
 
     # replacing hyperlinks with [link token]
     #https://mathiasbynens.be/demo/url-regex
@@ -260,17 +317,21 @@ def _preprocess(txt):
                 #so need to have regex code to compress words between two colons (with underscores)
         
     # remove repeated words
-    txt = txt.replace(r'\b([\w\-,\.]+)(\s+\1)+\b', r'\1')
+    text = text.replace(r'\b([\w\-,\.]+)(\s+\1)+\b', r'\1')
     
-    return txt
+    return text
 
     # Get a list of utterance and its preceeding utterance
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
-    prev_utterance = next(_dict['txt_preproc'] for 
+    try:
+        prev_utterance = next( _dict['txt_preproc'] for 
         _dict in li_thread_utterances 
-        if _dict['speakder_id'] == reply_to_id )
-    
+        if _dict['id_utt'] == reply_to_id )
+    except StopIteration as e:
+        prev_utterance = ''
+   
+
     return prev_utterance
 
 def _tree_to_rst_code(_tree, method=1):
@@ -297,21 +358,22 @@ def _tree_to_rst_code(_tree, method=1):
             #TODO: possibly figure out some way to normalize this vector
     """
 
+    li_relations_ns = [  re.findall(r'[a-zA-Z]+' ,_tree._label)  for _tree in _tree.subtrees() ]
+    li_relations_ns = [ [_li[0],_li[1:]] for _li in li_relations_ns if _li[0]!='n'  ] #removing rows which classifier produced n/a 
+    
+    li_relations_ns = [x for x in li_relations_ns if x != []]
 
-    #iter_nodes = list( nltk.utils.breadth_first(_tree) )
-    #Todo: check code for filtering relation and  ns relation-type
-    lli_relations_ns = [  re.findall(r'[a-zA-Z]+' ,_tree._label)  for _tree in _tree.subtrees() ]
-    li_relations_ns = [ [_li[0],_li[1:]] for _li in li_relations_ns]
-        
     return li_relations_ns
     
 def _rake_kw_extractor(str_utterance, topk=3):
-    r1 = Rake( ranking_metric=Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
+    r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
     r1.extract_keywords_from_text(str_utterance)
     
     li_ranked_kws = r1.get_ranked_phrases_with_scores()
     
     li_ranked_kws = li_ranked_kws[:topk]
+
+    li_ranked_kws = [ [ x[1], x[0] ] for x in li_ranked_kws ]
 
     return li_ranked_kws
 
@@ -322,7 +384,7 @@ def _textrank_extractor(str_utterance,topk=3):
 
     doc = nlp(str_utterance)
 
-    li_ranked_kws = [ (p.chunks[0], p.rank) for p in doc._.phrases ]
+    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases ]
 
     return li_ranked_kws[:topk]
         
@@ -337,31 +399,43 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
             #otherwise make new file 
 
     # Grouping utterances by the subreddit 
-    grouped_li_utterances = [ ( k, list(g)) for k,g in groupby(li_utterances, lambda _dict: _dict['subreddit'] ) ]
+    grouped_li_utterances = [ ( k, list(g)) for k,g in itertools.groupby(li_utterances, lambda _dict: _dict['subreddit'] ) ]
         #a list of tuples; elem0: subreddit name elem1: list of convos for that subreddit
     
     
     for subreddit, _li_utterances in grouped_li_utterances:
-        subreddit_dir = utils.get_path( os.join(dir_save_dataset,subreddit), _dir=True  )  
+        subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
         
-        
+        _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
         #unlimited batch_size
         if batch_save_size < 0:
             files_ = os.listdir(subreddit_dir)
-            fn = files_[0]
-            curr_len = int(max_fn[4:])
+            if len(files_)>0:
+                fn = files_[0]
+            else:
+                fn = "0000_0000"
+                with open(fn,"a+",newline='\n',encoding='utf-8') as _f:
+                    dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
+                    dict_writer.writeheader()
+                    pass
+            
+            curr_len = int(fn[-4:])
             new_len = curr_len + len(li_utterances)
 
-            fp = os.path.join(subreddit_dir,f"{max_fn[:4]}_{new_len:04d}.csv")
+            old_fp = os.path.join(subreddit_dir,fn)
+            new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:04d}")
+            
             keys = li_utterances[0].keys()
-            with open(fp,"a+", newline='') as _f:
-                dict_writer = csv.DictWriter(_f, keys)
+            with open(old_fp,"a+", newline='\n',encoding='utf-8') as fn:
+                dict_writer = csv.DictWriter(fn, keys)
                 dict_writer.writerows(li_utterances)
+            
+            os.rename( old_fp, new_fp )
 
         #limited batch save size - saving to existing file and any new files
         else:
             while len(_li_utterances)>0:
-                
+                #todo: add os.rename to files that get appended to 
                 files_ = os.listdir(subreddit_dir)
 
                 #most recent filename saved to
@@ -377,7 +451,7 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 if max_utt_to_add == 0:
                     fn = f"{int(last_fn[:4])+1:04d}_0000.csv"
                     fp = os.path.join(subreddit_dir, fn )
-                    with open(fp,"a+", newline='') as _f:
+                    with open(fp,"a+", newline='\n',encoding='utf-8') as _f:
                         pass
                     continue
                 # or saving a chunk of li_utterances and moving on
@@ -403,18 +477,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
 
 
-    parser.add_argument('--danet_vname', default="DaNetV003",
+    parser.add_argument('--danet_vname', default="DaNet_v001",
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
-    parser.add_argument('--batch_process_size', default=200,
+    parser.add_argument('--batch_process_size', default=50,
         help='',type=int)        
 
     parser.add_argument('--batch_save_size', default=-1,
         help='',type=int)        
 
-    parser.add_argument('--rst_method',default="feng-hirst",
-        options=['feng-hirst','akanni-rst'], type=str)
+    parser.add_argument('--rst_method', default="feng-hirst",
+        choices=['feng-hirst','akanni-rst'], type=str)
 
     args = parser.parse_args()
     main( **vars(args) )
