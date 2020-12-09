@@ -7,14 +7,17 @@ import glob
 
 
 def get_path(_path,_dir=False):
+
     if os.path.isabs(_path) == False:
         _path = os.path.join(dirname, _path)
     
     _path = os.path.realpath(_path)
     
     if _dir:
-        os.makedirs(_path,exist_ok=True)
-    
+        os.makedirs(_path, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
+
     return _path
 
 
@@ -26,10 +29,10 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
     output = {}
 
     if exists == False:    
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model_tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModel.from_pretrained(model_name)
         
-        tokenizer.save_pretrained(_dir_transformer)
+        model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
 
     if tokenizer == True:
@@ -69,4 +72,15 @@ def get_version_name(model_name):
     return new_version_name 
 
 
+def get_best_ckpt_path(dir_path):
+    dir_path = get_path(dir_path)
 
+    li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
+
+    li_versions = [ int(fname[6:9]) for fname in li_files ]
+
+    index = li_versions.index( max(li_versions) )
+
+    ckpt_path = li_files[index]
+
+    return ckpt_path

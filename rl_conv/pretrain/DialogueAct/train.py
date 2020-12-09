@@ -1,4 +1,8 @@
 import numpy as np
+import warnings
+import sklearn
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +15,7 @@ from functools import lru_cache
 
 from typing import List
 
-
+import pickle
 
 
 from itertools import cycle, islice
@@ -21,7 +25,11 @@ from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 
 import pytorch_lightning as pl
+
+
+
 from sklearn import preprocessing as sklp
+
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -31,6 +39,8 @@ import random
 
 import gc
 from pytorch_lightning import loggers as pl_loggers
+
+#from pytorch_lightning.loggers import TensorBoardLogger
 
 class Mish(nn.Module):
     def __init__(self):
@@ -46,6 +56,8 @@ class TrainingModule(pl.LightningModule):
                     model, context_history_len,
                     learning_rate,
                     warmup_proportion,
+                    workers,
+                    lr_schedule,
                     **kwargs):
         super().__init__()
 
@@ -61,22 +73,27 @@ class TrainingModule(pl.LightningModule):
             'max_epochs', 'context_history_len', 'learning_rate',
             'warmup_proportion')
         self.save_hyperparameters(model.return_params())
-
+        self.workers = workers
         self.model = model
+        self.lr_schedule = lr_schedule
         
         self.loss = nn.BCEWithLogitsLoss()
+
         self.dict_acc = {
-            k:pl.metrics.classification.Accuracy() for k in ["train",
+            k:pl.metrics.classification.Accuracy( ) for k in ["train",
+                "val","test"] }
+        self.dict_acc_micro = {
+            k:pl.metrics.classification.Accuracy( ) for k in ["train",
                 "val","test"] }
         self.dict_prec = {
-            k:pl.metrics.classification.Precision() for k in ["train",
+            k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in ["train",
                 "val","test"] }
         self.dict_recall =  {
-            k:pl.metrics.classification.Recall() for k in ["train",
+            k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
                 "val","test"] }
                 
 
-        self.create_data_loaders()
+        self.create_data_loaders(self.workers)
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
@@ -84,85 +101,144 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--config_file', default=None, help="Path to the \
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
-        parser.add_argument('--gpus', default=None)
-        parser.add_argument('--max_epochs', default=30)
-        parser.add_argument('--accumulate_grad_batches', default=1)
-        parser.add_argument('--context_history_len', default=1)
-        parser.add_argument('--batch_size', default=2)
-        parser.add_argument('--learning_rate', default=1e-4)
-        parser.add_argument('--warmup_proportion', default=0.15)
-        #parser.add_argument('--')
+        #parser.add_argument('--gpus', default=None)
+        parser.add_argument('--max_epochs', default=150, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--context_history_len', default=1, type=int)
+        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('--learning_rate', default=1e-3, type=float)
+        parser.add_argument('--warmup_proportion', default=0.05)
+        parser.add_argument('--workers', default=0, type=int)
+        parser.add_argument('--gpus', default=0, type=int)
+        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
+        parser.add_argument('--version_name', default='', required=False)
+        parser.add_argument('--lr_schedule', default='LROnPlateau', required=False, choices =['LROnPlateau','hard_restarts'])
         #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
-        tparams = parser.parse_args()
+        tparams = parser.parse_known_args()[0]
         if tparams.config_file != None:
-            tparams = json.load(open(utils.get_path(path)),"r" )
+            tparams = json.load(open(utils.get_path(tparams.config_file)),"r" )
 
         return tparams
 
-    def step(self, batch, step_name="train"):
+    def step(self, batch, step_name):
         target = batch.pop('da')
+       
         input_= batch
-
         output = self.forward(input_)
+
+        #removing lines with no DA label
+        keep_mask = torch.sum(target, dim=1, dtype=bool )
+        target = target[keep_mask]
+        output = output[keep_mask]
+
         loss = self.loss( output, target)
-        
         loss_key = f"{step_name}_loss"
         
-        self.log(loss_key, loss, True)
-        self.dict_acc[step_name](output, target)
-        self.dict_prec[step_name](output, target)
-        self.dict_recall[step_name](output, target)
-        
-        if step_name == 'train':
-            self.log(f'{step_name}_acc', self.dict_acc[step_name], on_step=True, on_epoch=False)
-            self.log(f'{step_name}_rec', self.dict_recall[step_name], on_step=True, on_epoch=False)
-            self.log(f'{step_name}_prec', self.dict_prec[step_name], on_step=True, on_epoch=False)
-            
-            return  { "loss": loss }
-        
-        else:
-            self.log(f'{step_name}_acc', self.dict_acc[step_name], on_step=False, on_epoch=True)
-            self.log(f'{step_name}_rec', self.dict_recall[step_name], on_step=False, on_epoch=True)
-            self.log(f'{step_name}_prec', self.dict_prec[step_name], on_step=False, on_epoch=True)
-            return {loss_key: loss}
-        #return self.log(loss_key, loss, on_step=True, on_epoch=True, prog_bar=True, 'log':tensorboard_logs)
+        output =  output.to('cpu')
+        output_bnrzd = torch.where( output<0.5,0.0,1.0)
+        target  = target.to('cpu')
 
+        #correct_micro = output_bnrzd.eq(target).min(dim=1)[0].sum()
+        #correct_macro = output_bnrzd.eq(target).sum()
+        #total_micro = target.shape[0]
+        #total_macro = torch.numel(target)
+
+        self.dict_acc[step_name](output_bnrzd, target)
+        correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
+        self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
+        self.dict_recall[step_name](output_bnrzd, target)
+        self.dict_recall[step_name](output_bnrzd, target)
+        self.dict_prec[step_name](output_bnrzd, target)
+
+        if step_name == 'train':
+            str_loss_key = "loss"
+            on_step = True
+            on_epoch = False
+            prog_bar = True
+            logger = False
+
+        else:
+            str_loss_key = loss_key
+            on_step = False
+            on_epoch = True
+            prog_bar = False
+            logger = True
+        
+            #self.log( str_loss_key, loss)#, on_step=on_step, on_epoch=on_epoch, prog_bar=True, logger=True)
+        
+        _dict = { str_loss_key: loss }
+        
+        self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
+        self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+
+        #self.log(f"{step_name}_acc_micro_step", correct_micro/total_micro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        #self.log(f"{step_name}_acc_macro_step", correct_macro/total_macro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+
+        return  _dict #, f'rec':self.dict_recall[step_name].compute() , f'prec':self.dict_prec[step_name].compute() }
+        
+    #@auto_move_data
     def forward(self, input_, *args):
         return self.model(input_, *args)
 
     def training_step(self, batch, batch_idx):
-        return self.step(batch,"train")
-    
+        output = self.step(batch,"train")
+
+        #self.log( 'train_loss', output['loss'] )
+
+        return output
+
     def validation_step(self, batch, batch_idx):
-        return self.step(batch, "val")
+        output = self.step(batch, "val")
+        
+        #self.log('val_loss', output['val_loss'])
+
+        return output
+
+    def test_step(self, batch, batch_idx):
+        output = self.step(batch, "test")
+
+        #self.log('test_loss', output['test_loss'])
+
+        return output
+
+    def training_epoch_end(self, outputs):
+        self.epoch_end_log(outputs,"train")
 
     def validation_epoch_end(self, outputs: List[dict]):
-        loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        self.log("val_loss", loss)
-    
-    def test_step(self, batch, batch_idx):
-        return self.step(batch, "test")
-    
+        self.epoch_end_log(outputs, "val")
+         
     def test_epoch_end(self, outputs: List[dict]):
-        loss = torch.stack([x["test_loss"] for x in outputs]).mean()
-        self.log("test_loss", loss)
+        self.epoch_end_log(outputs, "test")
 
-    def create_data_loaders(self, shuffle=False):
+    def epoch_end_log(self, outputs, step_name):
+
+        if step_name == "train":
+            pass
+        else:
+            loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
+
+            #correct_micro = torch.stack([x["correct_micro"] for x in outputs]).sum()
+            #correct_macro = torch.stack([x["correct_macro"] for x in outputs]).sum()
+            #total_micro=sum([x["total_micro"] for  x in outputs])
+            ##total_macro=sum([x["total_macro"] for  x in outputs])
+            
+            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
+            #self.log(f"{step_name}_acc_micro_epoch", correct_micro/total_micro, logger=True, prog_bar=False)
+            ##self.log(f"{step_name}_acc_macro_epoch", correct_macro/total_macro, logger=True, prog_bar=False)
+
+
+    def create_data_loaders(self, shuffle=False, **kwargs):
         dir_train_set = os.path.join(self.dir_data,"train") #"./combined_data/train/"
         dir_val_set = os.path.join(self.dir_data,"val")
-        dir_val_set = os.path.join(self.dir_data,"test")
-        batch_size = 2
-
+        dir_val_set = os.path.join(self.dir_data,"test") 
+        
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
-            dir_val_set, batch_size, self.model.tokenizer )
+            dir_val_set, self.batch_size, self.model.tokenizer, workers=self.workers)
         
         self.train_dl, self.val_dl, self.test_dl = dg()
-
-    def accuracy_calculator(self, outputs, targets):
-        #Accuracy = Total Correct Observations / Total Observations
-
-        return True
     
     def train_dataloader(self):
         return self.train_dl
@@ -191,14 +267,23 @@ class TrainingModule(pl.LightningModule):
         total_steps = self.total_steps()
         warmup_steps = int( self.total_steps() * self.warmup_proportion )
 
-        lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles = 3
-            )
+        if self.lr_schedule == "hard_restarts" :
+            lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+                num_cycles = 3
+                )
+        elif self.lr_schedule == "LROnPlateau":
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4,)
 
-        return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
+        return [optimizer], [{"scheduler": lr_scheduler, "interval": "epoch", "monitor":"val_loss"}]
+
+    def get_progress_bar_dict(self):
+        # don't show the version number
+        items = super().get_progress_bar_dict()
+        items.pop("v_num", None)
+        return items
 
 class DaNet(nn.Module):
     """Transformer Based Model for DA classfication Task
@@ -209,7 +294,8 @@ class DaNet(nn.Module):
 
         super(DaNet, self).__init__()
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
-        D_in, H, D_out = 768, 50, 12
+        #D_in, H, D_out = 768, 50, 12 #transformer frozer
+        D_in, H, D_out = 768, 56, 12
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
@@ -225,10 +311,14 @@ class DaNet(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Dropout(self.dropout),
-            nn.Linear(D_in, H),
+            nn.Linear(D_in, int(H*2) ),
             Mish(),
             nn.Dropout(self.dropout),
-            nn.Linear(H, D_out)
+            nn.Linear(int(H*2), int(H//2) ),
+            Mish(),
+            nn.Dropout(self.dropout),
+            nn.Linear(int(H//2), D_out),
+            #nn.Sigmoid()
         )
         
         for layer in self.classifier:
@@ -245,14 +335,14 @@ class DaNet(nn.Module):
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
-        parser.add_argument('--dropout', default=0.05, required=False, help="dropout")
-        parser.add_argument('--freeze_transformer', default=True, required=False)
+        parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
+        parser.add_argument('--freeze_transformer', default=True, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
             mparams = json.load(open(utils.get_path(path)),"r" )
-
+        
         return mparams
 
     def forward(self, input_, *args):
@@ -377,7 +467,13 @@ class SingleDataset(torch.utils.data.Dataset):
         speaker, utterances, da = datum.T.values
         
         encoded_input = self.encode_tokenize( utterances.tolist() )
-        binarized_target = self.target_binarizer.transform( [ da[-1].split() ] )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                binarized_target = self.target_binarizer.transform( [ da[-1].split(" ") ] )
+        except AttributeError as e:
+            binarized_target = np.zeros((1,12))
+
 
         map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
         return map_datum
@@ -395,48 +491,82 @@ def main(tparams, mparams):
     gc.collect()
     torch.cuda.empty_cache()
 
-    version_name = utils.get_version_name(mparams.model_name)
-    utils.save_version_params(tparams, mparams, version_name )
-    
-    # Setting up callbacks and loggers
-    early_stop_callback = EarlyStopping(
-        monitor='val_loss',
-        min_delta=0.00,
-        patience=5,
-        verbose=False,
-        mode='auto'
-    )
-    checkpoint_callback = ModelCheckpoint(monitor='val_loss',save_top_k=3, mode='min', 
-        dirpath=utils.get_path(f'./models/{version_name}/logs') )
-
-    tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{version_name}/logs'))
-    
+    tparams.version_name =  tparams.version_name if tparams.version_name!= '' else utils.get_version_name(mparams.model_name)
+    utils.save_version_params(tparams, mparams, tparams.version_name )
+    model_dir = utils.get_path(f'./models/{tparams.version_name}')
+    checkpoint_dir = f'{model_dir}/logs'
     # Setting up model, training_module and Trainer
+
+    if tparams.mode in ['train_cont','test']:
+        checkpoint_path = utils.get_best_ckpt_path(checkpoint_dir)
+        mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
+        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
+    
     danet = DaNet(**vars(mparams))
+    
+    # Defining callbacks
+    callbacks = []
 
-    training_module = TrainingModule(**vars(tparams), model=danet )
-    #training_module.save_hyperparameters(vars(mparams))
+    tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{tparams.version_name}/logs'))
+    
+    if tparams.mode in ["train_new","train_cont"]:
+        
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
+            mode='min', dirpath=checkpoint_dir, 
+            filename='{epoch:03}-{val_loss:.3f}-{val_acc_micro_epoch:.3f}')
+        
+        early_stop_callback = EarlyStopping(
+            monitor='val_loss',
+            min_delta=0.00,
+            patience=8,
+            verbose=False,
+            mode='auto'
 
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=5,
-                     callbacks=[early_stop_callback,checkpoint_callback],
-                     check_val_every_n_epoch=1, logger=tb_logger,
-                     default_root_dir=utils.get_path(f"./models/{version_name}"),
-                     fast_dev_run=True, 
-                     #log_gpu_memory=True
-                     )
+        )
+        callbacks.append(checkpoint_callback)
+        callbacks.append(early_stop_callback)
+        
 
-    trainer.fit(training_module)
-    trainer.test()
+    # Making training module
+    if tparams.mode in ["test","train_cont"]:
+        #checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+
+        training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
+        #training_module.load_state_dict(checkpoint['state_dict'])
+    else:
+        training_module = TrainingModule(**vars(tparams), model=danet )
+
+                
+                
+    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
+                check_val_every_n_epoch=1, logger=tb_logger,
+                default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
+                precision=16, callbacks=callbacks,
+                #track_grad_norm = True,
+                #overfit_batches=5
+                #,fast_dev_run=True, 
+                #log_gpu_memory=True
+                )
+
+    if tparams.mode in ["test"]:
+        training_module.eval() 
+        training_module.freeze() 
+        #trainer.ckpt_path = checkpoint_path
+        trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
+        #trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
+        
+    else:    
+        trainer.fit(training_module)
+        trainer.test(test_dataloaders=training_module.test_dl )
+
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     #parent_parser2 = argparse.ArgumentParser(add_help=False)    
     
-    parser_program = parent_parser.add_argument_group("program")
+    #parser_program = parent_parser.add_argument_group("program")
 
     # add PROGRAM level args
-    #parser_program.add_argument('--conda_env', type=str, default='some_name')
-    #parser_program.add_argument('--notification_email', type=str, default='johnsmith@email.com')
     
     # add model specific args
     mparams = DaNet.parse_model_specific_args(parent_parser)
