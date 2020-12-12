@@ -7,6 +7,7 @@
 [submodule "rl_conv/pretrain/RST_FH"]
 	path = rl_conv/pretrain/RST_FH
 	url = https://github.com/Akanni96/feng-hirst-rst-parser-1.git
-[submodule "rl_conv/pretrain/RST_FH_service"]
-	path = rl_conv/pretrain/RST_FH_service
-	url = https://github.com/Akanni96/feng-hirst-service.git
+
+[submodule "rl_conv/pretrain/DockerImages/feng-hirst-rst-parser"]
+	path = rl_conv/pretrain/DockerImages/feng-hirst-rst-parser
+	url = https://github.com/Akanni96/feng-hirst-rst-parser
