@@ -41,7 +41,7 @@ from utils import get_best_ckpt_path
 from utils import get_path
 
 import regex as re
-import multiprocessing
+import multiprocessing as mp
 
 from unidecode import unidecode
 
@@ -66,9 +66,10 @@ from unidecode import unidecode
     
 
 def main(danet_vname,
-            batch_process_size=200,
+            batch_process_size=20,
             batch_save_size=-1,
             rst_method="feng-hirst",
+            mp_count=5,
             **kwargs):
     """[summary]
 
@@ -97,15 +98,10 @@ def main(danet_vname,
     tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
 
     danet = DaNet(**vars(mparams))
-
-    # danet_module = TrainingModule( resume_from_checkpoint=utils_nlg.get_path(checkpoint_path)
-    #                 , mode='inference' ) #model=danet,
     
     danet_module = TrainingModule(mode='inference', model=danet)
     danet_module.load_state_dict(checkpoint['state_dict'] )
 
-    # danet_module = TrainingModule.load( resume_from_checkpoint=utils_nlg.get_path(checkpoint_path), 
-    #                 model=DaNet, mode='inference', )
     danet_module.eval()
     danet_module.model.eval()
     torch.set_grad_enabled(False)
@@ -115,7 +111,7 @@ def main(danet_vname,
         #Platform dependent way to start docker
         # linux: If an error in next line, changeother "other" permission on /var/run/docker.sock to read write execute chmod o=7 /var/run/docker.sock
     try:
-        client = docker.from_env(timeout=int(60*60))
+        client = docker.from_env(timeout=int(60*3))
     except docker.DockerException:
         os.system('chmod o=rwx var/run/docker.sock')
         client = docker.from_env(timeout=int(60*60))
@@ -138,8 +134,12 @@ def main(danet_vname,
     else:
         image = client.images.get(image_name)
 
-    fh_container  = client.containers.run(image, detach=True, 
-        entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) 
+    # fh_container  = client.containers.run(image, detach=True, 
+    #     entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) 
+    li_fh_container = [ client.containers.run(image, detach=True, 
+        entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
+
+    li_fh_container_id = [container.id for container in li_fh_container ]     
 
     #Creating Save directory
     dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_mc",_dir=True)
@@ -177,9 +177,17 @@ def main(danet_vname,
             [
                 _dict.update({'txt_preproc':_preprocess(_dict['text'])}) for _dict in 
                 li_thread_utterances]
+            
+
+            # Removing invalid lines in conversation
+            li_thread_utterances  = [
+                _dict for _dict in li_thread_utterances
+                if _valid_utterance(_dict['txt_preproc']) ]
+
             batch_li_li_thread_utterances.append(li_thread_utterances)
+
         
-        #pool = multiprocessing.Pool(6)
+        
 
         #endregion
         
@@ -210,69 +218,80 @@ def main(danet_vname,
         #     ]
 
         #     batch_li_li_thread_utterances[i] = li_thread_utterances
-        #         #results for dialog acts imply model is not being loaded in properly
+                #results for dialog acts imply model is not being loaded in properly
         #endregion
 
         #region Predicting the RST Tag
-        if rst_method == "feng-hirst":
-           
-            for i, _ in enumerate(batch_li_li_thread_utterances):
-                li_thread_utterances = batch_li_li_thread_utterances[i]
-                
-                #li_utterance  = [ unidecode(thread_utt['txt_preproc']) for thread_utt in li_thread_utterances ]
-                li_utterance  = [ thread_utt['txt_preproc'].encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "") for thread_utt in li_thread_utterances ]
-                json_li_utterance = json.dumps(li_utterance)
-                
-                #response = fh_container.run( entrypoint=entrypoint, command=command )
-                cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
-                exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
-                                    demux=True)
-                stdout, stderr = output
-                #stdout = stdout.decode('utf-8')
-                a=0
-                stdout_ = json.loads(stdout)
-                #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
-
-                li_trees = []
-                for idx, pt_str in enumerate(stdout_):
-                    try:
-                        _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-                    except ValueError:
-                        _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-                    li_trees.append(_)
-
-                # Creating two versions of the li_rst_methods
-                li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
-
-                [
-                    thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
-                    zip( li_thread_utterances, li_rst_dict)
-                ]
-
-                batch_li_li_thread_utterances[i] = li_thread_utterances
-                # output type of this docker env: trees.parse_tree.ParseTree, Tree.fromstring(str)
-                
-            client.containers.prune()
-
-        elif rst_method == "akanni":
-            pass
+        with mp.Pool(mp_count) as pool:
+            res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count) + 1) ) )
+        batch_li_li_thread_utterances = list( res ) 
+        batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+            #region old rst
+        # for i, _ in enumerate(batch_li_li_thread_utterances):
+        #     li_thread_utterances = batch_li_li_thread_utterances[i]
             
+        #    
+        #     li_utterance  = [ thread_utt['txt_preproc'].encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "") for thread_utt in li_thread_utterances ]
+        #     json_li_utterance = json.dumps(li_utterance)
+            
+        #     #response = fh_container.run( entrypoint=entrypoint, command=command )
+        #     cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
+        #     exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
+        #                         demux=True)
+        #     stdout, stderr = output
+        #     #stdout = stdout.decode('utf-8')
+        #     # a=0
+        #     try:
+        #         stdout_ = json.loads(stdout)
+        #     except TypeError as e:
+        #         [ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
+        #         batch_li_li_thread_utterances[i] = li_thread_utterances
+        #         continue
+        #     #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
+
+        #     li_trees = []
+        #     for idx, pt_str in enumerate(stdout_):
+        #         try:
+        #             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+        #         except ValueError:
+        #             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+        #         li_trees.append(_)
+
+        #     # Creating two versions of the li_rst_methods
+        #     li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
+
+        #     [
+        #         thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
+        #         zip( li_thread_utterances, li_rst_dict)
+        #     ]
+
+        #     batch_li_li_thread_utterances[i] = li_thread_utterances
+        #endregion
+        
         #endregion
 
         #region Topic extraction
-        for i, _ in enumerate(batch_li_li_thread_utterances):
-            li_thread_utterances = batch_li_li_thread_utterances[i]
 
-            li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
-                                        'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
-                    for thread_utterance in li_thread_utterances]
+        with mp.Pool(mp_count) as pool:
+            res = pool.map( _topic, _chunks(batch_li_li_thread_utterances,batch_process_size//mp_count) )
+        batch_li_li_thread_utterances = list( res ) 
+        batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+        
+        #old topic
+        # for i, _ in enumerate(batch_li_li_thread_utterances):
+        #     li_thread_utterances = batch_li_li_thread_utterances[i]
 
-            [
-                thread_utterance.update(dict_kw) for thread_utterance, dict_kw in 
-                zip( li_thread_utterances, li_rakekw_textankkw)
-            ]
+        #     li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
+        #                                 'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
+        #             for thread_utterance in li_thread_utterances]
 
-            batch_li_li_thread_utterances[i] = li_thread_utterances
+        #     [
+        #         thread_utterance.update(dict_kw) for thread_utterance, dict_kw in 
+        #         zip( li_thread_utterances, li_rakekw_textankkw)
+        #     ]
+
+        #     batch_li_li_thread_utterances[i] = li_thread_utterances
+        # #endregion
         #endregion
 
         # region Drop keys
@@ -290,9 +309,8 @@ def main(danet_vname,
         _save_data(li_utterances, batch_save_size, dir_save_dataset)
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
-        batches_completed =+ 1
+        batches_completed += 1
         #end region    
-
 
 def _load_data():
     # Donwload reddit-corpus-small if it doesnt exist
@@ -333,10 +351,41 @@ def _preprocess(text):
         
     # remove repeated words
     text = text.replace(r'\b([\w\-,\.]+)(\s+\1)+\b', r'\1')
+    #remove repeated periods
+    text = re.sub(r'(\.)\1{1}', ",", text)
+
+    # convert to ascii
+    text = text.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "")
+
+    #remove qoutes
+    text = text.replace('"', '')
+
+    text = text.replace('-', '')
+
+    # remove multiple spaces
     
+    text = re.sub(r'(?![\.\s?!])\n\s*\n', '.', text.strip())
+
+    text = re.sub(r'(?<=[\.\s?!])\n\s*\n', '', text)
+
+    text = re.sub(r'[\n\t ]{2,}', '', text)
+
     return text
 
     # Get a list of utterance and its preceeding utterance
+
+def _valid_utterance(txt):
+
+    txt = txt.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}","")
+    # Checking if someone has just drawn an image using brackets and spaces etc
+
+    # not all space characters = not txt.ispace()
+    # contains_alphabet = any( c.isalpha() for c in txt)
+
+    # post_not_deleted = txt!="[deleted]"
+
+    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]"
+
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
     try:
@@ -348,6 +397,60 @@ def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
    
 
     return prev_utterance
+
+def _rst(li_li_thread_utterances, fh_container_id ):
+    client = docker.from_env(timeout=int(60*3))
+    fh_container = client.containers.get(fh_container_id)
+        
+    for i, _ in enumerate(li_li_thread_utterances):
+        
+        li_thread_utterances = li_li_thread_utterances[i]
+        #return li_li_thread_utterances
+        li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]
+
+        #li_utterance  = [ thread_utt['txt_preproc'].encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "") for thread_utt in li_thread_utterances ]
+        #return True
+        json_li_utterance = json.dumps(li_utterance)
+        
+
+        #response = fh_container.run( entrypoint=entrypoint, command=command )
+        cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
+        exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
+                            demux=True)
+        stdout, stderr = output
+        #stdout = stdout.decode('utf-8')
+        # a=0
+        try:
+            stdout_ = json.loads(stdout)
+        except TypeError as e:
+            [ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
+            li_li_thread_utterances[i] = li_thread_utterances
+            continue
+        #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
+
+        li_trees = []
+        for idx, pt_str in enumerate(stdout_):
+            try:
+                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+            except ValueError:
+                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+            li_trees.append(_)
+
+        li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
+
+        [
+            thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
+            zip( li_thread_utterances, li_rst_dict)
+        ]
+
+        li_li_thread_utterances[i] = li_thread_utterances
+    #client.close()
+    return li_li_thread_utterances
+
+def _chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 def _tree_to_rst_code(_tree):
     """Converst RST Tree to rst code used in NLG model
@@ -365,38 +468,58 @@ def _tree_to_rst_code(_tree):
             #TODO: possibly figure out some way to normalize this vector
     """
 
-    # li_relations_ns = [  re.findall(r'[a-zA-Z]+' ,sub_tree._label)  for sub_tree in nltk.bread_first(_tree) ]
-
-    # li_relations_ns = [ [_li[0],_li[1:]] for _li in li_relations_ns  ] #removing rows which classifier produced n/a  
-    
-    # li_relations_ns = [x for x in li_relations_ns if x != []]
-
     
     # Getting List 1 and 2
     li_rels_ns = []
-    max_nodes = int(2*_tree.height()-1) # Without this nltk also searches subtrees of individual characteres
+    max_nodes = int(2*_tree.height()) -1 # Without this nltk also searches subtrees of individual characteres
     counter = 0
-    for node in nltk.breadth_first(_tree):
-        if type(node) == nltk.tree.Tree:
-            _ = re.findall(r'[a-zA-Z]+', node._label)
-            li_rels_ns.append( [ _[0], _[1:]] )
-            counter += 1
-        if counter == max_nodes: break
-    
+
+    for depth in range( _tree.height(),1,-1 ):
+        
+        subli_rels_ns = [  re.findall(r'[a-zA-Z]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
+        subli_rels_ns = [ [_li[0],_li[1:]] for _li in subli_rels_ns ]
+
+        li_rels_ns.extend(subli_rels_ns)
+
     # Getting List 3
         #getting position of all non leave
     tree_pos = _tree.treepositions()
     leaves_pos = _tree.treepositions('leaves')
     pos_xleaves = list(set(tree_pos) - set(leaves_pos)) #unordered
+    pos_xleaves = [  tuple(x if x<2 else 1 for x in _tuple ) for _tuple in pos_xleaves]        #binarizing ( correcting any number above 1 to 1)
         # reording pos_xleaves to breadfirst ordering
-    li_bintreepos = [0] + sorted([ utils_nlg.tree_order.get(x,-1) for x in pos_xleaves])
+    li_bintreepos = sorted([ utils_nlg.tree_order.get(x,-1) for x in pos_xleaves])
 
     # Zipping List 1 2 and 3
     li_dict_rels_ns_bintreepos = [  {'rel':rels_ns[0], 'ns':rels_ns[1], 'pos': bintreepos } for rels_ns,bintreepos in zip(li_rels_ns,li_bintreepos) if bintreepos!=-1 ]
 
     return li_dict_rels_ns_bintreepos
 
-    
+# def __depth_check(sub_tree, depth):
+#     """[summary]
+
+#     Args:
+#         sub_tree ([type]): [description]
+#         depth ([int]): [description]
+#     """   
+#     return sub_tree.height() == depth
+
+def _topic(li_li_thread_utterances):
+    for i, _ in enumerate(li_li_thread_utterances):
+        li_thread_utterances = li_li_thread_utterances[i]
+
+        li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
+                                    'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
+                for thread_utterance in li_thread_utterances]
+
+        [
+            thread_utterance.update(dict_kw) for thread_utterance, dict_kw in 
+            zip( li_thread_utterances, li_rakekw_textankkw)
+        ]
+
+        li_li_thread_utterances[i] = li_thread_utterances
+    return li_li_thread_utterances
+
 def _rake_kw_extractor(str_utterance, topk=3):
     r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
     r1.extract_keywords_from_text(str_utterance)
@@ -446,7 +569,7 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 fn = files_[0]
             else:
                 fn = "0000_0000"
-                with open(fn,"a+",newline='\n',encoding='utf-8') as _f:
+                with open( os.path.join(subreddit_dir,fn),"a+",newline='\n',encoding='utf-8') as _f:
                     dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
                     dict_writer.writeheader()
                     pass
@@ -513,7 +636,7 @@ if __name__ == '__main__':
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
-    parser.add_argument('--batch_process_size', default=50,
+    parser.add_argument('--batch_process_size', default=12,
         help='',type=int)        
 
     parser.add_argument('--batch_save_size', default=-1,
@@ -521,6 +644,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--rst_method', default="feng-hirst",
         choices=['feng-hirst','akanni-rst'], type=str)
+
+    parser.add_argument('--mp_count', default=6,
+        type=int)
 
     args = parser.parse_args()
     main( **vars(args) )
