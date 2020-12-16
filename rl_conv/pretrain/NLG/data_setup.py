@@ -45,6 +45,8 @@ import multiprocessing as mp
 
 from unidecode import unidecode
 
+last_batch_processed = 0
+dict_args = {}
 
 # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
@@ -70,6 +72,7 @@ def main(danet_vname,
             batch_save_size=-1,
             rst_method="feng-hirst",
             mp_count=5,
+            start_batch=0,
             **kwargs):
     """[summary]
 
@@ -147,17 +150,23 @@ def main(danet_vname,
     # setting up corpus data
     corpus = _load_data()
     li_id_dictconv  = list(corpus.conversations.items())
+    total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
+    batches_completed = 0
+
+    if start_batch != 0:
+        li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
+        batches_completed = start_batch
     # endregion
     
 
     #region operating in batches
-    total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
-    batches_completed = 0
+
     while len(li_id_dictconv) > 0:
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
         print(f"Operating on batch {batches_completed} of {total_batch_count}")
+        last_batch_processed = batches_completed
 
         #region preprocessing
         for id_dictconv  in batch_li_id_dictconv:
@@ -192,33 +201,33 @@ def main(danet_vname,
         #endregion
         
         #region DA assignment
-        # for i, _ in enumerate(batch_li_li_thread_utterances):
+        for i, _ in enumerate(batch_li_li_thread_utterances):
             
-        #     li_thread_utterances = batch_li_li_thread_utterances[i]
+            li_thread_utterances = batch_li_li_thread_utterances[i]
 
-        #     li_utt_prevutt = [
-        #         [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances), _dict['txt_preproc']  ]
-        #         for _dict in li_thread_utterances
-        #     ]
+            li_utt_prevutt = [
+                [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances), _dict['txt_preproc']  ]
+                for _dict in li_thread_utterances
+            ]
 
-        #     encoded_input =  tokenizer(li_utt_prevutt, add_special_tokens=True, padding='max_length', 
-        #     truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True)
+            encoded_input =  tokenizer(li_utt_prevutt, add_special_tokens=True, padding='max_length', 
+                truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True)
             
-        #     pred_da = danet_module.forward(encoded_input)
-        #     li_li_da, li_dict_da = danet_module.format_preds(pred_da)
+            pred_da = danet_module.forward(encoded_input)
+            li_li_da, li_dict_da = danet_module.format_preds(pred_da)
             
-        #         #sequence of vectors, vector=logit score for each da class
-        #     #pred_das = pred_das.tolist()
+                #sequence of vectors, vector=logit score for each da class
+            #pred_das = pred_das.tolist()
             
-        #     #TODO consider removing dialogues that 'reply_to'==None
+            #TODO consider removing dialogues that 'reply_to'==None
 
-        #     [
-        #         _dict.update({'li_da': li_da,'dict_da':dict_da }) for _dict, li_da, dict_da in 
-        #         zip( li_thread_utterances, li_li_da, li_dict_da)
-        #     ]
+            [
+                _dict.update({'li_da': li_da,'dict_da':dict_da }) for _dict, li_da, dict_da in 
+                zip( li_thread_utterances, li_li_da, li_dict_da)
+            ]
 
-        #     batch_li_li_thread_utterances[i] = li_thread_utterances
-                #results for dialog acts imply model is not being loaded in properly
+            batch_li_li_thread_utterances[i] = li_thread_utterances
+                
         #endregion
 
         #region Predicting the RST Tag
@@ -226,47 +235,6 @@ def main(danet_vname,
             res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count) + 1) ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
-            #region old rst
-        # for i, _ in enumerate(batch_li_li_thread_utterances):
-        #     li_thread_utterances = batch_li_li_thread_utterances[i]
-            
-        #    
-        #     li_utterance  = [ thread_utt['txt_preproc'].encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "") for thread_utt in li_thread_utterances ]
-        #     json_li_utterance = json.dumps(li_utterance)
-            
-        #     #response = fh_container.run( entrypoint=entrypoint, command=command )
-        #     cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
-        #     exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
-        #                         demux=True)
-        #     stdout, stderr = output
-        #     #stdout = stdout.decode('utf-8')
-        #     # a=0
-        #     try:
-        #         stdout_ = json.loads(stdout)
-        #     except TypeError as e:
-        #         [ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
-        #         batch_li_li_thread_utterances[i] = li_thread_utterances
-        #         continue
-        #     #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
-
-        #     li_trees = []
-        #     for idx, pt_str in enumerate(stdout_):
-        #         try:
-        #             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-        #         except ValueError:
-        #             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-        #         li_trees.append(_)
-
-        #     # Creating two versions of the li_rst_methods
-        #     li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
-
-        #     [
-        #         thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
-        #         zip( li_thread_utterances, li_rst_dict)
-        #     ]
-
-        #     batch_li_li_thread_utterances[i] = li_thread_utterances
-        #endregion
         
         #endregion
 
@@ -277,21 +245,7 @@ def main(danet_vname,
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         
-        #old topic
-        # for i, _ in enumerate(batch_li_li_thread_utterances):
-        #     li_thread_utterances = batch_li_li_thread_utterances[i]
-
-        #     li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
-        #                                 'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
-        #             for thread_utterance in li_thread_utterances]
-
-        #     [
-        #         thread_utterance.update(dict_kw) for thread_utterance, dict_kw in 
-        #         zip( li_thread_utterances, li_rakekw_textankkw)
-        #     ]
-
-        #     batch_li_li_thread_utterances[i] = li_thread_utterances
-        # #endregion
+        
         #endregion
 
         # region Drop keys
@@ -422,7 +376,7 @@ def _rst(li_li_thread_utterances, fh_container_id ):
         # a=0
         try:
             stdout_ = json.loads(stdout)
-        except TypeError as e:
+        except (TypeError, json.JSONDecodeError) as e:
             [ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
             li_li_thread_utterances[i] = li_thread_utterances
             continue
@@ -434,6 +388,7 @@ def _rst(li_li_thread_utterances, fh_container_id ):
                 _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
             except ValueError:
                 _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+                pass
             li_trees.append(_)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
@@ -568,17 +523,17 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
             if len(files_)>0:
                 fn = files_[0]
             else:
-                fn = "0000_0000"
+                fn = "0000_0000000000"
                 with open( os.path.join(subreddit_dir,fn),"a+",newline='\n',encoding='utf-8') as _f:
                     dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
                     dict_writer.writeheader()
                     pass
             
-            curr_len = int(fn[-4:])
+            curr_len = int(fn[-10:])
             new_len = curr_len + len(li_utterances)
 
             old_fp = os.path.join(subreddit_dir,fn)
-            new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:04d}")
+            new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
             
             keys = li_utterances[0].keys()
             with open(old_fp,"a+", newline='\n',encoding='utf-8') as fn:
@@ -594,10 +549,10 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 files_ = os.listdir(subreddit_dir)
 
                 #most recent filename saved to
-                last_fn = max( files_, key=int(fn[:4]) , default=f"0000_0000.csv")
+                last_fn = max( files_, key=int(fn[:4]) , default=f"0000_0000000000.csv")
 
                 # checking whether file is full
-                utt_count_in_last_file = int(last_fn[4:])
+                utt_count_in_last_file = int(last_fn[-10:])
                 
                 # extracting contents for file to add to
                 max_utt_to_add = batch_save_size - utt_count_in_last_file
@@ -636,7 +591,7 @@ if __name__ == '__main__':
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
-    parser.add_argument('--batch_process_size', default=12,
+    parser.add_argument('--batch_process_size', default=30,
         help='',type=int)        
 
     parser.add_argument('--batch_save_size', default=-1,
@@ -648,5 +603,23 @@ if __name__ == '__main__':
     parser.add_argument('--mp_count', default=6,
         type=int)
 
+    parser.add_argument('--start_batch', default=0, type=int)
+
     args = parser.parse_args()
-    main( **vars(args) )
+    
+    dict_args = vars(args)
+    
+    completed = False
+    while completed == False:
+        try:
+            main( **dict_args )
+            completed = True
+        except Exception as e:
+            cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
+            os.system(cmd)
+            os.system(cmd)
+
+            dict_args['start_batch'] = last_batch_processed + 1
+            pass
+            
+
