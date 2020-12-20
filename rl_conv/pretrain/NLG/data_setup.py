@@ -262,6 +262,8 @@ def main(danet_vname,
             li_thread_utterances = batch_li_li_thread_utterances[i]
             for idx in range(len(li_thread_utterances)):
                 li_thread_utterances[idx].pop('reply_to')
+                li_thread_utterances[idx].pop('id_utt')
+                li_thread_utterances[idx].pop('speaker_id')
             
             batch_li_li_thread_utterances[i] = li_thread_utterances
         # end region
@@ -522,21 +524,21 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 fn = files_[0]
             else:
                 fn = "0000_0000000000"
-                with open( os.path.join(subreddit_dir,fn),"a+",newline='\n',encoding='utf-8') as _f:
+                with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
                     dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
                     dict_writer.writeheader()
                     pass
             
             curr_len = int(fn[-10:])
-            new_len = curr_len + len(li_utterances)
+            new_len = curr_len + len(_li_utterances)
 
             old_fp = os.path.join(subreddit_dir,fn)
             new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
             
-            keys = li_utterances[0].keys()
-            with open(old_fp,"a+", newline='\n',encoding='utf-8') as fn:
+            keys = _li_utterances[0].keys()
+            with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
                 dict_writer = csv.DictWriter(fn, keys)
-                dict_writer.writerows(li_utterances)
+                dict_writer.writerows(_li_utterances)
             
             os.rename( old_fp, new_fp )
 
