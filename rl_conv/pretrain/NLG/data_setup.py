@@ -34,7 +34,7 @@ nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
 
 import csv
 import pickle
-
+import time
 import torch
 
 from utils import get_best_ckpt_path
@@ -608,7 +608,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     dict_args = vars(args)
-    
+    last_batch_processed = dict_args['start_batch']
     completed = False
     while completed == False:
         try:
@@ -617,9 +617,11 @@ if __name__ == '__main__':
         except Exception as e:
             cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
             os.system(cmd)
+            time.sleep(5)
             os.system(cmd)
-
-            dict_args['start_batch'] = last_batch_processed + 1
+            time.sleep(5)
+            last_batch_processed = last_batch_processed + 1
+            dict_args['start_batch'] = last_batch_processed
             pass
-            
+    #last bacth = 105
 
