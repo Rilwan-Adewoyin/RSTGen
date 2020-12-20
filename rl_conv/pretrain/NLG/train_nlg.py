@@ -34,11 +34,14 @@ import argparse
 import utils_nlg as utils
 import random 
 
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+
+
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
 import yaml
-
+import ast
 #Monkey Patching 
 #TODO: suggest this change on github pytorch lightning 
 def monkey_save_model(self, filepath: str, trainer, pl_module):
@@ -85,14 +88,16 @@ class NLG(nn.Module):
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
         
         # Optional Reset the Transformer model
-        if self.reset_base_transformer:
-            for param in self.transformer.parameters():
-                param.reset_parameters() # re-initializing weights
+        # if self.reset_base_transformer:
+        #     # for param in self.transformer.parameters():
+        #     #     param.reset_parameters() # re-initializing weights
+        #     for layer in self.classifier:
+        #         if isinstance(layer, nn.Linear):
+        #             layer.weight.data.normal_(mean=0.0, std=0.02)
+        #             if layer.bias is not None:
+        #                 layer.bias.data.zero_()
 
-        self.nlg_tokenizer = utils.load_pretrained_tokenizer_local( model_name = model_name)
-        if self.nlg_tokenizer == False:
-            self.nlg_tokenizer = NLG_tokenizer(base_model_name)
-            self.tokenizer.save("./models/roberta/tokenizer.json") 
+        self.nlg_tokenizer = NLG_tokenizer(base_model_name)
         
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
@@ -117,15 +122,13 @@ class NLG(nn.Module):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
                 
         parser.add_argument('--base_model_name', default='distilgpt2', required=False)
-        parser.add_argument('--reset_base_transformer', default=True, required=False, type=bool)
-        #parser.add_argument('--model_name', default='NLG', required=False)
+        parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
+        parser.add_argument('--model_name', default='NLG', required=False)
         parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
             choices=['CrossEntropy','UtteranceSimilarity']) 
         
         mparams = parser.parse_known_args( )[0]
-        if mparams.config_file != None:
-            mparams = json.load(open(utils.get_path(path)),"r" )
-        
+       
         return mparams
 
     def forward(self, input_):
@@ -233,36 +236,57 @@ class NLG_tokenizer():
     def __init__(self,
                  e2m_base_model_name='distilgpt2'):
 
+        self.e2m_base_model_name = e2m_base_model_name
+
         # RST utilities
+            #TODO: add case when rel == 'n' when it could not be classified
         self.rst_rel_li = ['Attribution',
             'Background','Cause','Comparing','Condition',
             'Contrast','Elaboration','Enablement','Evaluation',
             'Explanation','Joint','Manner-Means','Topic-Comment',
-            'Summary','Temporal','Topic Change']
+            'Summary','Temporal','Topic Change','n']
+
 
         self.rst_rel_binarizer = sklp.MultiLabelBinarizer()
-        self.rst_rel_binarizer.fit( [ rst_rel_li ] )
+        self.rst_rel_binarizer.fit( [ self.rst_rel_li ] )
 
-        self.rst_ns_li = ['NN','NS','SN',None]
+        self.rst_ns_li = ['NN','NS','SN','a']
         self.rst_ns_binarizer = sklp.MultiLabelBinarizer()
-        self.rst_ns_binarizer.fit( [ rst_ns_li ] )
+        self.rst_ns_binarizer.fit( [ self.rst_ns_li ] )
 
-        # DA utilities
+        # Initalising tokenzier
+        if os.path.isdir('./models/NLG_tokenizer'):
+            self.e2m_tokenizer = AutoToken.from_pretrained('./models/NLG_tokenizer')
 
-        # Entities 2 Mention Utilities
-            # Will use BERTS's encoding for words
-        self.e2m_base_model_name = e2m_base_model_name
-        self.e2m_tokenizer = utils.load_pretrained_transformer(self.e2m_base_model_name , transformer=False, tokenizer=True)['tokenizer']
+        # retreiving base tokenizer from online or local
+        else:
+            _dir_transformer = os.path.join( get_path("./models"), self.e2m_base_model_name )
+            exists = os.path.isdir(_dir_transformer)            
+
+            if exists==True:
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(_dir_transformer)
+            elif exists==False:
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(self.e2m_base_model_name)
+                
+                if str(special_tokens_dict['additional_special_tokens']) != \
+                 self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens','') :
+                    
+                    num_added_toks = self.e2m_tokenizer.add_special_tokens(special_tokens_dict)
+                    os.makedirs('./models/NLG_tokenizer')
+                    self.e2m_tokenizer.save_pretrained('./models/NLG_tokenizer')
 
         # Other
-        self.max_input_len = 1024
+        self.max_input_len = self.e2m_tokenizer.max_len
             # change this to make new tokenizer if it doesnt already exist
-        special_tokens_dict = {'dialogue_act': '[DA]'
-                                'rhetorical_structure_theory':'[RST]',
-                                'topic': '[TA]',
-                                'end_of_drt':'[EODRT]'}
+        
+        #TODO: add a check for these tokens and add them if they don't exist
+        token_exist = False
 
-        num_added_toks = self.e2m_tokenizer.add_special_tokens( special_tokens_dict )
+        
+        special_tokens_dict = {'additional_special_tokens':
+                ['<|da|>', '<|rst|>', '<|ta|>', '<|eodrt|>' ]}
+        
+
 
     
     def encode( self, rst_rels, rst_ns, rst_pos, das,
@@ -288,24 +312,24 @@ class NLG_tokenizer():
 
         #Getting Special Tokens
         #cls_token = self.e2m_tokenizer.token_to_id("[CLS]")     # Use same embedding layer E
-        da_start_token = self.e2m_tokenizer.token_to_id("[DA]") # Use same embedding layer E        
-        rst_start_token = self.e2m_tokenizer.token_to_id("[RST]") # Use same embedding layer E
-        topics_start_token = self.e2m_tokenizer.token_to_id("[TA]") # Use same embedding layer E
-        eodrt_token = self.e2m_tokenizer.token_to_id("[EODRT]") #(end of da, rst, topic ) # Use same embedding layer E 
+        da_start_token = self.e2m_tokenizer.token_to_id("<|da|>") # Use same embedding layer E        
+        rst_start_token = self.e2m_tokenizer.token_to_id("<|rst|>") # Use same embedding layer E
+        topics_start_token = self.e2m_tokenizer.token_to_id("<|ta|>") # Use same embedding layer E
+        eodrt_token = self.e2m_tokenizer.token_to_id("<|eodrt|>") #(end of da, rst, topic ) # Use same embedding layer E 
         eos_token = self.e2m_tokenizer.token_to_id("<|endoftext|>")   # Use same embedding layer E
         
         
         # adding padding
-        seq_len_nopad = rst_vectors.shape[0] + da_vectors.shape[0] + 
+        seq_len_nopad = rst_vectors.shape[0] + da_vectors.shape[0] + \
                             topics_vectors.shape[0] + tknzed_utt.shape[0] + 5
         
         padding_req = self.max_input_len - seq_len_nopad
         padding =  self.e2m_tokenizer.token_to_id("[PAD]") # tnsr of padding tokens to make 
         
         # making attn_mask section by section
-        preutt_dim = tnsr_das.size[0] + 
-                           tnsr_rst_rels.shape[1]+
-                           tnsr_topics_phrase.shape[1]+
+        preutt_dim = tnsr_das.size[0] + \
+                           tnsr_rst_rels.shape[1]+ \
+                           tnsr_topics_phrase.shape[1]+ \
                            4 # da,rst,topics,eordt tokens
         utt_dim = tknzd_utt.size + 1 # +1 for EOS token
         posteos_dim  = padding_req
@@ -327,14 +351,13 @@ class NLG_tokenizer():
         return { #'cls_token': cls_token,
                  'da_start_token':da_start_token, 'tnsr_das':tnsr_das, 'tnsr_da_pos':tnsr_da_pos, 
                  'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,'tnsr_rst_ns':tnsr_rst_ns,'tnsr_rst_pos':tnsr_rst_pos,
-                 'topics_start_token':topics_start_token, 'tnsr_topics_phrase':tnsr_topics_phrase, 'tnsr_topics_score', tnsr_topics_score,
-                 'eodrt_token': eodrt_token, 'tknzd_utt':tknzd_utt, 'eos_token':eos_token
+                 'topics_start_token':topics_start_token, 'tnsr_topics_phrase':tnsr_topics_phrase, 'tnsr_topics_score': tnsr_topics_score,
+                 'eodrt_token': eodrt_token, 'tknzd_utt':tknzd_utt, 'eos_token':eos_token,
                         #TODO: possibly text generated up until step i here
                         'padding_token':padding, 'padding_count':padding_count,
                         'attn_mask':attn_mask,
                         'labels':labels}
 
-    
     def encode_rst(self, rst_rels, rst_ns, rst_pos):
         """Converts the three lists into a seeries of vectors
 
@@ -382,9 +405,9 @@ class NLG_tokenizer():
         Returns:
             [type]: [description]
         """
-
+        topics = [ '<|ta|> '+topic  for topic in topics ]
         tnsr_topics_phrase = self.e2m_tokenizer( topics, add_special_tokens=False,
-                                                padding=None, truncation=3, 
+                                                padding=None, 
                                                 return_tensors='pt',
                                                 return_token_type_ids=False) # shape () topic_count, )
         
@@ -446,81 +469,82 @@ class TrainingModule(pl.LightningModule):
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
         parser.add_argument('--dir_data', default="./dataset/reddit_small_mc", help="Relative directory path for datafiles")
-        parse.add_argument('--dir_model', defailt="./model/")
+        parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=150, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
-        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('-bs','--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
         parser.add_argument('--warmup_proportion', default=0.05)
         parser.add_argument('--workers', default=0, type=int)
         parser.add_argument('--gpus', default=0, type=int)
-        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont','inference'])
+        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
         parser.add_argument('--lr_schedule', default='LROnPlateau', required=False, choices =['LROnPlateau','hard_restarts'])
-        parser.add_argument('--splits', default='{"train":0.6, "val":0. 2, "test":0.2}',required=False, type=json.loads )
+        parser.add_argument('--splits', default={'train':0.6, 'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         
             #TODO: check --version of required type None actually works
-
         tparams = parser.parse_known_args()[0]
-        if tparams.config_file != None:
-            tparams = json.load(open(utils.get_path(tparams.config_file)),"r" )
+        #tparams.splits = json.loads(tparams.splits)
 
         return tparams
     
     @staticmethod
-    def instatiate_training_module( tparams=None, mparams=None, model_dir=None ):
+    def instatiate_training_module( tparams=None, mparams=None ):
         """Create training module
 
         Args:
             tparams ([type]): [description]
         """
         
-        if tparams['mode'] in ["train"]:
-            training_module = TrainingModule(**vars(tparams), model_params=mparams  )
+        if tparams['mode'] in ["train_new"]:
+            training_module = TrainingModule(**tparams, model_params=mparams  )
 
         elif tparams['mode'] in ["test", "train_cont", "inference"]:
             #Retreiving best checkpoint from specific model-version
-            checkpoint_dir = tparams['checkpoint_dir'] if tparams['checkpoint_dir']!=None \
-                                else f"{model_dir}/{mparams['model_name']}/version_{tparams['version']:03d}/"
+
+            tparams['dir_checkpoints'] = os.path.join(tparams['dir_model'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
             
-            checkpoint_callback = 
-            checkpoint_path  = checkpoint_callback.best_model_path
+            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
+            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
             if torch.cuda.is_available():
-                checkpoint = torch.load(checkpoint_path)
+                checkpoint = torch.load(best_ckpt_path)
             else:
-                checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))
 
             #restore/update param files from the logs yaml
-            tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+            tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                 'batch_size', 'accumulate_grad_batches', 'lr_schedule', 'learning_rate',
-                'max_epochs','warmup_proportion']} 
+                'max_epochs','warmup_proportion']} )
 
-            mparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name','reset_base_transformer','loss_type']} 
+            mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                'base_model_name','reset_base_transformer','loss_type']} )
 
             os.makedirs(checkpoint_dir, exist_ok=True)
 
             training_module = TrainingModule(**vars(tparams), mparams=mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
         
+        else:
+            raise ValueError("tparams['mode'] must be in range [train_new, train_cont, test, inference]")
         return training_module
 
     @staticmethod
-    def instatiate_trainer( tparams, tb_logger, dir_model) ):
+    def instatiate_trainer( tparams, tb_logger, dir_model):
         """[summary]
 
             Creates The Trainer and callbacks
         """
         # Creating Callbacks
         callbacks = []
-        dir_checkpoints = os.path.join(dir_model,'checkpooints',mparams['model_name'],f"version_{tparams['version']:03d}" )
-        os.makedirs(dir_checkpoints, exist_ok=True)
+        dir_checkpoints = tparams['dir_checkpoints']
+        #os.makedirs(dir_checkpoints, exist_ok=True)
         
         if tparams.mode in ["train_new"]:
             
             checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
-                mode='min', dirpath=dir_checkpoint, 
+                mode='min', dirpath=dir_checkpoints, 
                 filename='{epoch:03d}_{val_loss:.5f}')
             
             early_stop_callback = EarlyStopping(
@@ -551,7 +575,7 @@ class TrainingModule(pl.LightningModule):
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
             trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
-                    resume_from_checkpoint = best_ckpt_path
+                    resume_from_checkpoint = best_ckpt_path,
                     check_val_every_n_epoch=1, logger=tb_logger,
                     log_every_n_steps=5,
                     precision=16
@@ -863,7 +887,7 @@ class SingleDataset(torch.utils.data.Dataset):
         #Topic scores
         #topics_rake = json.loads(datum['topic_rake'])
         topics_textrank = json.loads(datum['topic_textrank'])
-        rst_topics, rst_topics_score = zip( *topics_textrank ) #top 3 important words from utterance
+        topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
         
         #Utterance
         utterance = json.loads(datum['txt_preproc'])
@@ -873,47 +897,40 @@ class SingleDataset(torch.utils.data.Dataset):
             #( da_start_token, tnsr_das, tnsr_da_pos, rst_start_token, tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos,
                 #topics_start_token, tnsr_topics_phrase, tnsr_topics_score, eodrt_token, tknzd_utt ,padding_token, padding_count)      
         
-        
         map_datum = {**encoded_input, 'tknzed_utt': tknzed_target }
         
         return map_datum
 
 
 def main(tparams={}, mparams={}):
-    gc.collect()
     torch.cuda.empty_cache()
         
-    model_dir = utils.get_path(f'./models/')
-       
+           
     # Defining Logger
+
     tb_logger = pl_loggers.TensorBoardLogger( 
-                    save_dir = os.path.join(model_dir,"logs"),
-                    name = mparams['model_name']
+                    save_dir = os.path.abspath(tparams['model_dir']),
+                    name = mparams['model_name'],
                     version = tparams['version'] )
-    tparams['version'] =  tb_logger.version()
+    tparams['version'] =  tb_logger.version
 
  
-    training_module = NLG.instatiate_training_module( tparams, mparams, 
-                        model_dir=model_dir  )
+    training_module = TrainingModule.instatiate_training_module( tparams, mparams)
 
-    trainer = NLG.instatiate_trainer( tb_logger)
+    trainer = TrainingModule.instatiate_trainer( tb_logger)
     NLG.start(trainer, tparams, training_module)
                 
  
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
-    #parent_parser2 = argparse.ArgumentParser(add_help=False)    
-    
-    #parser_program = parent_parser.add_argument_group("program")
 
-        
     # add model specific args
     mparams = NLG.parse_model_specific_args(parent_parser)
 
     # add the trainer specific args
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
-    main(tparams, mparams)
+    main(vars(tparams), vars(mparams))
 
 

@@ -48,6 +48,15 @@ from unidecode import unidecode
 last_batch_processed = 0
 dict_args = {}
 
+pattern_hlinks =  re.compile("(\[?[\S ]*\]?)(\((https|www|ftp|http)?[\S]+\))")
+pattern_hlinks2 =  re.compile("([\(]?(https|www|ftp|http){1}[\S]+)")
+pattern_repword = re.compile(r'\b([\S]+)(\s+\1)+\b')
+pattern_repdot = re.compile(r'[\.]{2,}')
+pattern_qdab = re.compile("[\"\-\*\[\]]+")
+pattern_multwspace = r'[\s]{2,}'
+
+r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
+
 # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
             # Coloumns = [Speaker, utterance, Dialog Act, RST, topics ]
@@ -280,15 +289,13 @@ def _load_data():
     return corpus
 
 def _preprocess(text):
-
+    # removing leading and trailing whitespace characters
+    text = text.strip()
     # replacing hyperlinks with [link token]
-    #https://mathiasbynens.be/demo/url-regex
-    # "(\[[\w\-,\. ]+\])(\((https|www|ftp)?\S+\))"
-    #pattern = r"([\w]+)(\(_^(?:(?:https?|ftp)://)(?:\S+(?::\S*)?@)?(?:(?!10(?:\.\d{1,3}){3})(?!127(?:\.\d{1,3}){3})(?!169\.254(?:\.\d{1,3}){2})(?!192\.168(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z\x{00a1}-\x{ffff}0-9]+-?)*[a-z\x{00a1}-\x{ffff}0-9]+)(?:\.(?:[a-z\x{00a1}-\x{ffff}0-9]+-?)*[a-z\x{00a1}-\x{ffff}0-9]+)*(?:\.(?:[a-z\x{00a1}-\x{ffff}]{2,})))(?::\d{2,5})?(?:/[^\s]*)?$_iuS\))"
-    pattern =  re.compile("(\[[\w\-,\. ]+\])(\((https|www|ftp)?\S+\))")
-    text = re.sub(pattern,r"\1", text)
-        #causes [candid pics without makeup] --> [ candid pics without makeup ]
-        # correct this in output
+    text = re.sub(pattern_hlinks,r"\1", text)
+
+    # remove general hyperlinks
+    text = re.sub(pattern_hlinks2,"", text)
 
     # replace emojis
     text = emoji.demojize( text )
@@ -304,29 +311,22 @@ def _preprocess(text):
                 #so need to have regex code to compress words between two colons (with underscores)
         
     # remove repeated words
-    text = text.replace(r'\b([\w\-,\.]+)(\s+\1)+\b', r'\1')
+    text = text.replace(pattern_repword, r'\1')
+
     #remove repeated periods
-    text = re.sub(r'(\.)\1{1}', ",", text)
+    text = re.sub(pattern_repdot, ".", text)
 
     # convert to ascii
     text = text.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "")
 
-    #remove qoutes
-    text = text.replace('"', '')
-
-    text = text.replace('-', '')
+    #remove qoutes, dash and asterix, brackets
+    text = re.sub(pattern_qdab, "", text)
 
     # remove multiple spaces
-    
-    text = re.sub(r'(?![\.\s?!])\n\s*\n', '.', text.strip())
-
-    text = re.sub(r'(?<=[\.\s?!])\n\s*\n', '', text)
-
-    text = re.sub(r'[\n\t ]{2,}', '', text)
+    text = re.sub(pattern_multwspace, ' ', text)
 
     return text
 
-    # Get a list of utterance and its preceeding utterance
 
 def _valid_utterance(txt):
 
@@ -432,7 +432,7 @@ def _tree_to_rst_code(_tree):
     for depth in range( _tree.height(),1,-1 ):
         
         subli_rels_ns = [  re.findall(r'[a-zA-Z]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
-        subli_rels_ns = [ [_li[0],_li[1:]] for _li in subli_rels_ns ]
+        subli_rels_ns = [ [_li[0],''.join(_li[1:]) ] for _li in subli_rels_ns ]
 
         li_rels_ns.extend(subli_rels_ns)
 
@@ -463,7 +463,7 @@ def _topic(li_li_thread_utterances):
     for i, _ in enumerate(li_li_thread_utterances):
         li_thread_utterances = li_li_thread_utterances[i]
 
-        li_rakekw_textankkw = [ {'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
+        li_rakekw_textankkw = [ #{'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
                                     'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
                 for thread_utterance in li_thread_utterances]
 
@@ -476,7 +476,7 @@ def _topic(li_li_thread_utterances):
     return li_li_thread_utterances
 
 def _rake_kw_extractor(str_utterance, topk=3):
-    r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
+    
     r1.extract_keywords_from_text(str_utterance)
     
     li_ranked_kws = r1.get_ranked_phrases_with_scores()
@@ -491,11 +491,10 @@ def _textrank_extractor(str_utterance,topk=3):
     # Add the below to docker file
     # os.system(') install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.1.0/en_core_web_sm-2.1.0.tar.gz')
     # os.system python -m spacy download en_core_web_sm
+    # pytextrank using entity linking when deciding important phrases, for entity coreferencing
 
     doc = nlp(str_utterance)
-
     li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases ]
-
     return li_ranked_kws[:topk]
         
 def _save_data(li_utterances, batch_save_size, dir_save_dataset):
@@ -511,7 +510,6 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
     # Grouping utterances by the subreddit 
     grouped_li_utterances = [ ( k, list(g)) for k,g in itertools.groupby(li_utterances, lambda _dict: _dict['subreddit'] ) ]
         #a list of tuples; elem0: subreddit name elem1: list of convos for that subreddit
-    
     
     for subreddit, _li_utterances in grouped_li_utterances:
         subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  

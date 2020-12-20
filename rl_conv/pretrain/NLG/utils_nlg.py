@@ -30,7 +30,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
 
     if exists == False:    
         model_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
         
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
