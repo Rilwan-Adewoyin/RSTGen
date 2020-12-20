@@ -21,7 +21,6 @@ import pickle
 from itertools import cycle, islice
 from torch.utils.data._utils.collate import default_convert, default_collate
 
-from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 
 import pytorch_lightning as pl
@@ -35,14 +34,32 @@ import argparse
 import utils_nlg as utils
 import random 
 
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+
+
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
+import yaml
+import ast
+#Monkey Patching 
+#TODO: suggest this change on github pytorch lightning 
+def monkey_save_model(self, filepath: str, trainer, pl_module):
+    # in debugging, track when we save checkpoints
+    trainer.dev_debugger.track_checkpointing_history(filepath)
 
+    # make paths
+    if trainer.is_global_zero:
+        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-#TODO:
-# Write DataLoader
-# Writer New Model 
+    # delegate the saving to the trainer
+    if self.save_function is not None:
+        self.save_function(filepath, self.save_weights_only)
+    
+    self.to_yaml()
+
+ModelCheckpoint._save_model = monkey_save_model
+
 
 class Mish(nn.Module):
     def __init__(self):
@@ -56,90 +73,361 @@ class NLG(nn.Module):
     """NLG unit
     """
 
-    def __init__(self, freeze_transformer=False, dropout=0.1, 
-        base_model_name='microsoft/DialoGPT-small', model_name="NLG", **kwargs):
-
+    def __init__(self, 
+        base_model_name= 'distilgpt2', model_name="NLG",
+        reset_base_transformer=True, loss_type="CrossEntropy",
+        **kwargs):
+            #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
-
-
-        # Instantiate BERT model
-        self.base_model_name = base_model_name       
-        dict_transformertokenizer = utils.load_pretrained_transformer(self.base_model_name , transformer=True, tokenizer=True)
-        self.transformer = dict_transformertokenizer['transformer']
-        self.tokenizer = dict_transformertokenizer['tokenizer']
-        self.freeze_transformer = freeze_transformer
-        self.dropout = dropout
-        # Freeze the Transformer model
-        if self.freeze_transformer:
-            for param in self.transformer.parameters():
-                param.requires_grad = False
         
-        # for layer in self.classifier:
-        #     if isinstance(layer, nn.Linear):
-        #         layer.weight.data.normal_(mean=0.0, std=0.02)
-        #         if layer.bias is not None:
-        #             layer.bias.data.zero_()
+        self.base_model_name = base_model_name   
+        self.model_name = model_name
+        self.reset_base_transformer = reset_base_transformer
 
+        # Retreive/Instantiate base transformer
+        self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
+        
+        # Optional Reset the Transformer model
+        # if self.reset_base_transformer:
+        #     # for param in self.transformer.parameters():
+        #     #     param.reset_parameters() # re-initializing weights
+        #     for layer in self.classifier:
+        #         if isinstance(layer, nn.Linear):
+        #             layer.weight.data.normal_(mean=0.0, std=0.02)
+        #             if layer.bias is not None:
+        #                 layer.bias.data.zero_()
+
+        self.nlg_tokenizer = NLG_tokenizer(base_model_name)
+        
+        
+        self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
+
+        # Embedding Layers
+        self.embd_outp_dim = self.transformer.config.n_embd
+        self.embedding_das = torch.nn.conv1d(1, self.embd_outp_dim, kernel=20)
+        #self.embedding_das_pos = torch.nn.Embedding( 6, self.embd_outp_dim )
+        self.embedding_rst_rels = torch.nn.conv1d( 1, self.embd_outp_dim, kernel=16)
+        self.embedding_rst_ns = torch.nn.conv1d( 1, self.embd_outp_dim, kernel=3)
+        self.embedding_rst_pos = torch.nn.Embedding( 6, self.embd_outp_dim )
+        self.embedding_general = torch.nn.Embedding( len(self.nlg_tokenizer.e2m_tokenizer) , self.embd_outp_dim, sparse=True, scale_grad_by_freq=True  )
+            #TODO: consider initializing embedding from a pre-existing GPT-2 embedding layer 
+        self.embedding_topics_score = torch.nn.conv1d(1, self.embd_outp_dim, kernel=1)
+        #Remove the Transformer models embedding layers
+
+
+        
+        
     @staticmethod
     def parse_model_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
-        
-        parser.add_argument('--config_file', default=None, help="Path to the \
-            training hyperameters for this model ")
-        
-        parser.add_argument('--base_model_name', default='microsoft/DialoGPT-small', required=False)
-        parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
-        parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
+                
+        parser.add_argument('--base_model_name', default='distilgpt2', required=False)
+        parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='NLG', required=False)
+        parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
+            choices=['CrossEntropy','UtteranceSimilarity']) 
         
         mparams = parser.parse_known_args( )[0]
-        if mparams.config_file != None:
-            mparams = json.load(open(utils.get_path(path)),"r" )
-        
+       
         return mparams
 
     def forward(self, input_):
         """[summary]
 
         Args:
-            input_ids (torch.tensor): an input tensor with shape (batch_size,
-                      max_length)
-
-            attention_mask (torch.tensor):  a tensor that hold attention mask
-                      information with shape (batch_size, max_length)
-
-            token_type_ids (torch.tensor): an output tensor with shape (batch_size,
-                      num_labels)
+            input_ (torch.tensor): dict of inputs
 
         Returns:
             [type]: [description]
         """
-        #input_ids, attention_mask, token_type_ids = input_
-        input_ids = torch.squeeze(input_['input_ids'])
-        attention_mask = torch.squeeze(input_['attention_mask']) #
-        token_type_ids = torch.squeeze(input_['token_type_ids']) #extend to rst, da, topics, [prev topic vectors, prev rst topics]
-        #TODO: add new two new tokens, one after rst and one after da, topics
+        # Creating embedded inputs and attention mask
+        input_embed = layer_embed( input_ )
 
-
-        # Feed input to small DialoGPT
-        outputs = self.transformer(input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            token_type_ids=token_type_ids)
+        # Feed input to distilgpt2
+        if self.loss_type == "CrossEntropy":      
+            outputs = self.transformer( inputs_embeds=input_embed,
+                                        attention_mask = input_['attn_mask'],
+                                        labels= input_['labels'] ,
+                                        position_ids=None, #check pos_ids are being removed
+                                        return_dict=True )
+        
+        elif self.loss_type == "UtteranceSimilarity":
+            raise NotImplementedError
         
 
-        return logits
+        return outputs #dictionary
+    
+    def layer_embedding(self, input_):
+        """Creates embedding for input
+
+        Args:
+            input_ ([type]): [description]
+
+        Returns:
+            input_embedded [type]: [description]
+            
+
+        """
+        #cls_token = self.embedding_general( input_[cls_token])
+        da_start_token = self.embedding_general( input_['da_start_token'] )
+        das_word = self.embedding_das(input_['tnsr_das'])
+        #das_pos = self.embedding_das_pos(input_['tnsr_da_pos'])
+        das = das_word
+        
+        rst_start_token = self.embedding_general( input_['rst_start_token'] )        
+        rst_rels = self.embedding_rst_rels( input_['tnsr_rst_rels'] )
+        rst_ns = self.embedding_rst_rels( input_['tnsr_rst_ns'] )
+        rst_pos = self.embedding_rst_pos( input_['tnsr_rst_pos'] )
+        rst = rst_rels + rst_ns + rst_pos
+
+        topics_start_token = self.embedding_general( input_['topics_start_token'])
+        topics_phrase = self.embedding_general( input_['tnsr_topics_phrase']) #TODO: Handle Case where a phrase is predicted (flatten)
+        topics_score = self.embedding_topics_score( input_['tnsr_topics_score'])
+        topics = topics_phrase + topics_score
+
+        eodrt_token = self.embedding_general( input_['eodrt_token'])
+        embed_utt = self.embedding_general( input_['tknzd_utt'] )
+        eos_token  =self.embedding_general( input_['eos_token'] )
+        padding  = self.embedding_general( input_['padding'] ).repeat( 1, input_['padding_count'], 1 )
+
+        
+        input_embedded = torch.concat(
+            [da_start_token, das,
+             rst_start_token, rst,
+             topics_start_token, topics,
+             eodrt_token,
+             embed_utt,
+             eos_token,
+             padding], axis = 1
+        ) #dim [bs, 1024, dim1]
+        
+
+        return input_embedded
 
     def return_params(self):
         params = {}
-        params['base_model_name'] = self.base_model_name
-        params['freeze_transformer'] = self.freeze_transformer
-        params['model_name'] = self.base_model_name
-        params['dropout'] = self.dropout
+
+        params['base_model_name'] = self.batch_size
+        params['reset_base_transformer'] = self.accumulate_grad_batches
+        params['loss_type'] = self.loss_type 
+
         return params
+
+    def get_predicted_utterance(self):
+        """Given an input sequence, outputs predictions up until an <EOS> is emmitted
+
+        Raises:
+            Exception: [description]
+
+        Returns:
+            [type]: [description]
+        """
+
+class NLG_tokenizer():
+    """Rough Implmentation of the tokenizer for the NLG model
+
+    Raises:
+        Exception: [description]
+
+    Returns:
+        [type]: [description]
+    """
+
+    def __init__(self,
+                 e2m_base_model_name='distilgpt2'):
+
+        self.e2m_base_model_name = e2m_base_model_name
+
+        # RST utilities
+            #TODO: add case when rel == 'n' when it could not be classified
+        self.rst_rel_li = ['Attribution',
+            'Background','Cause','Comparing','Condition',
+            'Contrast','Elaboration','Enablement','Evaluation',
+            'Explanation','Joint','Manner-Means','Topic-Comment',
+            'Summary','Temporal','Topic Change','n']
+
+
+        self.rst_rel_binarizer = sklp.MultiLabelBinarizer()
+        self.rst_rel_binarizer.fit( [ self.rst_rel_li ] )
+
+        self.rst_ns_li = ['NN','NS','SN','a']
+        self.rst_ns_binarizer = sklp.MultiLabelBinarizer()
+        self.rst_ns_binarizer.fit( [ self.rst_ns_li ] )
+
+        # Initalising tokenzier
+        if os.path.isdir('./models/NLG_tokenizer'):
+            self.e2m_tokenizer = AutoToken.from_pretrained('./models/NLG_tokenizer')
+
+        # retreiving base tokenizer from online or local
+        else:
+            _dir_transformer = os.path.join( get_path("./models"), self.e2m_base_model_name )
+            exists = os.path.isdir(_dir_transformer)            
+
+            if exists==True:
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(_dir_transformer)
+            elif exists==False:
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(self.e2m_base_model_name)
+                
+                if str(special_tokens_dict['additional_special_tokens']) != \
+                 self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens','') :
+                    
+                    num_added_toks = self.e2m_tokenizer.add_special_tokens(special_tokens_dict)
+                    os.makedirs('./models/NLG_tokenizer')
+                    self.e2m_tokenizer.save_pretrained('./models/NLG_tokenizer')
+
+        # Other
+        self.max_input_len = self.e2m_tokenizer.max_len
+            # change this to make new tokenizer if it doesnt already exist
+        
+        #TODO: add a check for these tokens and add them if they don't exist
+        token_exist = False
+
+        
+        special_tokens_dict = {'additional_special_tokens':
+                ['<|da|>', '<|rst|>', '<|ta|>', '<|eodrt|>' ]}
+        
+
+
+    
+    def encode( self, rst_rels, rst_ns, rst_pos, das,
+        topics, topics_score, utterance ,prev_das=None, prev_rst=None,
+        labels=True):
+
+        """Return 
+
+            attn_mask : Bidirectional up to EODRT token, Causal Up till EOS, 0s till end of padding
+
+        Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
+            and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
+        """
+        
+        #Getting Vectors
+        tnsr_das, tnsr_da_pos = self.encode_da( das ) #dims (n2, 20), (n2,) # Use an upscaling convolution layer  and an embedding layer
+        tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst(rst_rels, rst_ns, rst_pos)   # dims (n1, 13) (n1, 3) (n1,) # Use an upscaling convolution layer, upscaling convolution layer, embedding layer  
+        tnsr_topics_phrase, tnsr_topics_score = self.encode_topic( topics, topics_score) #dims (n3, ) (n3, )  # Use an embedding layer E, upscaling convolutional layer
+        tknzd_utt = self.encode_utterance(utterance)
+        
+            #This will already have a EOS token
+            #TODO: make sure to remove CLS token
+
+        #Getting Special Tokens
+        #cls_token = self.e2m_tokenizer.token_to_id("[CLS]")     # Use same embedding layer E
+        da_start_token = self.e2m_tokenizer.token_to_id("<|da|>") # Use same embedding layer E        
+        rst_start_token = self.e2m_tokenizer.token_to_id("<|rst|>") # Use same embedding layer E
+        topics_start_token = self.e2m_tokenizer.token_to_id("<|ta|>") # Use same embedding layer E
+        eodrt_token = self.e2m_tokenizer.token_to_id("<|eodrt|>") #(end of da, rst, topic ) # Use same embedding layer E 
+        eos_token = self.e2m_tokenizer.token_to_id("<|endoftext|>")   # Use same embedding layer E
+        
+        
+        # adding padding
+        seq_len_nopad = rst_vectors.shape[0] + da_vectors.shape[0] + \
+                            topics_vectors.shape[0] + tknzed_utt.shape[0] + 5
+        
+        padding_req = self.max_input_len - seq_len_nopad
+        padding =  self.e2m_tokenizer.token_to_id("[PAD]") # tnsr of padding tokens to make 
+        
+        # making attn_mask section by section
+        preutt_dim = tnsr_das.size[0] + \
+                           tnsr_rst_rels.shape[1]+ \
+                           tnsr_topics_phrase.shape[1]+ \
+                           4 # da,rst,topics,eordt tokens
+        utt_dim = tknzd_utt.size + 1 # +1 for EOS token
+        posteos_dim  = padding_req
+        
+        mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
+        mask[ :preutt_dim , :preutt_dim ] = 1 #pre_utt masking
+        mask[ preutt_dim:preutt_dim+utt_dim,
+                preutt_dim:preutt_dim+utt_dim] = torch.tril( 
+                    torch.ones([ utt_dim,utt_dim]) ) #utt_dim
+        mask[ -posteos_dim: , -posteos_dim: ] = 0 #posteos dim
+
+        #Creating labels/targets for GPT Language Model Head
+        start_idx = preutt_dim
+        end_idx = preutt_dim + utt_dim
+        labels = -100* torch.ones( [ 1024, 1] )
+        labels[start_idx:end_idx-1] = tknzd_utt
+        labels[start_idx:end_idx-1] = eos_token
+
+        return { #'cls_token': cls_token,
+                 'da_start_token':da_start_token, 'tnsr_das':tnsr_das, 'tnsr_da_pos':tnsr_da_pos, 
+                 'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,'tnsr_rst_ns':tnsr_rst_ns,'tnsr_rst_pos':tnsr_rst_pos,
+                 'topics_start_token':topics_start_token, 'tnsr_topics_phrase':tnsr_topics_phrase, 'tnsr_topics_score': tnsr_topics_score,
+                 'eodrt_token': eodrt_token, 'tknzd_utt':tknzd_utt, 'eos_token':eos_token,
+                        #TODO: possibly text generated up until step i here
+                        'padding_token':padding, 'padding_count':padding_count,
+                        'attn_mask':attn_mask,
+                        'labels':labels}
+
+    def encode_rst(self, rst_rels, rst_ns, rst_pos):
+        """Converts the three lists into a seeries of vectors
+
+        Args:
+            rst_rels ([type]): [description]
+            rst_ns ([type]): [description]
+            rst_pos ([type]): [description]
+        """
+        rst_rels_encoded = self.rst_rel_binarizer.transform( rst_rels )
+        rst_ns_encoded = self.rst_ns_binarizer.transform( rst_ns )
+        rst_pos = rst_pos
+
+        tnsr_rels = torch.from_numpy( rst_rels_encoded ) #dim [ n, encode_dim1]
+        tnsr_ns = torch.from_numpy( rst_ns_encoded )    #dim [ n, encode_dim2]
+        tnsr_pos = torch.from_numpy( rst_pos )          #dim [ n, encode_dim3]
+        
+        #tnsr_rst = torch.cat( [tnsr_rels, tnsr_ns, tnsr_pos ] , axis=1  )
+
+        return tnsr_rels, tnsr_ns, tnsr_pos
+    
+    def encode_da(self, das):
+        """[summary]
+
+        Args:
+            das ([type]): [list of da probabilites]
+        """
+        #TODO: add some normalization of da probabilities here
+        tnsr_das = torch.FloatTensor( das) #dim [n, encode_dim1]
+        tnsr_pos = torch.unsqueeze( torch.range(start=1, end=tnsr_das.shape[0], dtype=torch.float32 ), dim=1 )
+
+        #tnsr_daspos = torch.cat( [tnsr_das, tnsr_pos], axis=1)
+        
+        return tnsr_das, tnsr_pos
+
+    def encode_topic(self, topics, topics_score):
+        """[summary]
+
+        Args:
+            topics ([type]): [list of topics (phrases or words)]
+            topics_score ([type]): [list of float scores for each topic relevancy]
+
+        Raises:
+            Exception: [description]
+
+        Returns:
+            [type]: [description]
+        """
+        topics = [ '<|ta|> '+topic  for topic in topics ]
+        tnsr_topics_phrase = self.e2m_tokenizer( topics, add_special_tokens=False,
+                                                padding=None, 
+                                                return_tensors='pt',
+                                                return_token_type_ids=False) # shape () topic_count, )
+        
+        tnsr_score = torch.unsqueeze( torch.FloatTensor( topics_score ) , dim=-1 ) # shape (topic_count, )
+
+        # tnr_topic = torch.cat( [tnsr_topics_phrase, tnsr_score], axis=1 )
+
+        return tnsr_topics_phrase, tnsr_score
+
+    def encode_utterance(self, utterance):
+        tknzd_utt = self.e2m_tokenizer(utterance,add_special_tokens=False,
+                                                padding=None, truncation=300, 
+                                                return_tensors='pt',
+                                                return_token_type_ids=False)
+        
+        return tknzd_utt
 
 class TrainingModule(pl.LightningModule):
 
-    def __init__(self, model=NLG(), batch_size=20, 
+    def __init__(self, model_params, batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
                     max_epochs=100,
@@ -155,103 +443,189 @@ class TrainingModule(pl.LightningModule):
 
         self.batch_size = batch_size
         self.gpus =  gpus
-        self.save_hyperparameters('batch_size', 'accumulate_grad_batches', 
-            'max_epochs', 'learning_rate',
-            'warmup_proportion')
-        
-        self.model = model
+        self.model = NLG( **model_params )
         self.mode = mode
         self.workers = workers
-        #self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-                
+        
         if self.mode in ['train_new','train_cont','test']:
+            self.create_data_loaders(self.workers)
+            self.dir_data = utils.get_path(dir_data)
+            self.accumulate_grad_batches = accumulate_grad_batches
+
+        if self.mode in ['train_new','train_cont']:
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-        
-            self.loss = nn.BCEWithLogitsLoss()
-
-            self.save_hyperparameters(model.return_params())
-
-            self.create_data_loaders(self.workers)
-
-            self.dir_data = utils.get_path(dir_data)
-
             self.learning_rate = learning_rate
-
-            self.accumulate_grad_batches = accumulate_grad_batches
-
-            # self.dict_acc = {
-            #     k:pl.metrics.classification.Accuracy( ) for k in ["train",
-            #         "val","test"] }
-            # self.dict_acc_micro = {
-            #     k:pl.metrics.classification.Accuracy( ) for k in ["train",
-            #         "val","test"] }
-            # self.dict_prec = {
-            #     k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in ["train",
-            #         "val","test"] }
-            # self.dict_recall =  {
-            #     k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
-            #         "val","test"] }
-                    
-
         
+
+        if self.mode in ['train_new']:
+            train_params_to_save = self.return_params()
+            model_params_to_save = self.model.return_params()
+            self.save_hyperparameters( train_params_to_save )
+            self.save_hyperparameters( model_params_to_save )
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
-        parser.add_argument('--config_file', default=None, help="Path to the \
-            model hyperameters used in this model")        
-        parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
-        #parser.add_argument('--gpus', default=None)
+        parser.add_argument('--dir_data', default="./dataset/reddit_small_mc", help="Relative directory path for datafiles")
+        parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=150, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
-        parser.add_argument('--context_history_len', default=1, type=int)
-        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('-bs','--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
         parser.add_argument('--warmup_proportion', default=0.05)
         parser.add_argument('--workers', default=0, type=int)
         parser.add_argument('--gpus', default=0, type=int)
-        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
-        parser.add_argument('--version_name', default='', required=False)
+        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
         parser.add_argument('--lr_schedule', default='LROnPlateau', required=False, choices =['LROnPlateau','hard_restarts'])
-        #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
-
+        parser.add_argument('--splits', default={'train':0.6, 'val':0.2,'test':0.2}, required=False, type=str )
+        parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
+        
+            #TODO: check --version of required type None actually works
         tparams = parser.parse_known_args()[0]
-        if tparams.config_file != None:
-            tparams = json.load(open(utils.get_path(tparams.config_file)),"r" )
+        #tparams.splits = json.loads(tparams.splits)
 
         return tparams
+    
+    @staticmethod
+    def instatiate_training_module( tparams=None, mparams=None ):
+        """Create training module
 
+        Args:
+            tparams ([type]): [description]
+        """
+        
+        if tparams['mode'] in ["train_new"]:
+            training_module = TrainingModule(**tparams, model_params=mparams  )
+
+        elif tparams['mode'] in ["test", "train_cont", "inference"]:
+            #Retreiving best checkpoint from specific model-version
+
+            tparams['dir_checkpoints'] = os.path.join(tparams['dir_model'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
+            
+            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
+            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            best_ckpt_path = min(scores_dict, key=scores_dict.get)
+
+            if torch.cuda.is_available():
+                checkpoint = torch.load(best_ckpt_path)
+            else:
+                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))
+
+            #restore/update param files from the logs yaml
+            tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                'batch_size', 'accumulate_grad_batches', 'lr_schedule', 'learning_rate',
+                'max_epochs','warmup_proportion']} )
+
+            mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                'base_model_name','reset_base_transformer','loss_type']} )
+
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+            training_module = TrainingModule(**vars(tparams), mparams=mparams)
+            training_module.load_state_dict(checkpoint['state_dict'])
+        
+        else:
+            raise ValueError("tparams['mode'] must be in range [train_new, train_cont, test, inference]")
+        return training_module
+
+    @staticmethod
+    def instatiate_trainer( tparams, tb_logger, dir_model):
+        """[summary]
+
+            Creates The Trainer and callbacks
+        """
+        # Creating Callbacks
+        callbacks = []
+        dir_checkpoints = tparams['dir_checkpoints']
+        #os.makedirs(dir_checkpoints, exist_ok=True)
+        
+        if tparams.mode in ["train_new"]:
+            
+            checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+                mode='min', dirpath=dir_checkpoints, 
+                filename='{epoch:03d}_{val_loss:.5f}')
+            
+            early_stop_callback = EarlyStopping(
+                monitor='val_loss',
+                min_delta=0.00,
+                patience=8,
+                verbose=False,
+                mode='auto'
+
+            )
+            callbacks.append(checkpoint_callback)
+            callbacks.append(early_stop_callback)
+
+            trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
+                        check_val_every_n_epoch=1, logger=tb_logger,
+                        log_every_n_steps=5,
+                        precision=16, callbacks=callbacks,
+                        #track_grad_norm = True,
+                        #overfit_batches=5
+                        #,fast_dev_run=2, 
+                        #log_gpu_memory=True
+                        )
+
+        if tparams.mode in ["train_cont","test","inference"]:
+             
+            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
+            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            best_ckpt_path = min(scores_dict, key=scores_dict.get)
+
+            trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
+                    resume_from_checkpoint = best_ckpt_path,
+                    check_val_every_n_epoch=1, logger=tb_logger,
+                    log_every_n_steps=5,
+                    precision=16
+                    #track_grad_norm = True,
+                    #overfit_batches=5
+                    #,fast_dev_run=2, 
+                    #log_gpu_memory=True
+                    )
+            
+            return trainer
+        
+    @staticmethod
+    def start(trainer, tparams, training_module ):
+        
+        if tparams.mode in ["test"]:
+            training_module.eval() 
+            training_module.freeze() 
+            trainer.test(test_dataloaders=training_module.test_dl, model=training_module, ckpt_path='best')
+            
+            
+        elif tparams.mode in ['train_new','train_cont']:    
+            trainer.fit(training_module)
+            
+            trainer.checkpoint_callback.to_yaml()
+
+            trainer.test(test_dataloaders=training_module.test_dl, ckpt_path='best')
+        
+        elif tparams.mode in ['infernece']: 
+            raise NotImplementedError   
+
+           
     def step(self, batch, step_name):
-        target = batch.pop('da')
+
+        #target = batch.pop('tknzed_target')
        
         input_= batch
         output = self.forward(input_)
 
-        #removing lines with no DA label
-        keep_mask = torch.sum(target, dim=1, dtype=bool )
-        target = target[keep_mask]
-        output = output[keep_mask]
+        #TODO: Make version where loss is based on meaning of the true utterance and my predicted utterance
+        loss = output['loss']
 
-        loss = self.loss( output, target)
+        #TODO: removing losses on utterances that had no valid rst relation tag
+            # requires loss to not already be batch reduced
+        keep_mask = batch['tnsr_rst'] != None
+        loss = loss[keep_mask]
+
         loss_key = f"{step_name}_loss"
         
         output =  output.to('cpu')
-        output_bnrzd = torch.where( output<0.5,0.0,1.0)
-        target  = target.to('cpu')
 
-        #correct_micro = output_bnrzd.eq(target).min(dim=1)[0].sum()
-        #correct_macro = output_bnrzd.eq(target).sum()
-        #total_micro = target.shape[0]
-        #total_macro = torch.numel(target)
-
-        self.dict_acc[step_name](output_bnrzd, target)
-        correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
-        self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
-        self.dict_recall[step_name](output_bnrzd, target)
-        self.dict_recall[step_name](output_bnrzd, target)
-        self.dict_prec[step_name](output_bnrzd, target)
 
         if step_name == 'train':
             str_loss_key = "loss"
@@ -267,25 +641,20 @@ class TrainingModule(pl.LightningModule):
             prog_bar = False
             logger = True
         
-            #self.log( str_loss_key, loss)#, on_step=on_step, on_epoch=on_epoch, prog_bar=True, logger=True)
+            self.log( str_loss_key, loss)#, on_step=on_step, on_epoch=on_epoch, prog_bar=True, logger=True)
         
         _dict = { str_loss_key: loss }
+                
+        #self.log(f'{step_name}_l', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         
-        self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
-        self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-
-        #self.log(f"{step_name}_acc_micro_step", correct_micro/total_micro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        #self.log(f"{step_name}_acc_macro_step", correct_macro/total_macro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-
-        return  _dict #, f'rec':self.dict_recall[step_name].compute() , f'prec':self.dict_prec[step_name].compute() }
+        return  _dict 
         
     #@auto_move_data
     def forward(self, input_, *args):
+        
         return self.model(input_)
 
-    def format_preds(self, preds):
+    def get_predicted_utterance(self, output):
         """Converts list of logit scores for Dialogue Acts
             to a list of OrderedDictionaries where
             each dict contains the DA names and probabilities 
@@ -297,33 +666,20 @@ class TrainingModule(pl.LightningModule):
         Returns:
             [type]: [description]
         """
-        preds = torch.sigmoid(preds)
-        li_li_da = preds.tolist()
-
-        li_dict_da = [ OrderedDict(zip( self.ordered_label_list, pred_da))
-                            for pred_da in li_li_da ]
-
-        return li_li_da, li_dict_da
+        predicted_utterance = self.model.get_predicted_utterance( output )
+        
+        return predicted_utterance
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch,"train")
-
-        #self.log( 'train_loss', output['loss'] )
-
         return output
 
     def validation_step(self, batch, batch_idx):
         output = self.step(batch, "val")
-        
-        #self.log('val_loss', output['val_loss'])
-
         return output
 
     def test_step(self, batch, batch_idx):
         output = self.step(batch, "test")
-
-        #self.log('test_loss', output['test_loss'])
-
         return output
 
     def training_epoch_end(self, outputs):
@@ -341,29 +697,18 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-
-            #correct_micro = torch.stack([x["correct_micro"] for x in outputs]).sum()
-            #correct_macro = torch.stack([x["correct_macro"] for x in outputs]).sum()
-            #total_micro=sum([x["total_micro"] for  x in outputs])
-            ##total_macro=sum([x["total_macro"] for  x in outputs])
-            
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
-            #self.log(f"{step_name}_acc_micro_epoch", correct_micro/total_micro, logger=True, prog_bar=False)
-            ##self.log(f"{step_name}_acc_macro_epoch", correct_macro/total_macro, logger=True, prog_bar=False)
-
 
     def create_data_loaders(self, shuffle=False, **kwargs):
-        dir_train_set = os.path.join(self.dir_data,"train") #"./combined_data/train/"
-        dir_val_set = os.path.join(self.dir_data,"val")
-        dir_test_set = os.path.join(self.dir_data,"test") 
+       
+        dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.model.tokenizer, 
+            workers=self.workers, mode=self.mode )
         
-        dg = DataLoaderGenerator(dir_train_set, dir_val_set,
-            dir_test_set, self.batch_size, self.model.tokenizer, 
-            workers=self.workers, mode=self.mode
-            )
-        
-        self.train_dl, self.val_dl, self.test_dl = dg()
-    
+        _dict_dl = dg()
+        self.train_dl = _dict_dl['train_dl']
+        self.val_dl = _dict_dl['val_dl']
+        self.test_dl = _dict_dl['test_dl']
+
     def train_dataloader(self):
         return self.train_dl
 
@@ -409,28 +754,31 @@ class TrainingModule(pl.LightningModule):
         items.pop("v_num", None)
         return items
 
+    def return_params():
+        params = {}
+
+        params['batch_size'] = self.batch_size
+        params['accumulate_grad_batches'] = self.accumulate_grad_batches
+        params['lr_schedule'] = self.lr_schedule 
+        params['learning_rate'] = self.learning_rate
+        params['max_epochs'] = self.max_epochs
+        params['warmup_proportion'] = self.warmup_proportion 
+
+        return params
+
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
     """
-    def __init__(self, dir_train_set, dir_val_set,
-                    dir_test_set, batch_size,
+    def __init__(self, dir_data, batch_size,
                     tokenizer, 
-                    context_history_len=1,
                     workers=0, mode='train_new',
                     **kwargs):
-
-        self.dir_train_set = dir_train_set
-        self.dir_val_set = dir_val_set
-        self.dir_test_set = dir_test_set
-
+        
+        self.dir_data = dir_data
         self.tokenizer = tokenizer
-        label_mapping = json.load(open(utils.get_path("./label_mapping.json"),"r"))     
-        self.target_binarizer = sklp.MultiLabelBinarizer()
-        self.target_binarizer.fit( [label_mapping['MCONV']['labels_list'] ] )
+        label_mapping = json.load(open(utils_nlg.get_path("../DialogueAct/label_mapping.json"),"r"))     
 
-            #Add a utility code that downloads pretrained bert tokenizer if it is not already in the relatively directory above
         self.bs = batch_size
-        self.context_history_len = context_history_len
         self.workers  = workers
         self.mode = mode
 
@@ -440,23 +788,61 @@ class DataLoaderGenerator():
         Returns:
             [type]: [description]
         """
-        dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
-        li_shuffle = [True, False, False]
-        dataloaders = []
+                
+        if self.mode in [ 'train_new', 'train_cont']:
+            train_dl, = self.prepare_dataset(self.dir_data, shuffle=True, split_name='train' )
+            val_dl = self.prepare_dataset(self.dir_data, shuffle=False,split_name='val'  )
+            test_dl = self.prepare_dataset(self.dir_data, shuffle=False,split_name='test'  )
         
-        dataloaders = [self.prepare_dataset(_dir, shuffle) for _dir,shuffle in zip(dir_sets,li_shuffle)]
-        return dataloaders
+        elif self.mode in ['test']:
+            train_dl = None
+            val_dl = None
+            test_dl = self.prepare_dataset(self.dir_data, shuffle=False ,split_name='test' )
 
-    def prepare_dataset(self, dir_dset, shuffle=False):
-        """Prepares a dataloader given a directory of text files each containing one conversation
+        
+        elif self.mode in ['inference']:
+            train_dl = None
+            val_dl = None
+            test_dl = None
 
+        
+        dict_dl = {'train_dl':train_dl,
+                    'val_dl':val_dl,
+                    'test_dl':test_dl}
+
+        return dict_dl 
+
+    def prepare_dataset(self, dir_data, shuffle=False, 
+        split_name='train'):
+
+        """Prepares a dataloader given a directory of data for NLG language module
+            # The current method takes a percentage of data from each subdirectory
         Args:
             dir_dset ([type]): [description]
+        
         """
-        files = glob.glob( os.path.join(dir_dset,"*") )
-        random.shuffle(files)
-        li_dsets = [ SingleDataset(_f, self.tokenizer, self.target_binarizer, 
-            self.context_history_len) for _f in files ]
+        #getting all files from all different subreddits/types of conversation
+        files = glob.glob(  os.path.join( utils.get_path(dir_data),"*[0-9999999999]") )
+        
+        #getting number of utterances records in each file
+        files_sizes = [ int(_f[-10:]) for _f in files]
+
+        #defining starting line and total lines to use for dataset
+        if split_name == 'train':
+            line_starts = [0]*len(files)
+            line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_start,files_sizes)  ]
+        
+        elif split_name == 'val':
+            line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
+            line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_start,files_sizes)  ]
+        
+        elif split_name == 'test':
+            line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
+            line_ends = files_sizes
+
+
+        li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end) 
+                        for _f in zip(files, line_starts, line_ends) ]
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
@@ -466,138 +852,85 @@ class DataLoaderGenerator():
 
     def __call__(self):
         
-        train_dl, val_dl, test_dl = self.prepare_datasets()
-        return train_dl, val_dl, test_dl
+        dict_dl = self.prepare_datasets()
+        return dict_dl
     
 class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
-    def __init__(self, file_path, tokenizer, target_binarizer, context_history_len  ):
+    def __init__(self, file_path, tokenizer, line_start, line_end  ):
         self.fp = file_path
         self.tokenizer = tokenizer
-        self.target_binarizer = target_binarizer
-        self.context_history_len = context_history_len
+        self.line_start = line_start
+        self.line_end = line_end
 
-    #def parse_file(self, file_path):
+        skiprows = linestart if line_start!=0 else None
         with open(self.fp, 'r') as f:
-            self.data = pd.read_csv(file_path, sep='|', header=0)
+            self.data = pd.read_csv(file_path, sep=',', header=0, skiprows =skiprows, nrows=(self.line_end-self.line_start) )
                     
     def __len__(self):
-        return len(self.data) - self.context_history_len
+        return (self.line_end - self.line_start)
     
     def __getitem__(self, index):
-        datum = self.data[index:index+1+self.context_history_len]
-        speaker, utterances, da = datum.T.values
+        datum = self.data[index]
+
+        #Dialogue Act
+        das = json.loads(datum['li_da'])
         
-        encoded_input = self.encode_tokenize( utterances.tolist() )
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                binarized_target = self.target_binarizer.transform( [ da[-1].split(" ") ] )
-        except AttributeError as e:
-            binarized_target = np.zeros((1,12))
-
-
-        map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
+        #RST
+        rst = json.loads(datum['rst']) 
+        rst_rels = rst['rels']
+        rst_ns = rst['ns']
+        rst_pos = rst['pos']
+        
+        #Topic scores
+        #topics_rake = json.loads(datum['topic_rake'])
+        topics_textrank = json.loads(datum['topic_textrank'])
+        topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
+        
+        #Utterance
+        utterance = json.loads(datum['txt_preproc'])
+        
+        # encoding inputs
+        encoded_input = self.tokenizer.encode(das, rst_rels, rst_ns, rst_pos, topics, topics_score, utterance, prev_das=None, prev_rst=None )
+            #( da_start_token, tnsr_das, tnsr_da_pos, rst_start_token, tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos,
+                #topics_start_token, tnsr_topics_phrase, tnsr_topics_score, eodrt_token, tknzd_utt ,padding_token, padding_count)      
+        
+        map_datum = {**encoded_input, 'tknzed_utt': tknzed_target }
+        
         return map_datum
 
-    def encode_tokenize(self, li_str):
-        #_str_tknized = self.tokenizer.tokenize(_str)
-        
-        encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
-            truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True )
-                
-        return encoded_input
 
-
-def main(tparams, mparams):
-    gc.collect()
+def main(tparams={}, mparams={}):
     torch.cuda.empty_cache()
-
-    tparams.version_name =  tparams.version_name if tparams.version_name!= '' else utils.get_version_name(mparams.model_name)
-    utils.save_version_params(tparams, mparams, tparams.version_name )
-    model_dir = utils.get_path(f'./models/{tparams.version_name}')
-    checkpoint_dir = f'{model_dir}/logs'
-    # Setting up model, training_module and Trainer
-
-    if tparams.mode in ['train_cont','test']:
-        checkpoint_path = utils.get_best_ckpt_path(checkpoint_dir)
-        mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
-        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
-    
-    danet = DaNet(**vars(mparams))
-    
-    # Defining callbacks
-    callbacks = []
-
-    tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{tparams.version_name}/logs'))
-    
-    if tparams.mode in ["train_new","train_cont"]:
         
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
-            mode='min', dirpath=checkpoint_dir, 
-            filename='{epoch:03}-{val_loss:.3f}-{val_acc_micro_epoch:.3f}')
-        
-        early_stop_callback = EarlyStopping(
-            monitor='val_loss',
-            min_delta=0.00,
-            patience=8,
-            verbose=False,
-            mode='auto'
+           
+    # Defining Logger
 
-        )
-        callbacks.append(checkpoint_callback)
-        callbacks.append(early_stop_callback)
-        
+    tb_logger = pl_loggers.TensorBoardLogger( 
+                    save_dir = os.path.abspath(tparams['model_dir']),
+                    name = mparams['model_name'],
+                    version = tparams['version'] )
+    tparams['version'] =  tb_logger.version
 
-    # Making training module
-    if tparams.mode in ["test","train_cont"]:
-        #checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
-        raise Exception("Replace resume_from_checkpoint with the state dict method")
-        training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
-        #training_module.load_state_dict(checkpoint['state_dict'])
-    else:
-        training_module = TrainingModule(**vars(tparams), model=danet )
+ 
+    training_module = TrainingModule.instatiate_training_module( tparams, mparams)
 
+    trainer = TrainingModule.instatiate_trainer( tb_logger)
+    NLG.start(trainer, tparams, training_module)
                 
-                
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
-                check_val_every_n_epoch=1, logger=tb_logger,
-                default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
-                precision=16, callbacks=callbacks,
-                #track_grad_norm = True,
-                #overfit_batches=5
-                #,fast_dev_run=True, 
-                #log_gpu_memory=True
-                )
-
-    if tparams.mode in ["test"]:
-        training_module.eval() 
-        training_module.freeze() 
-        #trainer.ckpt_path = checkpoint_path
-        trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
-        #trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
-        
-    else:    
-        trainer.fit(training_module)
-        trainer.test(test_dataloaders=training_module.test_dl )
-
+ 
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
-    #parent_parser2 = argparse.ArgumentParser(add_help=False)    
-    
-    #parser_program = parent_parser.add_argument_group("program")
 
-    # add PROGRAM level args
-    
     # add model specific args
-    mparams = DaNet.parse_model_specific_args(parent_parser)
+    mparams = NLG.parse_model_specific_args(parent_parser)
 
     # add the trainer specific args
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
-    main(tparams, mparams)
+    main(vars(tparams), vars(mparams))
 
 
