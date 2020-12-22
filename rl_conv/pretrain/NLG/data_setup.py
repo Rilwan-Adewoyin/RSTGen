@@ -148,6 +148,7 @@ def main(danet_vname,
 
     # fh_container  = client.containers.run(image, detach=True, 
     #     entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) 
+    mp_count_rst = 20
     li_fh_container = [ client.containers.run(image, detach=True, 
         entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
 
@@ -167,17 +168,18 @@ def main(danet_vname,
         batches_completed = start_batch
     # endregion
     
-
+    timer = Timer()
     #region operating in batches
-
+    
     while len(li_id_dictconv) > 0:
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
-        print(f"Operating on batch {batches_completed} of {total_batch_count}")
+        print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
         last_batch_processed = batches_completed
 
         #region preprocessing
+        timer.start()
         for id_dictconv  in batch_li_id_dictconv:
             conv_id  = id_dictconv[0]
             dictconv = id_dictconv[1]
@@ -203,13 +205,14 @@ def main(danet_vname,
                 if _valid_utterance(_dict['txt_preproc']) ]
 
             batch_li_li_thread_utterances.append(li_thread_utterances)
-
+        timer.end("preprocessing")
         
         
 
         #endregion
         
         #region DA assignment
+        timer.start()
         for i, _ in enumerate(batch_li_li_thread_utterances):
             
             li_thread_utterances = batch_li_li_thread_utterances[i]
@@ -225,10 +228,8 @@ def main(danet_vname,
             pred_da = danet_module.forward(encoded_input)
             li_li_da, li_dict_da = danet_module.format_preds(pred_da)
             
-                #sequence of vectors, vector=logit score for each da class
-            #pred_das = pred_das.tolist()
-            
-            #TODO consider removing dialogues that 'reply_to'==None
+                #sequence of vectors, vector=logit score for each da class           
+            #TODO consider removing dialogues where 'reply_to'==None
 
             [
                 _dict.update({'li_da': li_da,'dict_da':dict_da }) for _dict, li_da, dict_da in 
@@ -236,25 +237,27 @@ def main(danet_vname,
             ]
 
             batch_li_li_thread_utterances[i] = li_thread_utterances
-                
+        timer.end("DA")   
         #endregion
 
         #region Predicting the RST Tag
-        with mp.Pool(mp_count) as pool:
-            res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count) + 1) ) )
+        timer.start()
+        mp_count_rst = 20
+        with mp.Pool(mp_count_rst) as pool:
+            res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
-        
+        timer.end("RST")
+
         #endregion
 
         #region Topic extraction
-
+        timer.start()
         with mp.Pool(mp_count) as pool:
             res = pool.map( _topic, _chunks(batch_li_li_thread_utterances,batch_process_size//mp_count) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
-        
-        
+        timer.end("Topic")
         #endregion
 
         # region Drop keys
@@ -269,12 +272,14 @@ def main(danet_vname,
         # end region
 
         #region Saving Batches
+        timer.start()
             # format = subreddit/convo_code
         li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
         _save_data(li_utterances, batch_save_size, dir_save_dataset)
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
+        timer.end("Saving")
         #end region    
 
 def _load_data():
@@ -313,7 +318,7 @@ def _preprocess(text):
                 #so need to have regex code to compress words between two colons (with underscores)
         
     # remove repeated words
-    text = text.replace(pattern_repword, r'\1')
+    text = re.sub(pattern_repword, r'\1', text)
 
     #remove repeated periods
     text = re.sub(pattern_repdot, ".", text)
@@ -346,8 +351,8 @@ def _valid_utterance(txt):
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
     try:
         prev_utterance = next( _dict['txt_preproc'] for 
-        _dict in li_thread_utterances 
-        if _dict['id_utt'] == reply_to_id )
+         _dict in li_thread_utterances 
+         if _dict['id_utt'] == reply_to_id )
     except StopIteration as e:
         prev_utterance = ''
    
@@ -357,19 +362,17 @@ def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
 def _rst(li_li_thread_utterances, fh_container_id ):
     client = docker.from_env(timeout=int(60*3))
     fh_container = client.containers.get(fh_container_id)
-        
+    new_li_li_thread_utterances = []
+
     for i, _ in enumerate(li_li_thread_utterances):
         
         li_thread_utterances = li_li_thread_utterances[i]
-        #return li_li_thread_utterances
+    
         li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]
-
-        #li_utterance  = [ thread_utt['txt_preproc'].encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "") for thread_utt in li_thread_utterances ]
-        #return True
-        json_li_utterance = json.dumps(li_utterance)
         
+        json_li_utterance = json.dumps(li_utterance)
 
-        #response = fh_container.run( entrypoint=entrypoint, command=command )
+        
         cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
         exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
                             demux=True)
@@ -379,8 +382,8 @@ def _rst(li_li_thread_utterances, fh_container_id ):
         try:
             stdout_ = json.loads(stdout)
         except (TypeError, json.JSONDecodeError) as e:
-            [ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
-            li_li_thread_utterances[i] = li_thread_utterances
+            #[ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
+            #li_li_thread_utterances[i] = li_thread_utterances
             continue
         #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
 
@@ -400,9 +403,10 @@ def _rst(li_li_thread_utterances, fh_container_id ):
             zip( li_thread_utterances, li_rst_dict)
         ]
 
-        li_li_thread_utterances[i] = li_thread_utterances
-    #client.close()
-    return li_li_thread_utterances
+        #li_li_thread_utterances[i] = li_thread_utterances
+        new_li_li_thread_utterances.append(li_thread_utterances)
+    
+    return new_li_li_thread_utterances
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -428,13 +432,12 @@ def _tree_to_rst_code(_tree):
     
     # Getting List 1 and 2
     li_rels_ns = []
-    max_nodes = int(2*_tree.height()) -1 # Without this nltk also searches subtrees of individual characteres
     counter = 0
 
     for depth in range( _tree.height(),1,-1 ):
         
         subli_rels_ns = [  re.findall(r'[a-zA-Z]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
-        subli_rels_ns = [ [_li[0],''.join(_li[1:]) ] for _li in subli_rels_ns ]
+        subli_rels_ns = [ [_li[0],''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
 
         li_rels_ns.extend(subli_rels_ns)
 
@@ -452,20 +455,11 @@ def _tree_to_rst_code(_tree):
 
     return li_dict_rels_ns_bintreepos
 
-# def __depth_check(sub_tree, depth):
-#     """[summary]
-
-#     Args:
-#         sub_tree ([type]): [description]
-#         depth ([int]): [description]
-#     """   
-#     return sub_tree.height() == depth
-
 def _topic(li_li_thread_utterances):
     for i, _ in enumerate(li_li_thread_utterances):
         li_thread_utterances = li_li_thread_utterances[i]
 
-        li_rakekw_textankkw = [ #{'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
+        li_rakekw_textankkw = [ {#'topic_rake':_rake_kw_extractor(thread_utterance['txt_preproc']),
                                     'topic_textrank':_textrank_extractor(thread_utterance['txt_preproc'])}
                 for thread_utterance in li_thread_utterances]
 
@@ -579,19 +573,35 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                         dict_writer.writerows(li_utterances)
                 
             
+class Timer():
+    def __init__(self):
+        self.start_time = None
+        self.end_time = None
+    
+    #def __call__(self,_segment_name=None):
+    def start(self):
+        
+        self.start_time = time.time()
+        self.timing = True
+        
+    def end(self, segment_name):
+        self.end_time = time.time()
+        time_taken = self.end_time - self.start_time
+        print(f"\t{segment_name} segment: {time_taken} secs")
+            
+
+
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
-    #parent_parser2 = argparse.ArgumentParser(add_help=False)    
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
-
 
     parser.add_argument('--danet_vname', default="DaNet_v001",
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
-    parser.add_argument('--batch_process_size', default=30,
+    parser.add_argument('-bps','--batch_process_size', default=90,
         help='',type=int)        
 
     parser.add_argument('--batch_save_size', default=-1,
@@ -615,13 +625,21 @@ if __name__ == '__main__':
             main( **dict_args )
             completed = True
         except Exception as e:
+            # cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
+            # os.system(cmd)
+            # time.sleep(5)
+            # os.system(cmd)
+            # time.sleep(5)
+            print(e)
+            last_batch_processed = last_batch_processed + 1
+            dict_args['start_batch'] = last_batch_processed
+            
+        finally :
             cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
             os.system(cmd)
             time.sleep(5)
             os.system(cmd)
             time.sleep(5)
-            last_batch_processed = last_batch_processed + 1
-            dict_args['start_batch'] = last_batch_processed
-            pass
+
     #last bacth = 105
 

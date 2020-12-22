@@ -1,6 +1,6 @@
 import os
 import json
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, GPT2LMHeadModel
 dirname = os.path.dirname(__file__)
 from datetime import date
 import glob
@@ -30,8 +30,9 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
 
     if exists == False:    
         model_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        
+        #model = AutoModel.from_pretrained(model_name)
+        model = GPT2LMHeadModel.from_pretrained(model_name)
+
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
 
