@@ -7,6 +7,7 @@
 rl_conv/pretrain/DialogueAct/combined_data
 rl_conv/pretrain/DialogueAct/MRDA-Corpus
 rl_conv/pretrain/DialogueAct/Switchboard-Corpus
+rl_conv/pretrain/DialogueAct/MIDAS-Corpus
 rl_conv/pretrain/DialogueAct/models
 rl_conv/pretrain/DialogueAct/models/*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
