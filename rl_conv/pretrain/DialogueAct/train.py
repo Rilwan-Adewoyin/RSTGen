@@ -102,7 +102,7 @@ class DaNet(nn.Module):
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
         parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
-        parser.add_argument('--freeze_transformer', default=True, required=False, type=bool)
+        parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         
         mparams = parser.parse_known_args( )[0]
@@ -163,7 +163,7 @@ class TrainingModule(pl.LightningModule):
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=1e-3,
-                    warmup_proportion=0.1,
+                    warmup_proportion=0.25,
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
@@ -172,10 +172,7 @@ class TrainingModule(pl.LightningModule):
         super().__init__()
 
         self.batch_size = batch_size
-        
-
         self.gpus =  gpus
-        
         self.context_history_len = context_history_len
         
         
@@ -184,32 +181,21 @@ class TrainingModule(pl.LightningModule):
             'warmup_proportion')
         
         self.model = model
-        self.mode = mode
-
-        
+        self.mode = mod
         self.workers = workers
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
                 
         if self.mode in ['train_new','train_cont','test']:
             self.max_epochs = max_epochs
-
             self.warmup_proportion = warmup_proportion
-
             self.lr_schedule = lr_schedule
-        
             self.loss = nn.BCEWithLogitsLoss()
-
             self.save_hyperparameters(model.return_params())
-
             self.create_data_loaders(self.workers)
-
             self.dir_data = utils.get_path(dir_data)
-
             self.learning_rate = learning_rate
-
             self.accumulate_grad_batches = accumulate_grad_batches
-
             self.dict_acc = {
                 k:pl.metrics.classification.Accuracy( ) for k in ["train",
                     "val","test"] }
@@ -239,11 +225,11 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
         parser.add_argument('--warmup_proportion', default=0.05)
-        parser.add_argument('--workers', default=0, type=int)
+        parser.add_argument('--workers', default=6, type=int)
         parser.add_argument('--gpus', default=0, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
         parser.add_argument('--version_name', default='', required=False)
-        parser.add_argument('--lr_schedule', default='LROnPlateau', required=False, choices =['LROnPlateau','hard_restarts'])
+        parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
         #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
         tparams = parser.parse_known_args()[0]
@@ -404,15 +390,11 @@ class TrainingModule(pl.LightningModule):
 
     @lru_cache()
     def total_steps(self):
-        train_files = [name for name in glob.glob(os.path.join(self.dir_data,"train","*")) ]
+        
+        ds_size = self.train_dl.dataset.__len__()
+        steps = (ds_size * self.max_epochs) // (self.batch_size*self.accumulate_grad_batches )
 
-        utterance_count = sum( [ sum(1 for line in open(f,'r')) for f in train_files ] )
-
-        conv_count = len(train_files)
-
-        train_size = utterance_count - conv_count*self.context_history_len
-
-        return ( train_size // self.batch_size*self.accumulate_grad_batches ) * self.max_epochs
+        return steps
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
@@ -579,13 +561,11 @@ def main(tparams, mparams):
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
         
-
     # Making training module
     if tparams.mode in ["test","train_cont"]:
-        #checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
-        raise Exception("Replace resume_from_checkpoint with the state dict method")
+        ckpt = torch.load(checkpoint_path)
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
-        #training_module.load_state_dict(checkpoint['state_dict'])
+        training_module.load_state_dict(checkpoint['state_dict'])
     else:
         training_module = TrainingModule(**vars(tparams), model=danet )
 
@@ -615,11 +595,6 @@ def main(tparams, mparams):
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
-    #parent_parser2 = argparse.ArgumentParser(add_help=False)    
-    
-    #parser_program = parent_parser.add_argument_group("program")
-
-    # add PROGRAM level args
     
     # add model specific args
     mparams = DaNet.parse_model_specific_args(parent_parser)

@@ -208,6 +208,33 @@
             "other","Humorous-Material","Floor-Grabber","Misspeak-Self-Correction"]
     },
 
+    "MIDAS":{
+        "MCONV":{
+            "apology": ["other-forward-function"],
+            "appreciation": ["understanding","backchannel"] ,
+            "back-channeling": ["backchannel"],
+            "closing": ["other-forward-function"],
+            "command": ["action-directive"],
+            "comment": ["understanding","elaboration"],
+            "complaint": ["understanding","reject"],
+            "dev_command": ["action-directive"] ,
+            "neg_answer": ["reject"],
+            "open_question_factual":["question"],
+            "open_question_opinion":["question"],
+            "opening":["other-forward-function"],
+            "opinion":["statement"],
+            "other_answers":["hedge"],
+            "pos_answer":["agreement"],
+            "respond_to_apology":["other-forward-function"],
+            "statement":["statement"],
+            "thanking":["other-forward-function"],
+            "yes_no_question":["question"]
+
+        },
+        "removed":["abandon","hold", "nonsense",
+            "other"]
+    }
+    ,
     "MCONV":{
         "labels_code":{
             "statement":0 ,
