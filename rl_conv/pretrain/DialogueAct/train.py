@@ -40,6 +40,7 @@ import gc
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
+import torchdata as td
 
 #from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -77,11 +78,7 @@ class DaNet(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Dropout(self.dropout),
-            nn.Linear(D_in, int(H*2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H//2), D_out),
-            #nn.Sigmoid()
+            nn.Linear(D_in, D_out ),
         )
         
         for layer in self.classifier:
@@ -98,13 +95,13 @@ class DaNet(nn.Module):
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
-        parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
+        parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
-            mparams = json.load(open(utils.get_path(path)),"r" )
+            mparams = json.load(open(utils.get_path(mparams.config_file)),"r" )
         
         return mparams
 
@@ -135,11 +132,15 @@ class DaNet(nn.Module):
                             token_type_ids=token_type_ids)
         
         # Extract the last hidden state of the token `[CLS]` for classification task
-        last_hidden_state_cls = outputs[0][:, 0, :]
+        # last_hidden_state_cls = outputs[0][:, 0, :]
+        # hidden_state = last_hidden_state_cls
+        # Using Pooled Output 
+        pooled_output = outputs[1]
+        hidden_state = pooled_output
         #cls_for_nsp = outputs[1][:, 0, :]
 
         # Feed input to classifier to compute logits
-        logits = self.classifier(last_hidden_state_cls)
+        logits = self.classifier(hidden_state)
 
         return logits
 
@@ -430,13 +431,14 @@ class DataLoaderGenerator():
             [type]: [description]
         """
         dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
+        set_names = ["train","val","set"]
         li_shuffle = [True, False, False]
         dataloaders = []
         
-        dataloaders = [self.prepare_dataset(_dir, shuffle) for _dir,shuffle in zip(dir_sets,li_shuffle)]
+        dataloaders = [self.prepare_dataset(_dir, shuffle,name) for _dir,shuffle,name in zip(dir_sets,li_shuffle, set_names)]
         return dataloaders
 
-    def prepare_dataset(self, dir_dset, shuffle=False):
+    def prepare_dataset(self, dir_dset, shuffle=False, name="train"):
         """Prepares a dataloader given a directory of text files each containing one conversation
 
         Args:
@@ -447,7 +449,13 @@ class DataLoaderGenerator():
         li_dsets = [ SingleDataset(_f, self.tokenizer, self.target_binarizer, 
             self.context_history_len) for _f in files ]
 
-        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+        concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+        
+        _dir = f"./cache"
+        os.makedirs("_dir",exist_ok=True)
+
+        #concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
+        concat_dset = concat_dset.cache()
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
         
