@@ -55,7 +55,7 @@ class DaNet(nn.Module):
     """Transformer Based Model for DA classfication Task
     """
 
-    def __init__(self, freeze_transformer=True, dropout=0.1, 
+    def __init__(self, freeze_transformer=False, dropout=0.1, 
         base_model_name='bert-base-cased', model_name="DaNet", **kwargs):
 
         super(DaNet, self).__init__()
@@ -78,9 +78,6 @@ class DaNet(nn.Module):
         self.classifier = nn.Sequential(
             nn.Dropout(self.dropout),
             nn.Linear(D_in, int(H*2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H*2), int(H//2) ),
             Mish(),
             nn.Dropout(self.dropout),
             nn.Linear(int(H//2), D_out),
@@ -181,19 +178,19 @@ class TrainingModule(pl.LightningModule):
             'warmup_proportion')
         
         self.model = model
-        self.mode = mod
+        self.mode = mode
         self.workers = workers
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
                 
         if self.mode in ['train_new','train_cont','test']:
+            self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
             self.loss = nn.BCEWithLogitsLoss()
             self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
-            self.dir_data = utils.get_path(dir_data)
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
             self.dict_acc = {
@@ -219,12 +216,12 @@ class TrainingModule(pl.LightningModule):
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         #parser.add_argument('--gpus', default=None)
-        parser.add_argument('--max_epochs', default=150, type=int)
-        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--max_epochs', default=100, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
-        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('-bs','--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
-        parser.add_argument('--warmup_proportion', default=0.05)
+        parser.add_argument('--warmup_proportion', default=0.15)
         parser.add_argument('--workers', default=6, type=int)
         parser.add_argument('--gpus', default=0, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
@@ -256,11 +253,6 @@ class TrainingModule(pl.LightningModule):
         output_bnrzd = torch.where( output<0.5,0.0,1.0)
         target  = target.to('cpu')
 
-        #correct_micro = output_bnrzd.eq(target).min(dim=1)[0].sum()
-        #correct_macro = output_bnrzd.eq(target).sum()
-        #total_micro = target.shape[0]
-        #total_macro = torch.numel(target)
-
         self.dict_acc[step_name](output_bnrzd, target)
         correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
         self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
@@ -281,18 +273,13 @@ class TrainingModule(pl.LightningModule):
             on_epoch = True
             prog_bar = False
             logger = True
-        
-            #self.log( str_loss_key, loss)#, on_step=on_step, on_epoch=on_epoch, prog_bar=True, logger=True)
-        
+                
         _dict = { str_loss_key: loss }
         
-        self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        self.log(f'{step_name}_acc_macro', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
         self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-
-        #self.log(f"{step_name}_acc_micro_step", correct_micro/total_micro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        #self.log(f"{step_name}_acc_macro_step", correct_macro/total_macro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
 
         return  _dict #, f'rec':self.dict_recall[step_name].compute() , f'prec':self.dict_prec[step_name].compute() }
         
@@ -322,23 +309,14 @@ class TrainingModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch,"train")
-
-        #self.log( 'train_loss', output['loss'] )
-
         return output
 
     def validation_step(self, batch, batch_idx):
         output = self.step(batch, "val")
-        
-        #self.log('val_loss', output['val_loss'])
-
         return output
 
     def test_step(self, batch, batch_idx):
         output = self.step(batch, "test")
-
-        #self.log('test_loss', output['test_loss'])
-
         return output
 
     def training_epoch_end(self, outputs):
@@ -517,7 +495,7 @@ class SingleDataset(torch.utils.data.Dataset):
         #_str_tknized = self.tokenizer.tokenize(_str)
         
         encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
-            truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True )
+            truncation=True, max_length=360, return_tensors='pt', return_token_type_ids=True )
                 
         return encoded_input
 
@@ -563,7 +541,7 @@ def main(tparams, mparams):
         
     # Making training module
     if tparams.mode in ["test","train_cont"]:
-        ckpt = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path)
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
     else:
