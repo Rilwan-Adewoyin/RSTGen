@@ -10,6 +10,7 @@ rl_conv/pretrain/DialogueAct/Switchboard-Corpus
 rl_conv/pretrain/DialogueAct/models
 rl_conv/pretrain/DialogueAct/models/*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
+rl_conv/pretrain/DialogueAct/log
 
 #NLG
 rl_conv/pretrain/NLG/dataset/*
@@ -25,7 +26,7 @@ rl_conv/pretrain/.ipynb_checkpoints
 *_pycache_*
 
 
-*vscode/*
+.vscode/*
 *src*
-rl_conv/pretrain/DialogueAct/log
+
 .vscode/launch.json

@@ -148,7 +148,7 @@ def main(danet_vname,
 
     # fh_container  = client.containers.run(image, detach=True, 
     #     entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) 
-    mp_count_rst = 20
+    
     li_fh_container = [ client.containers.run(image, detach=True, 
         entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
 
@@ -242,7 +242,7 @@ def main(danet_vname,
 
         #region Predicting the RST Tag
         timer.start()
-        mp_count_rst = 20
+        mp_count_rst = mp_count
         with mp.Pool(mp_count_rst) as pool:
             res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) ) )
         batch_li_li_thread_utterances = list( res ) 
@@ -436,7 +436,7 @@ def _tree_to_rst_code(_tree):
 
     for depth in range( _tree.height(),1,-1 ):
         
-        subli_rels_ns = [  re.findall(r'[a-zA-Z]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
+        subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
         subli_rels_ns = [ [_li[0],''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
 
         li_rels_ns.extend(subli_rels_ns)
@@ -601,7 +601,7 @@ if __name__ == '__main__':
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
-    parser.add_argument('-bps','--batch_process_size', default=90,
+    parser.add_argument('-bps','--batch_process_size', default=120,
         help='',type=int)        
 
     parser.add_argument('--batch_save_size', default=-1,

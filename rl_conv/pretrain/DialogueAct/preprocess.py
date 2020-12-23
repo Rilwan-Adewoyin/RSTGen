@@ -161,49 +161,39 @@ def _annotate_dialog_act(df_conv, ds_name, dict_da_map):
     df_conv['da'] = df_conv['da'].apply( lambda da: dict_da_map[ds_name]['short2full'][da] )
 
     # remove repeated consecutive words in utterance
-    df_conv['utterance'] = df_conv['utterance'].str.replace(r'\b([\w\-,\.]+)(\s+\1)+\b', r'\1')
+    df_conv['utterance'] = df_conv['utterance'].str.replace(r'\b([\S]+)(\s+\1)+\b', r'\1')
 
-    #remove da if in removed list, given utterance less than 5 words and does not have a MCONV mapping
+    #remove da if in removed list given utterance less than 2 words and does not have a MCONV mapping
     remove = '|'.join(dict_da_map[ds_name]['removed'])
     pattern = re.compile(r'\b('+remove+r')\b', flags=re.IGNORECASE)
 
-
     df_conv['da'] = df_conv.apply( 
         lambda row: pattern.sub("", row.da) 
-        if len(row.da.split())<=4  and (row.da not in list(dict_da_map[ds_name]['MCONV'].keys()))
+        if len(row.da.split())<=2  and (row.da not in list(dict_da_map[ds_name]['MCONV'].keys()))
         else row.da, axis=1)
 
     #compress lines together if same speaker
     df_conv['key'] = (df_conv.speaker!=df_conv.speaker.shift(1)).cumsum()
     df_conv = df_conv.groupby(  ['key','speaker'], sort=False ).agg( lambda x: ' '.join(x) ).reset_index().drop('key',axis=1)
     
-    #stripping final full-stop from end of sentence, depracated
-    #df_conv['utterance'] = df_conv['utterance'].apply(lambda utt: utt.rstrip('.') )
-
-
     # remove whole utterance if no other dialoge act left
     df_conv = df_conv[ df_conv.da.replace(" ", "") != "" ].reset_index(drop=True)
 
-    #
-    #df_conv['da'] = df_conv['da'].apply( lambda da: " ".join( sorted( set(da.split() ) ) ) )
+        #read in file as a pandas dataframe and filter out coloumns to keep
+    # convert das to mconv full schemes and remove repeated consecutive dialogue acts
+    df_conv['da'] = df_conv['da'].apply( lambda da: _parse_list_or_string(da) )
+    df_conv['utterance'] = df_conv['utterance'].str.strip(',')
 
+    return df_conv
+    
     def _parse_list_or_string(da):
         _li = sum( [ dict_da_map[ds_name]['MCONV'][word] for word in da.split() ], [])
         _set = set(_li)
         _set = sorted(_set)
 
         if "other" in _set:
-            a = 1
-
-        _str = " ".join(_set)
+            _str = " ".join(_set)
         return _str
-
-        #read in file as a pandas dataframe and filter out coloumns to keep
-    # convert das to mconv full schemes and remove repeated consecutive dialogue acts
-    df_conv['da'] = df_conv['da'].apply( lambda da: _parse_list_or_string(da) )
-
-    return df_conv
-
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
