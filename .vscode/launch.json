@@ -19,7 +19,7 @@
             "type": "python",
             "request": "launch",
             "program": "${file}",
-            "cwd": "C:/Users/Rilwa/01_Mcv/MasteringConversation/rl_conv/pretrain"
+            "cwd": "/home/u1862646/01_Mcv/mastering-conversation/rl_conv/pretrain/NLG"
         },
         {
             "name": "Python: testing DaNet train",
@@ -36,7 +36,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "cwd": "C:/Users/Rilwa/01_Mcv/MasteringConversation/rl_conv/pretrain/DialogueAct"
+            "cwd": "C:/Users/Rilwa/ 01_Mcv/MasteringConversation/rl_conv/pretrain/DialogueAct"
         }
     ]
 }
