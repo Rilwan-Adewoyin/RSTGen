@@ -218,7 +218,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         #parser.add_argument('--gpus', default=None)
         parser.add_argument('--max_epochs', default=100, type=int)
-        parser.add_argument('--accumulate_grad_batches', default=2, type=int)
+        parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
@@ -451,8 +451,8 @@ class DataLoaderGenerator():
 
         concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
         
-        _dir = f"./cache"
-        os.makedirs("_dir",exist_ok=True)
+        #_dir = f"./cache"
+        #os.makedirs("_dir",exist_ok=True)
 
         #concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
         concat_dset = concat_dset.cache()
@@ -466,7 +466,8 @@ class DataLoaderGenerator():
         train_dl, val_dl, test_dl = self.prepare_datasets()
         return train_dl, val_dl, test_dl
     
-class SingleDataset(torch.utils.data.Dataset):
+#class SingleDataset(torch.utils.data.Dataset):
+class SingleDataset(td.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
@@ -557,7 +558,7 @@ def main(tparams, mparams):
 
                 
                 
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
+    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
                 check_val_every_n_epoch=1, logger=tb_logger,
                 default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                 precision=16, callbacks=callbacks,
