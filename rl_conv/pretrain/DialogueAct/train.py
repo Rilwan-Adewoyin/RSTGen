@@ -3,6 +3,7 @@ import warnings
 import sklearn
 
 import torchdata as td
+#from torchdata import datasets,Dataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,7 +162,7 @@ class TrainingModule(pl.LightningModule):
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=1e-3,
-                    warmup_proportion=0.25,
+                    warmup_proportion=0.10,
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
@@ -451,11 +452,11 @@ class DataLoaderGenerator():
 
         concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
         
-        #_dir = f"./cache"
-        #os.makedirs("_dir",exist_ok=True)
+        _dir = f"./cache"
+        os.makedirs("_dir",exist_ok=True)
 
-        #concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
-        concat_dset = concat_dset.cache()
+        concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
+        #concat_dset = concat_dset.cache()
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
         
@@ -466,8 +467,8 @@ class DataLoaderGenerator():
         train_dl, val_dl, test_dl = self.prepare_datasets()
         return train_dl, val_dl, test_dl
     
-#class SingleDataset(torch.utils.data.Dataset):
-class SingleDataset(td.Dataset):
+class SingleDataset(torch.utils.data.Dataset):
+#class SingleDataset(Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
