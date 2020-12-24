@@ -2,7 +2,7 @@ import numpy as np
 import warnings
 import sklearn
 
-
+import torchdata as td
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +40,7 @@ import gc
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
-import torchdata as td
+
 
 #from pytorch_lightning.loggers import TensorBoardLogger
 
