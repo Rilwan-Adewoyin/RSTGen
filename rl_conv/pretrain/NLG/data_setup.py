@@ -408,6 +408,61 @@ def _rst(li_li_thread_utterances, fh_container_id ):
     
     return new_li_li_thread_utterances
 
+
+def _rst_v2(li_li_thread_utterances, fh_container_id ):
+    client = docker.from_env(timeout=int(60*3))
+    fh_container = client.containers.get(fh_container_id)
+    new_li_li_thread_utterances = []
+
+    li_li_utterances = [ [thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ] for li_thread_utterances in li_li_thread_utterances] #li of li of utts
+    json_li_li_utterance = json.dumps(li_li_utterances)
+
+    cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance]
+    exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
+                        demux=True)
+    stdout, stderr = output
+    
+    try:
+        li_strtree = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as e:
+        print(e)
+        raise Exception
+
+    for idx, str_tree in enumerate(li_strtree):
+        li_thread_utterances = li_li_thread_utterances[i]
+        li_subtrees = []
+
+        for idx, pt_str in enumerate(str_tree):
+            try:
+                if pt_str == '': raise ValueError
+                
+                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+            except ValueError:
+                _ = None
+                pass
+            li_subtrees.append(_)
+
+        li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
+
+
+        # Keeping non erroneous utterances within a conversation - bad trees
+        assert len(li_rst_dict) == len(li_thread_utterances)
+        new_li_thread_utterance = []
+        for idx in range(li_rst_dict):
+            if li_rst_dict[idx]!=None:
+                li_thread_utterances[idx].update( {'rst':li_rst_dict[idx]})
+                new_li_thread_utterance.append(li_thread_utterances[idx] )
+            else:
+                pass
+
+
+        new_li_li_thread_utterances.append(new_li_thread_utterance)
+    
+
+
+    return new_li_li_thread_utterances
+
+
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):

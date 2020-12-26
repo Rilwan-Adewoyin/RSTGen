@@ -2,7 +2,8 @@ import numpy as np
 import warnings
 import sklearn
 
-
+import torchdata as td
+#from torchdata import datasets,Dataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +42,7 @@ from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
 
+
 #from pytorch_lightning.loggers import TensorBoardLogger
 
 class Mish(nn.Module):
@@ -55,7 +57,7 @@ class DaNet(nn.Module):
     """Transformer Based Model for DA classfication Task
     """
 
-    def __init__(self, freeze_transformer=True, dropout=0.1, 
+    def __init__(self, freeze_transformer=False, dropout=0.1, 
         base_model_name='bert-base-cased', model_name="DaNet", **kwargs):
 
         super(DaNet, self).__init__()
@@ -77,14 +79,7 @@ class DaNet(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Dropout(self.dropout),
-            nn.Linear(D_in, int(H*2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H*2), int(H//2) ),
-            Mish(),
-            nn.Dropout(self.dropout),
-            nn.Linear(int(H//2), D_out),
-            #nn.Sigmoid()
+            nn.Linear(D_in, D_out ),
         )
         
         for layer in self.classifier:
@@ -101,13 +96,13 @@ class DaNet(nn.Module):
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
-        parser.add_argument('--dropout', default=0.125, required=False, help="dropout")
+        parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
-            mparams = json.load(open(utils.get_path(path)),"r" )
+            mparams = json.load(open(utils.get_path(mparams.config_file)),"r" )
         
         return mparams
 
@@ -138,11 +133,15 @@ class DaNet(nn.Module):
                             token_type_ids=token_type_ids)
         
         # Extract the last hidden state of the token `[CLS]` for classification task
-        last_hidden_state_cls = outputs[0][:, 0, :]
+        # last_hidden_state_cls = outputs[0][:, 0, :]
+        # hidden_state = last_hidden_state_cls
+        # Using Pooled Output 
+        pooled_output = outputs[1]
+        hidden_state = pooled_output
         #cls_for_nsp = outputs[1][:, 0, :]
 
         # Feed input to classifier to compute logits
-        logits = self.classifier(last_hidden_state_cls)
+        logits = self.classifier(hidden_state)
 
         return logits
 
@@ -163,7 +162,7 @@ class TrainingModule(pl.LightningModule):
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=1e-3,
-                    warmup_proportion=0.25,
+                    warmup_proportion=0.10,
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
@@ -181,19 +180,19 @@ class TrainingModule(pl.LightningModule):
             'warmup_proportion')
         
         self.model = model
-        self.mode = mod
+        self.mode = mode
         self.workers = workers
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
                 
         if self.mode in ['train_new','train_cont','test']:
+            self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
             self.loss = nn.BCEWithLogitsLoss()
             self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
-            self.dir_data = utils.get_path(dir_data)
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
             self.dict_acc = {
@@ -219,12 +218,12 @@ class TrainingModule(pl.LightningModule):
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         #parser.add_argument('--gpus', default=None)
-        parser.add_argument('--max_epochs', default=150, type=int)
-        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--max_epochs', default=100, type=int)
+        parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
-        parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('-bs','--batch_size', default=20, type=int)
         parser.add_argument('--learning_rate', default=1e-3, type=float)
-        parser.add_argument('--warmup_proportion', default=0.05)
+        parser.add_argument('--warmup_proportion', default=0.15)
         parser.add_argument('--workers', default=6, type=int)
         parser.add_argument('--gpus', default=0, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
@@ -256,11 +255,6 @@ class TrainingModule(pl.LightningModule):
         output_bnrzd = torch.where( output<0.5,0.0,1.0)
         target  = target.to('cpu')
 
-        #correct_micro = output_bnrzd.eq(target).min(dim=1)[0].sum()
-        #correct_macro = output_bnrzd.eq(target).sum()
-        #total_micro = target.shape[0]
-        #total_macro = torch.numel(target)
-
         self.dict_acc[step_name](output_bnrzd, target)
         correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
         self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
@@ -281,18 +275,13 @@ class TrainingModule(pl.LightningModule):
             on_epoch = True
             prog_bar = False
             logger = True
-        
-            #self.log( str_loss_key, loss)#, on_step=on_step, on_epoch=on_epoch, prog_bar=True, logger=True)
-        
+                
         _dict = { str_loss_key: loss }
         
-        self.log(f'{step_name}_acc', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        self.log(f'{step_name}_acc_macro', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
         self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-
-        #self.log(f"{step_name}_acc_micro_step", correct_micro/total_micro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        #self.log(f"{step_name}_acc_macro_step", correct_macro/total_macro,  on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
 
         return  _dict #, f'rec':self.dict_recall[step_name].compute() , f'prec':self.dict_prec[step_name].compute() }
         
@@ -322,23 +311,14 @@ class TrainingModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch,"train")
-
-        #self.log( 'train_loss', output['loss'] )
-
         return output
 
     def validation_step(self, batch, batch_idx):
         output = self.step(batch, "val")
-        
-        #self.log('val_loss', output['val_loss'])
-
         return output
 
     def test_step(self, batch, batch_idx):
         output = self.step(batch, "test")
-
-        #self.log('test_loss', output['test_loss'])
-
         return output
 
     def training_epoch_end(self, outputs):
@@ -452,13 +432,14 @@ class DataLoaderGenerator():
             [type]: [description]
         """
         dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
+        set_names = ["train","val","set"]
         li_shuffle = [True, False, False]
         dataloaders = []
         
-        dataloaders = [self.prepare_dataset(_dir, shuffle) for _dir,shuffle in zip(dir_sets,li_shuffle)]
+        dataloaders = [self.prepare_dataset(_dir, shuffle,name) for _dir,shuffle,name in zip(dir_sets,li_shuffle, set_names)]
         return dataloaders
 
-    def prepare_dataset(self, dir_dset, shuffle=False):
+    def prepare_dataset(self, dir_dset, shuffle=False, name="train"):
         """Prepares a dataloader given a directory of text files each containing one conversation
 
         Args:
@@ -469,7 +450,13 @@ class DataLoaderGenerator():
         li_dsets = [ SingleDataset(_f, self.tokenizer, self.target_binarizer, 
             self.context_history_len) for _f in files ]
 
-        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+        concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+        
+        _dir = f"./cache"
+        os.makedirs("_dir",exist_ok=True)
+
+        concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
+        #concat_dset = concat_dset.cache()
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
         
@@ -481,6 +468,7 @@ class DataLoaderGenerator():
         return train_dl, val_dl, test_dl
     
 class SingleDataset(torch.utils.data.Dataset):
+#class SingleDataset(Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
@@ -517,7 +505,7 @@ class SingleDataset(torch.utils.data.Dataset):
         #_str_tknized = self.tokenizer.tokenize(_str)
         
         encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
-            truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True )
+            truncation=True, max_length=360, return_tensors='pt', return_token_type_ids=True )
                 
         return encoded_input
 
@@ -563,7 +551,7 @@ def main(tparams, mparams):
         
     # Making training module
     if tparams.mode in ["test","train_cont"]:
-        ckpt = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path)
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
     else:
@@ -571,7 +559,7 @@ def main(tparams, mparams):
 
                 
                 
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
+    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
                 check_val_every_n_epoch=1, logger=tb_logger,
                 default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                 precision=16, callbacks=callbacks,
