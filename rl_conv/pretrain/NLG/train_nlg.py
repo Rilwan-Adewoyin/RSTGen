@@ -2,6 +2,7 @@
 import numpy as np
 import warnings
 import sklearn
+import gc
 
 import torch
 import torch.nn as nn
@@ -671,9 +672,9 @@ class TrainingModule(pl.LightningModule):
             training_module = TrainingModule(**tparams, model_params=mparams  )
             
         elif tparams['mode'] in ["test", "train_cont", "inference"]:
+            
             #Retreiving best checkpoint from specific model-version
-
-            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
+            checkpoint_yaml_file = os.path.join( tparams['dir_checkpoints'],"best_k_models.yaml" )
             scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
@@ -682,16 +683,14 @@ class TrainingModule(pl.LightningModule):
             else:
                 checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))
 
-            #restore/update param files from the logs yaml
+            #restore/update param files from the checkpoint
             tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'batch_size', 'accumulate_grad_batches', 'lr_schedule', 'learning_rate',
-                'max_epochs','warmup_proportion']} )
+                'batch_size', 'lr_schedule', 'learning_rate']} )
 
             mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name','reset_base_transformer','loss_type']} )
+                'base_model_name','reset_base_transformer','loss_type','model_name']} )
 
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
+            #Restore/update Training Module
             training_module = TrainingModule(**vars(tparams), mparams=mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
         
@@ -705,57 +704,89 @@ class TrainingModule(pl.LightningModule):
 
             Creates The Trainer and callbacks
         """
-        # Creating Callbacks
-        callbacks = []
         dir_checkpoints = tparams['dir_checkpoints']
-        #os.makedirs(dir_checkpoints, exist_ok=True)
-        
+        # Creating Callbacks
+        callbacks = []        
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+            mode='min', dirpath=dir_checkpoints, 
+            filename='{epoch:03d}_{val_loss:.5f}')
+        early_stop_callback = EarlyStopping(
+            monitor='val_loss',
+            min_delta=0.00,
+            patience=8,
+            verbose=False,
+            mode='auto'
+        )
+        callbacks.append(checkpoint_callback)
+        callbacks.append(early_stop_callback)
+
         if tparams['mode'] in ["train_new"]:
             
-            checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
-                mode='min', dirpath=dir_checkpoints, 
-                filename='{epoch:03d}_{val_loss:.5f}')
-            
-            early_stop_callback = EarlyStopping(
-                monitor='val_loss',
-                min_delta=0.00,
-                patience=8,
-                verbose=False,
-                mode='auto'
-
-            )
-            callbacks.append(checkpoint_callback)
-            callbacks.append(early_stop_callback)
-
-            trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams), progress_bar_refresh_rate=1,
+            trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
+                        progress_bar_refresh_rate=50,
+                        default_root_dir=tparams['dir_checkpoints'],
                         check_val_every_n_epoch=1, logger=tb_logger,
                         log_every_n_steps=5,
                         precision=16, callbacks=callbacks,
-                        num_processes=1,
                         #track_grad_norm = True,
-                        overfit_batches=5,
-                        fast_dev_run=2, 
+                        #overfit_batches=5,
+                        #fast_dev_run=2, 
                         #log_gpu_memory=True
                         )
 
         if tparams['mode'] in ["train_cont","test","inference"]:
-             
-            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
-            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
-            best_ckpt_path = min(scores_dict, key=scores_dict.get)
+            #restoring checkpoint             
+            checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
             trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=1,
-                    resume_from_checkpoint = best_ckpt_path,
                     check_val_every_n_epoch=1, logger=tb_logger,
-                    log_every_n_steps=5,
                     precision=16
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
                     #log_gpu_memory=True
                     )
-            
+
+            # load callback states
+            trainer.on_load_checkpoint(checkpoint)
+            trainer.global_step = checkpoint['global_step']
+            trainer.current_epoch = checkpoint['epoch']
+
+            # restore the optimizers
+            optimizer_states = checkpoint['optimizer_states']
+            for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
+                optimizer.load_state_dict(opt_state)
+
+                # move optimizer to GPU 1 weight at a time
+                # avoids OOM
+                if trainer.root_gpu is not None:
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda(trainer.root_gpu)
+
+            # restore the lr schedulers
+            lr_schedulers = checkpoint['lr_schedulers']
+            for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
+                scheduler['scheduler'].load_state_dict(lrs_state)
+
         return trainer
+    
+    @staticmethod
+    def get_ckpt_file(_dir_checkpoint,mode='best'):
+        if mode=='best':
+            checkpoint_yaml_file = os.path.join( dir_checkpoints,"best_k_models.yaml" )
+            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            best_ckpt_path = min(scores_dict, key=scores_dict.get)
+
+            if torch.cuda.is_available():
+                checkpoint = torch.load(best_ckpt_path)
+            else:
+                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))            
+        else:
+            raise NotImplementedError
+        
+        return checkpoint
         
     @staticmethod
     def start(trainer, tparams, training_module ):
@@ -764,8 +795,7 @@ class TrainingModule(pl.LightningModule):
             training_module.eval() 
             training_module.freeze() 
             trainer.test(test_dataloaders=training_module.test_dl, model=training_module, ckpt_path='best')
-            
-            
+              
         elif tparams['mode'] in ['train_new','train_cont']:    
             trainer.fit(training_module )
             #trainer.checkpoint_callback.to_yaml()
@@ -773,6 +803,7 @@ class TrainingModule(pl.LightningModule):
         
         elif tparams['mode'] in ['infernece']: 
             raise NotImplementedError   
+
 
     def step(self, batch, step_name):
 
@@ -1081,7 +1112,7 @@ class SingleIterDataset(torch.utils.data.IterableDataset):
         self.line_start = line_start
         self.line_end = line_end
 
-        skiprows = linestart if line_start!=0 else None
+        skiprows = self.linestart if self.line_start!=0 else None
         with open(self.fp, 'r') as f:
             self.data = pd.read_csv(file_path, sep=',', header=0, skiprows=skiprows, nrows=(self.line_end-self.line_start) )
                     
@@ -1104,10 +1135,6 @@ class SingleIterDataset(torch.utils.data.IterableDataset):
         rst_rels = [ _dict['rel'] for _dict in li_rst ]
         rst_ns = [ _dict['ns'] for _dict in li_rst ]
         rst_pos = [ _dict['pos'] for _dict in li_rst ]
-
-        # rst_rels = rst['rels']
-        # rst_ns = rst['ns']
-        # rst_pos = rst['pos']
         
         #Topic scores
         #topics_rake = json.loads(datum['topic_rake'])
@@ -1131,8 +1158,9 @@ class SingleIterDataset(torch.utils.data.IterableDataset):
         return map_datum
 
 def main(tparams={}, mparams={}):
+    gc.collect()
     torch.cuda.empty_cache()
-        
+     
            
     # Defining Logger
     tb_logger = pl_loggers.TensorBoardLogger( 
@@ -1140,8 +1168,9 @@ def main(tparams={}, mparams={}):
                     name = mparams['model_name'],
                     version = tparams['version'] )
     tparams['version'] =  tb_logger.version
-    tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
+    tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']:02d}",'checkpoints' )
     
+
     # initiating training loop
     training_module = TrainingModule.instatiate_training_module( tparams, mparams)
     trainer = TrainingModule.instatiate_trainer( tparams,  tb_logger)

@@ -428,7 +428,7 @@ class DataLoaderGenerator():
             [type]: [description]
         """
         dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
-        set_names = ["train","val","set"]
+        set_names = ["train","val","test"]
         li_shuffle = [True, False, False]
         dataloaders = []
         
@@ -533,7 +533,6 @@ def main(tparams, mparams):
 
     tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{tparams.version_name}/logs'))
     
-    
         
     checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
         mode='min', dirpath=checkpoint_dir, 
@@ -567,19 +566,7 @@ def main(tparams, mparams):
         checkpoint = torch.load(checkpoint_path)
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
-        #training_module.optimizer_obj.load_state_dict(checkpoint['optimizer_states'])
-        #training_module.lr_scheduler_obj.load_state_dict(checkpoint['lr_scheduler'])
-        #training_module.global_step = checkpoint['global_step']
-        #training_module.current_epoch = checkpoint['epoch'] + 1
 
-        #callbacks = []
-        # for callback, attrs in checkpoint['callbacks'].items():
-        #     for atr,value in attrs.items():
-        #         setattr(callback,atr,value)
-        #     callbacks.append(callback)
-
-             
-                
         trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
@@ -589,8 +576,7 @@ def main(tparams, mparams):
                     #,fast_dev_run=True, 
                     #log_gpu_memory=True
                     )
-        #trainer.checkpoint_connector.restore_training_state(checkpoint)
-        
+                
         # load callback states
         trainer.on_load_checkpoint(checkpoint)
 
@@ -615,17 +601,18 @@ def main(tparams, mparams):
         for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
             scheduler['scheduler'].load_state_dict(lrs_state)
 
+    if tparams.mode in ["train_new","train_cont"]:    
+        trainer.fit(training_module)
+        trainer.test(test_dataloaders=training_module.test_dl )
 
-    if tparams.mode in ["test"]:
+    elif tparams.mode in ["test","inference"]:
         training_module.eval() 
         training_module.freeze() 
         #trainer.ckpt_path = checkpoint_path
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
         #trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
         
-    else:    
-        trainer.fit(training_module)
-        trainer.test(test_dataloaders=training_module.test_dl )
+
 
 
 if __name__ == '__main__':
