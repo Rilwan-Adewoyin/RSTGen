@@ -12,6 +12,7 @@ rl_conv/pretrain/DialogueAct/models
 rl_conv/pretrain/DialogueAct/models/*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
 rl_conv/pretrain/DialogueAct/log
+rl_conv/pretrain/DialogueAct/cache/*
 
 #NLG
 rl_conv/pretrain/NLG/dataset/*
@@ -29,6 +30,7 @@ rl_conv/pretrain/.ipynb_checkpoints
 
 .vscode/*
 *src*
+
 
 .vscode/launch.json
 .vscode/settings.json

@@ -55,8 +55,9 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     tp_fp = os.path.join(_dir_version,'tparam.json')
     mp_fp = os.path.join(_dir_version,'mparam.json')
 
-    json.dump( vars(t_params), open(tp_fp,"w") )
-    json.dump( vars(m_params), open(mp_fp,"w") )
+    if t_params.mode == "train_new":
+        json.dump( vars(t_params), open(tp_fp,"w") )
+        json.dump( vars(m_params), open(mp_fp,"w") )
 
     return True    
 
@@ -78,9 +79,9 @@ def get_best_ckpt_path(dir_path):
 
     li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
 
-    li_versions = [ re.findall( r"epoch=[\d]{3}" ,fname)[0][-3:] for fname in li_files ]
+    li_ckpts = [ re.findall( r"epoch=[\d]{3}" ,fname)[0][-3:] for fname in li_files ]
 
-    index = li_versions.index( max(li_versions, key=int ) )
+    index = li_ckpts.index( max(li_ckpts, key=int) )
 
     ckpt_path = li_files[index]
 

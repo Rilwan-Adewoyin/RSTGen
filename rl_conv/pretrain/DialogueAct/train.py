@@ -2,6 +2,8 @@ import numpy as np
 import warnings
 import sklearn
 
+from pathlib import Path
+
 import torchdata as td
 #from torchdata import datasets,Dataset
 import torch
@@ -336,15 +338,8 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-
-            #correct_micro = torch.stack([x["correct_micro"] for x in outputs]).sum()
-            #correct_macro = torch.stack([x["correct_macro"] for x in outputs]).sum()
-            #total_micro=sum([x["total_micro"] for  x in outputs])
-            ##total_macro=sum([x["total_macro"] for  x in outputs])
-            
+           
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
-            #self.log(f"{step_name}_acc_micro_epoch", correct_micro/total_micro, logger=True, prog_bar=False)
-            ##self.log(f"{step_name}_acc_macro_epoch", correct_macro/total_macro, logger=True, prog_bar=False)
 
 
     def create_data_loaders(self, shuffle=False, **kwargs):
@@ -389,6 +384,7 @@ class TrainingModule(pl.LightningModule):
                 num_training_steps=total_steps,
                 num_cycles = 3
                 )
+        
         elif self.lr_schedule == "LROnPlateau":
             lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4,)
 
@@ -453,9 +449,9 @@ class DataLoaderGenerator():
         concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
         
         _dir = f"./cache"
-        os.makedirs("_dir",exist_ok=True)
+        os.makedirs(os.path.abspath(_dir),exist_ok=True)
 
-        concat_dset = concat_dset.cache(td.cachers.Pickle( os.path.join(_dir,name)) )
+        concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
         #concat_dset = concat_dset.cache()
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
@@ -523,7 +519,12 @@ def main(tparams, mparams):
     if tparams.mode in ['train_cont','test']:
         checkpoint_path = utils.get_best_ckpt_path(checkpoint_dir)
         mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
-        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
+        
+        # Restoring old tparams and combining with some params in new tparams
+        old_tparams_dict = json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) )
+        curr_tparams_dict = vars(tparams)
+        old_tparams_dict.update({key: curr_tparams_dict[key] for key in ['accumulate_grad_batches','batch_size','workers','gpus','mode']  })
+        tparams = argparse.Namespace(** old_tparams_dict )
     
     danet = DaNet(**vars(mparams))
     
@@ -532,42 +533,88 @@ def main(tparams, mparams):
 
     tb_logger = pl_loggers.TensorBoardLogger(utils.get_path(f'./models/{tparams.version_name}/logs'))
     
-    if tparams.mode in ["train_new","train_cont"]:
+    
         
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
-            mode='min', dirpath=checkpoint_dir, 
-            filename='{epoch:03}-{val_loss:.3f}-{val_acc_micro_epoch:.3f}')
-        
-        early_stop_callback = EarlyStopping(
-            monitor='val_loss',
-            min_delta=0.00,
-            patience=8,
-            verbose=False,
-            mode='auto'
+    checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
+        mode='min', dirpath=checkpoint_dir, 
+        filename='{epoch:03}-{val_loss:.3f}-{val_acc_micro:.3f}')
+    
+    early_stop_callback = EarlyStopping(
+        monitor='val_loss',
+        min_delta=0.00,
+        patience=8,
+        verbose=False,
+        mode='auto'
 
-        )
-        callbacks.append(checkpoint_callback)
-        callbacks.append(early_stop_callback)
+    )
+    callbacks.append(checkpoint_callback)
+    callbacks.append(early_stop_callback)
+    if tparams.mode in ["train_new"]:
+        training_module = TrainingModule(**vars(tparams), model=danet )
+        
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
+                        check_val_every_n_epoch=1, logger=tb_logger,
+                        default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
+                        precision=16, callbacks=callbacks,
+                        #track_grad_norm = True,
+                        #overfit_batches=5
+                        #,fast_dev_run=True, 
+                        #log_gpu_memory=True
+                        )
         
     # Making training module
-    if tparams.mode in ["test","train_cont"]:
+    elif tparams.mode in ["test","train_cont"]:
         checkpoint = torch.load(checkpoint_path)
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
-    else:
-        training_module = TrainingModule(**vars(tparams), model=danet )
+        #training_module.optimizer_obj.load_state_dict(checkpoint['optimizer_states'])
+        #training_module.lr_scheduler_obj.load_state_dict(checkpoint['lr_scheduler'])
+        #training_module.global_step = checkpoint['global_step']
+        #training_module.current_epoch = checkpoint['epoch'] + 1
 
+        #callbacks = []
+        # for callback, attrs in checkpoint['callbacks'].items():
+        #     for atr,value in attrs.items():
+        #         setattr(callback,atr,value)
+        #     callbacks.append(callback)
+
+             
                 
-                
-    trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
-                check_val_every_n_epoch=1, logger=tb_logger,
-                default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
-                precision=16, callbacks=callbacks,
-                #track_grad_norm = True,
-                #overfit_batches=5
-                #,fast_dev_run=True, 
-                #log_gpu_memory=True
-                )
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
+                    check_val_every_n_epoch=1, logger=tb_logger,
+                    default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
+                    precision=16, callbacks=callbacks ,
+                    #track_grad_norm = True,
+                    #overfit_batches=5
+                    #,fast_dev_run=True, 
+                    #log_gpu_memory=True
+                    )
+        #trainer.checkpoint_connector.restore_training_state(checkpoint)
+        
+        # load callback states
+        trainer.on_load_checkpoint(checkpoint)
+
+        trainer.global_step = checkpoint['global_step']
+        trainer.current_epoch = checkpoint['epoch']
+
+        # restore the optimizers
+        optimizer_states = checkpoint['optimizer_states']
+        for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
+            optimizer.load_state_dict(opt_state)
+
+            # move optimizer to GPU 1 weight at a time
+            # avoids OOM
+            if trainer.root_gpu is not None:
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.cuda(trainer.root_gpu)
+
+        # restore the lr schedulers
+        lr_schedulers = checkpoint['lr_schedulers']
+        for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
+            scheduler['scheduler'].load_state_dict(lrs_state)
+
 
     if tparams.mode in ["test"]:
         training_module.eval() 
