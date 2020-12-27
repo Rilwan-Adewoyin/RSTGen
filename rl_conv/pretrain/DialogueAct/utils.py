@@ -80,7 +80,7 @@ def get_best_ckpt_path(dir_path):
 
     li_versions = [ re.findall( r"epoch=[\d]{3}" ,fname)[0][-3:] for fname in li_files ]
 
-    index = li_versions.index( max(li_versions) )
+    index = li_versions.index( max(li_versions, key=int ) )
 
     ckpt_path = li_files[index]
 

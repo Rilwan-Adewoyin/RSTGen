@@ -244,7 +244,7 @@ def main(danet_vname,
         timer.start()
         mp_count_rst = mp_count
         with mp.Pool(mp_count_rst) as pool:
-            res = pool.starmap( _rst, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) ) )
+            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         timer.end("RST")
@@ -367,12 +367,9 @@ def _rst(li_li_thread_utterances, fh_container_id ):
     for i, _ in enumerate(li_li_thread_utterances):
         
         li_thread_utterances = li_li_thread_utterances[i]
-    
-        li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]
-        
+        li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]        
         json_li_utterance = json.dumps(li_utterance)
 
-        
         cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
         exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
                             demux=True)
@@ -435,7 +432,6 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         for idx, pt_str in enumerate(str_tree):
             try:
                 if pt_str == '': raise ValueError
-                
                 _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
             except ValueError:
                 _ = None
@@ -443,7 +439,6 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
             li_subtrees.append(_)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
-
 
         # Keeping non erroneous utterances within a conversation - bad trees
         assert len(li_rst_dict) == len(li_thread_utterances)
@@ -455,13 +450,8 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
             else:
                 pass
 
-
         new_li_li_thread_utterances.append(new_li_thread_utterance)
-    
-
-
     return new_li_li_thread_utterances
-
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""

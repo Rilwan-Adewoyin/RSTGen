@@ -874,7 +874,7 @@ class TrainingModule(pl.LightningModule):
     def total_steps(self):
 
         ds_size = self.train_dl.dataset.__len__()
-        steps = (ds_size * self.max_epochs) // self.batch_size
+        steps = (ds_size * self.max_epochs) // (self.batch_size*self.accumulate_grad_batches)
         return steps
 
     def configure_optimizers(self):
