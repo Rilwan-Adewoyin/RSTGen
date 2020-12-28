@@ -48,7 +48,6 @@ import multiprocessing as mp
 
 
 from unidecode import unidecode
-global batches_completed
 batches_completed = 0
 dict_args = {}
 
@@ -166,6 +165,7 @@ def main(danet_vname,
     
     timer = Timer()
     #region operating in batches
+    global batches_completed
     batches_completed = start_batch
 
     while len(li_id_dictconv) > 0:
