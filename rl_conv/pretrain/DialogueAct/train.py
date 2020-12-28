@@ -583,6 +583,7 @@ def main(tparams, mparams):
         trainer.global_step = checkpoint['global_step']
         trainer.current_epoch = checkpoint['epoch']
 
+        
         # restore the optimizers
         optimizer_states = checkpoint['optimizer_states']
         for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):

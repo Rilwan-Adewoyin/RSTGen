@@ -278,7 +278,7 @@ def main(danet_vname,
 
 def _load_data():
     # Donwload reddit-corpus-small if it doesnt exist
-    _dir_path = utils_nlg.get_path("dataset/reddit_small")
+    _dir_path = utils_nlg.get_path("./dataset/reddit_small")
     if os.path.exists(_dir_path):
         use_local = True
     else:
