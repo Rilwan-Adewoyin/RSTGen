@@ -1,5 +1,6 @@
 import sys, os
 #sys.stdout = codecs.getwriter(encoding)(sys.stdout)
+import traceback
 
 import convokit
 from convokit.model import ConvoKitMeta
@@ -138,17 +139,10 @@ def main(danet_vname,
         image = client.images.build(path=dir_dockferfile,
             nocache=True, pull=False, rm=True,forcerm=True,
             tag="akanni96/feng-hirst-rst-parser")[0]
-        #Use this image for lightweight reproducible version
-        # image = client.images.pull(image_name, tag='latest')
-            #Make a tag for Windows and Linux
-
-        #image = client.images.build(utils.get_path("..\"))
+        
     else:
         image = client.images.get(image_name)
 
-    # fh_container  = client.containers.run(image, detach=True, 
-    #     entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) 
-    
     li_fh_container = [ client.containers.run(image, detach=True, 
         entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
 
@@ -426,7 +420,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         raise Exception
 
     for idx, str_tree in enumerate(li_strtree):
-        li_thread_utterances = li_li_thread_utterances[i]
+        li_thread_utterances = li_li_thread_utterances[idx]
         li_subtrees = []
 
         for idx, pt_str in enumerate(str_tree):
@@ -642,7 +636,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
 
-    parser.add_argument('--danet_vname', default="DaNet_v001",
+    parser.add_argument('--danet_vname', default="DaNet_v007",
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
@@ -676,6 +670,8 @@ if __name__ == '__main__':
             # os.system(cmd)
             # time.sleep(5)
             print(e)
+            print(traceback.format_exc())
+
             last_batch_processed = last_batch_processed + 1
             dict_args['start_batch'] = last_batch_processed
             
