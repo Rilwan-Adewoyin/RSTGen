@@ -342,7 +342,7 @@ def _valid_utterance(txt):
 
     # post_not_deleted = txt!="[deleted]"
 
-    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]"
+    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]" and txt!="removed"
 
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
@@ -408,8 +408,8 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
     fh_container = client.containers.get(fh_container_id)
     new_li_li_thread_utterances = []
 
-    #TODO: need to get rid of the utterances that equal == "removed"
-    li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
+    #TODO: need to get rid of the utterances that equal == "empty" (these cases are currently )
+    li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread_utt['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
 
     li_li_utterances = [ [thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ] for li_thread_utterances in li_li_thread_utterances] #li of li of utts
 
