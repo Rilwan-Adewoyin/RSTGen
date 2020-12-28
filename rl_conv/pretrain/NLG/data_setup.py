@@ -245,7 +245,7 @@ def main(danet_vname,
         containers = sum(contaiers, [])
         with mp.Pool(mp_count_rst) as pool:
 
-            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), containers  )
+            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst , containers ) ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
