@@ -241,11 +241,11 @@ def main(danet_vname,
         timer.start()
         mp_count_rst = mp_count
         #containers = li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)
-        contaiers =  [ li_fh_container for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
-        containers = sum(contaiers, [])
+        contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
+        contaier_ids = sum(contaier_ids, [])
         with mp.Pool(mp_count_rst) as pool:
 
-            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst) , containers  ) )
+            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst) , contaier_ids  ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
