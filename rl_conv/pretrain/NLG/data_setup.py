@@ -244,6 +244,7 @@ def main(danet_vname,
             res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ), li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+        batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
         timer.end("RST")
 
         #endregion
@@ -409,11 +410,9 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
     new_li_li_thread_utterances = []
 
     #TODO: need to get rid of the utterances that equal == "empty" (these cases are currently )
-    li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread_utt['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
+    #li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread_utt['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
 
     li_li_utterances = [ [thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ] for li_thread_utterances in li_li_thread_utterances] #li of li of utts
-
-    
 
     json_li_li_utterance = json.dumps(li_li_utterances)
 
@@ -426,7 +425,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         li_strtree = json.loads(stdout)
     except (TypeError, json.JSONDecodeError) as e:
         print(e)
-        raise Exception
+        return new_li_li_thread_utterances
 
     for idx, str_tree in enumerate(li_strtree):
         li_thread_utterances = li_li_thread_utterances[idx]
