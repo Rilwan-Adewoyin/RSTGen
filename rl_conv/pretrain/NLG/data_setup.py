@@ -166,7 +166,9 @@ def main(danet_vname,
     
     timer = Timer()
     #region operating in batches
+    global batches_completed
     batches_completed = start_batch
+
     while len(li_id_dictconv) > 0:
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
@@ -681,7 +683,7 @@ if __name__ == '__main__':
             # time.sleep(5)
             print(e)
             print(traceback.format_exc())
-
+            global batches_completed
             dict_args['start_batch'] = batches_completed + 1
             
         finally :
