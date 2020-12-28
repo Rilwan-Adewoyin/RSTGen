@@ -240,7 +240,7 @@ def main(danet_vname,
         #region Predicting the RST Tag
         timer.start()
         mp_count_rst = mp_count
-        containers = li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1) )
+        #containers = li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)
         contaiers =  [ li_fh_container for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
         containers = sum(contaiers, [])
         with mp.Pool(mp_count_rst) as pool:
