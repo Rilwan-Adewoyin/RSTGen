@@ -49,7 +49,7 @@ import multiprocessing as mp
 
 from unidecode import unidecode
 
-last_batch_processed = 0
+batches_completed = 0
 dict_args = {}
 
 pattern_hlinks =  re.compile("(\[?[\S ]*\]?)(\((https|www|ftp|http)?[\S]+\))")
@@ -158,22 +158,20 @@ def main(danet_vname,
     corpus = _load_data()
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
-    batches_completed = 0
+
 
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
-        batches_completed = start_batch
     # endregion
     
     timer = Timer()
     #region operating in batches
-    
+    batches_completed = start_batch
     while len(li_id_dictconv) > 0:
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
         print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
-        last_batch_processed = batches_completed
 
         #region preprocessing
         timer.start()
@@ -669,7 +667,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     dict_args = vars(args)
-    last_batch_processed = dict_args['start_batch']
+
     completed = False
     while completed == False:
         try:
@@ -684,8 +682,7 @@ if __name__ == '__main__':
             print(e)
             print(traceback.format_exc())
 
-            last_batch_processed = last_batch_processed + 1
-            dict_args['start_batch'] = last_batch_processed
+            dict_args['start_batch'] = batches_completed + 1
             
         finally :
             cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
