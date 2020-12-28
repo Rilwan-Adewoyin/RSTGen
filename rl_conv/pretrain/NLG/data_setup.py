@@ -408,7 +408,13 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
     fh_container = client.containers.get(fh_container_id)
     new_li_li_thread_utterances = []
 
+    #TODO: need to get rid of the utterances that equal == "removed"
+    li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
+
     li_li_utterances = [ [thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ] for li_thread_utterances in li_li_thread_utterances] #li of li of utts
+
+    
+
     json_li_li_utterance = json.dumps(li_li_utterances)
 
     cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance]
