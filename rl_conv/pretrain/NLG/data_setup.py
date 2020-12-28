@@ -449,7 +449,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         # Keeping non erroneous utterances within a conversation - bad trees
         assert len(li_rst_dict) == len(li_thread_utterances)
         new_li_thread_utterance = []
-        for idx in range(li_rst_dict):
+        for idx in range(len(li_rst_dict)):
             if li_rst_dict[idx]!=None:
                 li_thread_utterances[idx].update( {'rst':li_rst_dict[idx]})
                 new_li_thread_utterance.append(li_thread_utterances[idx] )
