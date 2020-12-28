@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(sys.path[0])) # Adds higher directory to python 
 sys.path.append( os.path.join( os.path.dirname(sys.path[0]),"DialogueAct" ) ) 
 import numpy
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import convokit
 from convokit import Corpus, download
 import argparse
@@ -43,6 +44,8 @@ from utils import get_path
 
 import regex as re
 import multiprocessing as mp
+
+
 
 from unidecode import unidecode
 
@@ -285,7 +288,7 @@ def _load_data():
         use_local = False
         os.makedirs(_dir_path, exist_ok=True)
 
-    corpus = Corpus(filename=download("reddit-corpus-small", data_dir=os.path.abspath(_dir_path), use_local=use_local), merge_lines=True)
+    corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
     return corpus
 
