@@ -354,9 +354,10 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
         #current utterance
         li_li_pp_text = __get_response(model, tokenizer, rows_to_pp['utterance'].values.tolist() , copies_to_make )
         #prev utterance
-        li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist() , copies_to_make )
+        li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist(), copies_to_make )
 
     # make a list of new dfs with the paraphrase
+        li_pp_df_copy = []
         for idx, li_pp_txt, li_pp_txt_prev in zip(idxs_to_pp,  li_li_pp_text, li_li_pp_text_prev):
             if li_pp_txt==[] or li_pp_txt_prev==[]:
                 continue
