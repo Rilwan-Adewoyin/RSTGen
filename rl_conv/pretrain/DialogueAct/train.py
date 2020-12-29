@@ -579,7 +579,6 @@ def main(tparams, mparams):
                 
         # load callback states
         trainer.on_load_checkpoint(checkpoint)
-
         trainer.global_step = checkpoint['global_step']
         trainer.current_epoch = checkpoint['epoch']
 

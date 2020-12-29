@@ -1,6 +1,7 @@
 import os
 import json
 from transformers import AutoTokenizer, AutoModel
+from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 dirname = os.path.dirname(__file__)
 from datetime import date
 import glob
@@ -23,15 +24,26 @@ def get_path(_path,_dir=False):
 
 
 def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, tokenizer=False):
-    _dir_transformer = os.path.join( get_path("./models"), model_name )
+    #If model name contains a forward slash then only take second half
+    if "/" in model_name:
+        _dir_transformer = os.path.join( get_path("./models"), model_name.split("/")[-1] )
+    else:
+        _dir_transformer = os.path.join( get_path("./models"), model_name )
 
     exists = os.path.isdir(_dir_transformer)
 
     output = {}
 
-    if exists == False:    
-        model_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
+    if exists == False:   
+
+        if model_name == "tuner007/pegasus_paraphrase":
+            model_tokenizer = PegasusTokenizer.from_pretrained(model_name)
+            model = PegasusForConditionalGeneration.from_pretrained(model_name)
+        else:
+            model_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name)
+
+        
         
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
@@ -40,7 +52,10 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
         output['tokenizer'] = AutoTokenizer.from_pretrained(_dir_transformer)
 
     if transformer == True:
-        output['transformer'] = AutoModel.from_pretrained(_dir_transformer)
+        if model_name == "tuner007/pegasus_paraphrase":
+            output['transformer'] = PegasusForConditionalGeneration.from_pretrained(_dir_transformer)
+        else:
+            output['transformer'] = AutoModel.from_pretrained(_dir_transformer)
     
     return output
 
