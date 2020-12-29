@@ -291,7 +291,7 @@ class TrainingModule(pl.LightningModule):
     def forward(self, input_, *args):
         return self.model(input_)
 
-    def format_preds(self, preds):
+    def format_preds(self, preds, logits=True):
         """Converts list of logit scores for Dialogue Acts
             to a list of OrderedDictionaries where
             each dict contains the DA names and probabilities 
@@ -303,7 +303,9 @@ class TrainingModule(pl.LightningModule):
         Returns:
             [type]: [description]
         """
-        preds = torch.sigmoid(preds)
+        if logits == True:
+            preds = torch.sigmoid(preds)
+        
         li_li_da = preds.tolist()
 
         li_dict_da = [ OrderedDict(zip( self.ordered_label_list, pred_da))
@@ -501,7 +503,7 @@ class SingleDataset(torch.utils.data.Dataset):
         #_str_tknized = self.tokenizer.tokenize(_str)
         
         encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
-            truncation=True, max_length=360, return_tensors='pt', return_token_type_ids=True )
+            truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True )
                 
         return encoded_input
 

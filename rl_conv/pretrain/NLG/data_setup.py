@@ -235,13 +235,20 @@ def main(danet_vname,
 
                 # If more than 2 EDUs we evaluate each EDU and the complete utterance
                 if len(li_uttedu) >= 3:
-                    li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
+                    li_input.extend( [ [ prev_utt, uttedu] for uttedu in li_uttedu  ] )
 
-
-                encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
-                    truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                    encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
                 
-                pred_da = danet_module.forward(encoded_input)
+                    pred_da = danet_module.forward(encoded_input)
+
+                    pred_da = torch.sigmoid( pred_da )
+
+                    # Reducing the pred_da to one prediction
+                        # Take the maximum for each da label if
+                    max_values, _ = torch.max(pred_da,axis=0)
+
+                    pred_da = torch.where(max_values>=0.5, max_values, )
 
             
             li_li_da, li_dict_da = danet_module.format_preds(pred_da)

@@ -388,11 +388,11 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
             
             batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=80, num_beams=12, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True) #no_repeat_ngram_size=2
+            translated_pp = model.generate(**batch, max_length=60, num_beams=12, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True) #no_repeat_ngram_size=2
             #parameters chosen after careful evaluation: sample=True produces more diverse and longer responses. This is better for evaluation on later reddit data which also tends to be longer. and this temperature circa 2 produces diverse responses too
                 #The mode sample=True does not use a length penalization, so in a sense is not summarization, early_stopping=True increases variation in text
             
-            translated_smrzd = model.generate(**batch, max_length=80, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True)
+            translated_smrzd = model.generate(**batch, max_length=60, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True)
             #choosing to make another few samples that are summarizations. This means that are model will be length invariant since da classes should have a mix or short and long representations
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
