@@ -30,6 +30,7 @@ import traceback
 
 import torch
 import copy
+import gc
 
 from timeit import default_timer as timer
 from datetime import timedelta
@@ -414,6 +415,8 @@ if __name__ == "__main__":
     completed= False
     while completed == False:
         try:
+            gc.collect()
+            torch.cuda.empty_cache()
             main()
         except Exception as e:
             print(e) 
