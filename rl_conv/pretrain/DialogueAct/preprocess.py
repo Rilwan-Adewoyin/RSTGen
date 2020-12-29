@@ -129,8 +129,8 @@ def preprocess(args, str_subset):
     # removing fns from to process based on their suffix
 
     li_fns_mrda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in mrda_proc_codes ) ]
-    li_fns_swda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in swda_proc_codes ) ]
-    li_fns_mrda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in mrda_proc_codes ) ]
+    li_fns_swda = [ fn for fn in li_fns_swda if ( os.path.split(fn)[1] not in swda_proc_codes ) ]
+    li_fns_midas = [ fn for fn in li_fns_midas if ( os.path.split(fn)[1] not in midas_proc_codes ) ]
 
     #Removed fns that have already been procesed
 

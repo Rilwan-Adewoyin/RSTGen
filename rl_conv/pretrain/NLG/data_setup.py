@@ -205,65 +205,8 @@ def main(danet_vname,
 
             batch_li_li_thread_utterances.append(li_thread_utterances)
         timer.end("preprocessing")
-        
         #endregion
         
-        #region DA assignment
-        timer.start()
-        for i, _ in enumerate(batch_li_li_thread_utterances):
-            
-            li_thread_utterances = batch_li_li_thread_utterances[i]
-
-            # li_prevutt_utt = [
-            #     [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances), _dict['txt_preproc']  ]
-            #     for _dict in li_thread_utterances
-            # ] #list of prev utterance and current utterance
-
-            # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
-                #list of prev utterance
-            li_currutt =  [ _dict['txt_preproc'] for _dict
-                            in li_thread_utterances ] 
-
-            li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
-                            in li_thread_utterances ] 
-            li_li_uttedu = [ _dict['edus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
-
-            
-            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttedu):
-                #this prev_utt is added as context  to all the edus for a given long utterance
-                li_input = [ [prev_utt, curr_utt ] ]
-
-                # If more than 2 EDUs we evaluate each EDU and the complete utterance
-                if len(li_uttedu) >= 3:
-                    li_input.extend( [ [ prev_utt, uttedu] for uttedu in li_uttedu  ] )
-
-                    encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
-                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
-                
-                    pred_da = danet_module.forward(encoded_input)
-
-                    pred_da = torch.sigmoid( pred_da )
-
-                    # Reducing the pred_da to one prediction
-                        # Take the maximum for each da label if
-                    max_values, _ = torch.max(pred_da,axis=0)
-
-                    pred_da = torch.where(max_values>=0.5, max_values, )
-
-            
-            li_li_da, li_dict_da = danet_module.format_preds(pred_da)
-            
-                #sequence of vectors, vector=logit score for each da class           
-            #TODO consider removing dialogues where 'reply_to'==None
-
-            [
-                _dict.update({'dict_da':dict_da }) for _dict, li_da, dict_da in 
-                zip( li_thread_utterances, li_dict_da)
-            ]
-
-            batch_li_li_thread_utterances[i] = li_thread_utterances
-        timer.end("DA")   
-        #endregion
 
         #region Predicting the RST Tag
         timer.start()
@@ -277,6 +220,60 @@ def main(danet_vname,
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
         timer.end("RST")
+        #endregion
+
+
+        #region DA assignment
+        timer.start()
+        for i, _ in enumerate(batch_li_li_thread_utterances):
+            
+            li_thread_utterances = batch_li_li_thread_utterances[i]
+
+            # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
+                #list of prev utterance
+            li_currutt =  [ _dict['txt_preproc'] for _dict
+                            in li_thread_utterances ] 
+
+            li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
+                            in li_thread_utterances ] 
+            li_li_uttedu = [ _dict['edus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
+
+            
+            li_dict_da = []
+            li_li_da = []
+            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttedu):
+                #this prev_utt is added as context  to all the edus for a given long utterance
+                li_input = [ [prev_utt, curr_utt ] ]
+
+                # If more than 2 EDUs we evaluate each EDU and the complete utterance
+                if len(li_uttedu) >= 3:
+                    li_input.extend( [ [ prev_utt, uttedu] for uttedu in li_uttedu  ] )
+
+                    encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                
+                    pred_da = danet_module.forward(encoded_input)
+                    pred_da = torch.sigmoid( pred_da )
+
+                    # Reducing the pred_da to one prediction
+                        # Take the maximum for each da label if
+                    max_values, _ = torch.max(pred_da,axis=0)
+                    pred_da = torch.where(max_values>=0.5, max_values, torch.mean( pred_da, axis=0) )
+
+                    li_da, dict_da = danet_module.format_preds(pred_da)
+                    li_li_da.append(li_li_da)
+                    li_dict_da.append(dict_da)
+            
+                #sequence of vectors, vector=logit score for each da class           
+            #TODO consider removing dialogues where 'reply_to'==None
+
+            [
+                _dict.update({'dict_da':dict_da }) for _dict, li_da, dict_da in 
+                zip( li_thread_utterances, li_dict_da)
+            ]
+
+            batch_li_li_thread_utterances[i] = li_thread_utterances
+        timer.end("DA")   
         #endregion
 
         #region Topic extraction
@@ -457,11 +454,12 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
     except (TypeError, json.JSONDecodeError) as e:
         print(e)
         return new_li_li_thread_utterances
-
+    
     for idx, str_tree in enumerate(li_strtree):
         li_thread_utterances = li_li_thread_utterances[idx]
         li_subtrees = []
 
+        # Parsing a list of subtrees in the utterance tree str_tree
         for idx, pt_str in enumerate(str_tree):
             try:
                 if pt_str == '': raise ValueError
@@ -472,13 +470,15 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
             li_subtrees.append(_)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
+        #TODO: ENTER CODE TO RETREIVE edus for a given utterance
+        li_rst_edus = [ _tree_to_edu_str(_tree) if _tree != None else None for _tree in li_subtrees  ]
 
-        # Keeping non erroneous utterances within a conversation - bad trees
+        # Keeping non erroneous utterances within a conversation - bad trees were assigned None
         assert len(li_rst_dict) == len(li_thread_utterances)
         new_li_thread_utterance = []
         for idx in range(len(li_rst_dict)):
             if li_rst_dict[idx]!=None:
-                li_thread_utterances[idx].update( {'rst':li_rst_dict[idx]})
+                li_thread_utterances[idx].update( {'rst':li_rst_dict[idx], 'edus':li_rst_edus[idx] } )
                 new_li_thread_utterance.append(li_thread_utterances[idx] )
             else:
                 pass
