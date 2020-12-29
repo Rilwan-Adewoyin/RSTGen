@@ -421,7 +421,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(e) 
             print("\n")
-            print(traceback.print_tb())
+            print(traceback.print_exc())
             print("\n\nRestarting Script\n\n")
             pass
 
