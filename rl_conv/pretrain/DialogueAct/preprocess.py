@@ -416,7 +416,6 @@ if __name__ == "__main__":
     while completed == False:
         try:
             gc.collect()
-            torch.cuda.empty_cache()
             main()
         except Exception as e:
             print(e) 

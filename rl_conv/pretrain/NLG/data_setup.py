@@ -221,15 +221,27 @@ def main(danet_vname,
 
             # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
                 #list of prev utterance
+            li_currutt =  [ _dict['txt_preproc'] for _dict
+                            in li_thread_utterances ] 
+
             li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
                             in li_thread_utterances ] 
-            li_li_uttedus = [ _dict['edus'] for _dict in li_thread_utterances ] #list of the EDUs for a given utterance
+            li_li_uttedu = [ _dict['edus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
 
             
-            encoded_input =  tokenizer(li_prevutt_utt, add_special_tokens=True, padding='max_length', 
-                truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True)
-            
-            pred_da = danet_module.forward(encoded_input)
+            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttedu):
+                #this prev_utt is added as context  to all the edus for a given long utterance
+                li_input = [ [prev_utt, curr_utt ] ]
+
+                # If more than 2 EDUs we evaluate each EDU and the complete utterance
+                if len(li_uttedu) >= 3:
+                    li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
+
+
+                encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                    truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                
+                pred_da = danet_module.forward(encoded_input)
 
             
             li_li_da, li_dict_da = danet_module.format_preds(pred_da)
