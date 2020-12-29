@@ -9,6 +9,7 @@ sys.path.append( os.path.join( os.path.dirname(sys.path[0]),"DialogueAct" ) )
 import numpy
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import convokit
 from convokit import Corpus, download
 import argparse
@@ -38,6 +39,8 @@ import csv
 import pickle
 import time
 import torch
+
+
 
 from utils import get_best_ckpt_path
 from utils import get_path
@@ -203,8 +206,6 @@ def main(danet_vname,
             batch_li_li_thread_utterances.append(li_thread_utterances)
         timer.end("preprocessing")
         
-        
-
         #endregion
         
         #region DA assignment
@@ -213,23 +214,32 @@ def main(danet_vname,
             
             li_thread_utterances = batch_li_li_thread_utterances[i]
 
-            li_utt_prevutt = [
-                [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances), _dict['txt_preproc']  ]
-                for _dict in li_thread_utterances
-            ]
+            # li_prevutt_utt = [
+            #     [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances), _dict['txt_preproc']  ]
+            #     for _dict in li_thread_utterances
+            # ] #list of prev utterance and current utterance
 
-            encoded_input =  tokenizer(li_utt_prevutt, add_special_tokens=True, padding='max_length', 
+            # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
+                #list of prev utterance
+            li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
+                            in li_thread_utterances ] 
+            li_li_uttedus = [ _dict['edus'] for _dict in li_thread_utterances ] #list of the EDUs for a given utterance
+
+            
+            encoded_input =  tokenizer(li_prevutt_utt, add_special_tokens=True, padding='max_length', 
                 truncation=True, max_length=160, return_tensors='pt', return_token_type_ids=True)
             
             pred_da = danet_module.forward(encoded_input)
+
+            
             li_li_da, li_dict_da = danet_module.format_preds(pred_da)
             
                 #sequence of vectors, vector=logit score for each da class           
             #TODO consider removing dialogues where 'reply_to'==None
 
             [
-                _dict.update({'li_da': li_da,'dict_da':dict_da }) for _dict, li_da, dict_da in 
-                zip( li_thread_utterances, li_li_da, li_dict_da)
+                _dict.update({'dict_da':dict_da }) for _dict, li_da, dict_da in 
+                zip( li_thread_utterances, li_dict_da)
             ]
 
             batch_li_li_thread_utterances[i] = li_thread_utterances
@@ -239,7 +249,6 @@ def main(danet_vname,
         #region Predicting the RST Tag
         timer.start()
         mp_count_rst = mp_count
-        #containers = li_fh_container_id*int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)
         contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
         contaier_ids = sum(contaier_ids, [])
         with mp.Pool(mp_count_rst) as pool:
@@ -249,7 +258,6 @@ def main(danet_vname,
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
         timer.end("RST")
-
         #endregion
 
         #region Topic extraction
@@ -268,6 +276,7 @@ def main(danet_vname,
                 li_thread_utterances[idx].pop('reply_to')
                 li_thread_utterances[idx].pop('id_utt')
                 li_thread_utterances[idx].pop('speaker_id')
+                li_thread_utterances[idx].pop('edus')
             
             batch_li_li_thread_utterances[i] = li_thread_utterances
         # end region

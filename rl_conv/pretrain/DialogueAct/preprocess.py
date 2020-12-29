@@ -11,6 +11,7 @@
 
 import argparse
 import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import re
 import glob
 import logging
@@ -25,6 +26,7 @@ import json
 import utils
 import time
 import numpy as np
+
 
 import torch
 import copy
@@ -105,9 +107,30 @@ def preprocess(args, str_subset):
     dir_dset = os.path.join(args.output_dir, str_subset)
     os.makedirs(dir_dset,exist_ok=True)
     
+    #list of files to process
     li_fns_mrda = _get_fns( os.path.join(dir_mrda_dset,"*") ) # [fn for fn in glob.glob(pattern) ]
     li_fns_swda = _get_fns( os.path.join(dir_swda_dset,"*") ) # [fn for fn in glob.glob(pattern) ]
     li_fns_midas= _get_fns( os.path.join(dir_midas_dset,"*"))
+
+    #list of files' codes already processed
+    li_fns_mrda_proc = _get_fns( os.path.join(dir_dset, "MRDA_*.txt" ) )
+    mrda_proc_codes = [ _fn.split('_')[-1] for _fn in li_fns_mrda_proc ]
+
+    li_fns_swda_proc = _get_fns( os.path.join(dir_dset, "SWDB-DAMSL_*.txt" ) )
+    swda_proc_codes = [ _fn.split('_')[-1] for _fn in li_fns_swda_proc ]
+
+    li_fns_midas_proc = _get_fns( os.path.join(dir_dset, "midas_*.txt" ) )
+    midas_proc_codes = [ _fn.split('_')[-1].replace('.txt',"") for _fn in li_fns_midas_proc ]
+    # getting the 
+
+
+    # removing fns from to process based on their suffix
+
+    li_fns_mrda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in mrda_proc_codes ) ]
+    li_fns_swda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in swda_proc_codes ) ]
+    li_fns_mrda = [ fn for fn in li_fns_mrda if ( os.path.split(fn)[1] not in mrda_proc_codes ) ]
+
+    #Removed fns that have already been procesed
 
     dict_da_map = json.load( open(utils.get_path("label_mapping.json"),"r") )
     
@@ -163,7 +186,7 @@ def preprocess(args, str_subset):
             # Paraphrasing (makes pphrases per file and saves them)
             response = _mk_pphrase(li_df_convs, paraphrase_counts, model, tokenizer, dir_dset, ds_name, fn )
             
-            if counter+1 % 20 == 0:
+            if counter+1 % 10 == 0:
                 print(f"\t\t Finished {counter} of {len(li_fns)}")
         
         time_elapsed =time.time() - start_time
@@ -352,22 +375,22 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
 
     return True
 
-def __get_response(model, tokenizer, li_input_text, li_num_return_sequences, temp=1.5 ):
+def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
     
     li_tgt_text = []
     for txt, num_ret_seq in zip( li_input_text, li_num_return_sequences):
         txt_len = len(txt.split(' '))
 
         if txt_len > 2:
-            max_len = int(txt_len*2)
+            #max_len = int(txt_len*2)
             
             batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=max_len, num_beams=16, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True, top_p=0.999) #no_repeat_ngram_size=2
+            translated_pp = model.generate(**batch, max_length=80, num_beams=12, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True) #no_repeat_ngram_size=2
             #parameters chosen after careful evaluation: sample=True produces more diverse and longer responses. This is better for evaluation on later reddit data which also tends to be longer. and this temperature circa 2 produces diverse responses too
                 #The mode sample=True does not use a length penalization, so in a sense is not summarization, early_stopping=True increases variation in text
             
-            translated_smrzd = model.generate(**batch, max_length=max_len, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True, top_p=0.99)
+            translated_smrzd = model.generate(**batch, max_length=80, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True)
             #choosing to make another few samples that are summarizations. This means that are model will be length invariant since da classes should have a mix or short and long representations
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
@@ -387,4 +410,12 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences, tem
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    main()
+    
+    completed= False
+    while completed == False:
+        try:
+            main()
+        except Exception as e:
+            print("\n\nRestarting Script\n\n")
+            pass
+        
