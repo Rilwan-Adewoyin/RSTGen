@@ -26,7 +26,7 @@ import json
 import utils
 import time
 import numpy as np
-
+import traceback
 
 import torch
 import copy
@@ -416,6 +416,9 @@ if __name__ == "__main__":
         try:
             main()
         except Exception as e:
+            print(e) 
+            print("\n")
+            print(traceback.print_tb())
             print("\n\nRestarting Script\n\n")
             pass
-        
+
