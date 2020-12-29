@@ -303,18 +303,19 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
 
     # Then return the list of two sentence paraphrased sentences.
     
-    li_df_pphrased = []
+    
 
     li_da_labels_to_pp = list(paraphrase_counts.keys())
     li_das_not_to_pp = ["backchannel","statement","other-forward-function","understanding","question","agreement"]
+    li_df_pphrased = []
 
     for df in li_df_conv:
+        
 
     # Check for the any row that contains they above das but does not contain "statement"
     # the lambda statment: returns true if all labels in x are in the list of das_to_pp but not in the 
     # list of das to ignore
         #1)
-        #idxs_to_pp = ( df['da'].loc[lambda _str: all( (x in li_da_labels_to_pp) or (x not in li_das_not_to_pp )  for x in _str.split(' ') )  ] ).index.tolist()
         idxs_to_pp = df[ df.apply(lambda row: all( (da != '') and ((da in li_da_labels_to_pp) or (da not in li_das_not_to_pp )) for da in row['da'].split(' ') )  , axis=1) ].index.tolist()
 
             #  removing index 0 from list if there since cant get response to 0th index 
@@ -331,9 +332,12 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
         li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist() , copies_to_make )
 
     # make a list of new dfs with the paraphrase
-        for idx,li_pp_txt,li_pp_txt_prev in zip(idxs_to_pp,li_li_pp_text,li_li_pp_text_prev):
+        for idx, li_pp_txt, li_pp_txt_prev in zip(idxs_to_pp,  li_li_pp_text, li_li_pp_text_prev):
+            if li_pp_txt==[] or li_pp_txt_prev==[]:
+                continue
+
             df_ = df.iloc[ idx-1: idx+1 ]  #Gathering the row and prev row relating the the paraphrases
-            li_pp_df_copy = [ pd.DataFrame(columns = df_.columns, data = copy.deepcopy(df_.values)) for idx in range(len(li_pp_txt))  ] # Creating copies
+            li_pp_df_copy = [ pd.DataFrame(columns = df_.columns, data = copy.deepcopy(df_.values)) for idx2 in range(len(li_pp_txt))  ] # Creating copies
             
             #inserting the the paraphrased utterances
             for df_copy, pp_text, pp_text_prev in zip( li_pp_df_copy, li_pp_txt, li_pp_txt_prev):
@@ -342,8 +346,8 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
              
         li_df_pphrased.extend(li_pp_df_copy)
 
-    for idx2, df2 in enumerate(li_df_pphrased):
-        path = os.path.join(dir_dset, f"{ds_name}_{os.path.split(fn)[-1]}_pp_{idx2:05d}.txt")
+    for idx3, df2 in enumerate(li_df_pphrased):
+        path = os.path.join(dir_dset, f"{ds_name}_{os.path.split(fn)[-1]}_pp_{idx3:05d}.txt")
         df2.to_csv( path, header=True, index=False, sep="|" )
 
     return True
@@ -353,16 +357,17 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences, tem
     li_tgt_text = []
     for txt, num_ret_seq in zip( li_input_text, li_num_return_sequences):
         txt_len = len(txt.split(' '))
+
         if txt_len > 2:
             max_len = int(txt_len*2)
             
             batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=max_len, num_beams=15, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=False, top_p=0.999) #no_repeat_ngram_size=2
+            translated_pp = model.generate(**batch, max_length=max_len, num_beams=16, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True, top_p=0.999) #no_repeat_ngram_size=2
             #parameters chosen after careful evaluation: sample=True produces more diverse and longer responses. This is better for evaluation on later reddit data which also tends to be longer. and this temperature circa 2 produces diverse responses too
                 #The mode sample=True does not use a length penalization, so in a sense is not summarization, early_stopping=True increases variation in text
             
-            translated_smrzd = model.generate(**batch, max_length=max_len, num_beams=15, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True, top_p=0.99)
+            translated_smrzd = model.generate(**batch, max_length=max_len, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True, top_p=0.99)
             #choosing to make another few samples that are summarizations. This means that are model will be length invariant since da classes should have a mix or short and long representations
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
@@ -375,7 +380,9 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences, tem
                 tgt_text = [ txt2.rstrip('.')+"?" if txt2[-1]!="?" else txt2 for txt2 in  tgt_text ]
 
             li_tgt_text.append( tgt_text )
-        
+        else:
+            li_tgt_text.append([])
+
     return li_tgt_text
 
 if __name__ == "__main__":
