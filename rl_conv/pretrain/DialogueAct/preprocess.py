@@ -332,7 +332,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     
 
     li_da_labels_to_pp = list(paraphrase_counts.keys())
-    li_das_not_to_pp = ["backchannel","statement"]#,"understanding","question","agreement"]
+    li_das_not_to_pp = [] #["backchannel","statement"]#,"understanding","question","agreement"]
     li_df_pphrased = []
 
     for df in li_df_conv:
