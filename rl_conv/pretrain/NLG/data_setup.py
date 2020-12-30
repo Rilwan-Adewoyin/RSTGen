@@ -214,7 +214,6 @@ def main(danet_vname,
         contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
         contaier_ids = sum(contaier_ids, [])
         with mp.Pool(mp_count_rst) as pool:
-
             res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst) , contaier_ids  ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
@@ -494,24 +493,22 @@ def _chunks(lst, n):
 def _tree_to_rst_code(_tree):
     """Converst RST Tree to rst code used in NLG model
 
-    Args:
-        method (int, optional): [description]. Defaults to 1.
-    
-    Return:
-        if method==0:
-            Three lists zipped together
-            List 1 Represents A Flattened version of the rst relations in the RST tree
-            List 2 the nuclearity/satellite couple type e.g. N-N or NS
-            List 3 The position in a binary tree of max depth 5
+        Args:
+            method (int, optional): [description]. Defaults to 1.
+        
+        Return:
+            if method==0:
+                Three lists zipped together
+                List 1 Represents A Flattened version of the rst relations in the RST tree
+                List 2 the nuclearity/satellite couple type e.g. N-N or NS
+                List 3 The position in a binary tree of max depth 5
 
-            #TODO: possibly figure out some way to normalize this vector
+                #TODO: possibly figure out some way to normalize this vector
     """
 
-    
     # Getting List 1 and 2
     li_rels_ns = []
-    counter = 0
-
+    
     for depth in range( _tree.height(),1,-1 ):
         
         subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
@@ -532,6 +529,15 @@ def _tree_to_rst_code(_tree):
     li_dict_rels_ns_bintreepos = [  {'rel':rels_ns[0], 'ns':rels_ns[1], 'pos': bintreepos } for rels_ns,bintreepos in zip(li_rels_ns,li_bintreepos) if bintreepos!=-1 ]
 
     return li_dict_rels_ns_bintreepos
+
+
+def _tree_to_edusstr(_tree):
+
+    li_edus = []
+    for depth in range( _tree.height(),1,-1 ):
+
+
+
 
 def _topic(li_li_thread_utterances):
     for i, _ in enumerate(li_li_thread_utterances):
