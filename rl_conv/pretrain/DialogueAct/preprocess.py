@@ -394,7 +394,7 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
    
             translated_smrzd = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=8, temperature=2.2, do_sample=True, early_stopping=True, top_p=0.999, top_k=100,repetition_penalty=1.0, length_penalty=20.0 )
 
-            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.2, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repitition_penalty=1.0 )
+            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.2, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repetition_penalty=1.0 )
             
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
