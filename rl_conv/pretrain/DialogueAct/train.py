@@ -373,7 +373,7 @@ class TrainingModule(pl.LightningModule):
     @lru_cache()
     def total_steps(self):
          
-        train_batches = len( self.train_dl() //self.gpus 
+        train_batches = len( self.train_dl() ) //self.gpus 
         
         steps = (self.max_epochs * train_batches) //self.accumulate_grad_batches
 
