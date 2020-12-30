@@ -145,12 +145,13 @@ def preprocess(args, str_subset):
     seps = {'MRDA':'|', "SWDB-DAMSL":"|", "MIDAS":"##" }
 
     paraphrase_counts = {
-                        'action-directive': 10,
-                        'reject': 6,
-                        'summarize': 12,
-                        'quotation': 12,
-                        'hedge': 10,
-                        'elaboration': 6} 
+                        'action-directive': 15,
+                        'reject': 12,
+                        'summarize': 18,
+                        'quotation': 18,
+                        'hedge': 18,
+                        'elaboration': 9,
+                        'other-forward-function':9}  
                         #NOTE: have to be even numbers, half half split for summarization and paraphrasing
     
     # Getting paraphraser
@@ -331,7 +332,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     
 
     li_da_labels_to_pp = list(paraphrase_counts.keys())
-    li_das_not_to_pp = ["backchannel","statement","other-forward-function","understanding","question","agreement"]
+    li_das_not_to_pp = ["backchannel","statement"]#,"understanding","question","agreement"]
     li_df_pphrased = []
 
     for df in li_df_conv:
@@ -341,7 +342,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     # the lambda statment: returns true if all labels in x are in the list of das_to_pp but not in the 
     # list of das to ignore
         #1)
-        idxs_to_pp = df[ df.apply(lambda row: all( (da != '') and ((da in li_da_labels_to_pp) or (da not in li_das_not_to_pp )) for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
+        idxs_to_pp = df[ df.apply(lambda row: all( (da != '') and ((da in li_da_labels_to_pp) and (da not in li_das_not_to_pp )) for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
 
             #  removing index 0 from list if there since cant get response to 0th index 
         idxs_to_pp = [idx for idx in idxs_to_pp if idx != 0]
@@ -384,21 +385,23 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
     for txt, num_ret_seq in zip( li_input_text, li_num_return_sequences):
         txt_len = len(txt.split(' '))
 
-        if txt_len > 2:
+        if txt_len > 3:
             #max_len = int(txt_len*2)
             
             batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=60, num_beams=12, num_return_sequences=num_ret_seq//2, temperature=2.1, do_sample=True, early_stopping=True) #no_repeat_ngram_size=2
-            #parameters chosen after careful evaluation: sample=True produces more diverse and longer responses. This is better for evaluation on later reddit data which also tends to be longer. and this temperature circa 2 produces diverse responses too
-                #The mode sample=True does not use a length penalization, so in a sense is not summarization, early_stopping=True increases variation in text
+            translated_pp = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=True, early_stopping=True,top_k=75, repetition_penalty=1.0,  ) #no_repeat_ngram_size=2
+   
+            translated_smrzd = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=8, temperature=2.2, do_sample=True, early_stopping=True, top_p=0.999, top_k=100,repetition_penalty=1.0, length_penalty=20.0 )
+
+            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.2, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repitition_penalty=1.0 )
             
-            translated_smrzd = model.generate(**batch, max_length=60, num_beams=8, num_return_sequences=num_ret_seq//2, do_sample=False,early_stopping=True)
-            #choosing to make another few samples that are summarizations. This means that are model will be length invariant since da classes should have a mix or short and long representations
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
             tgt_text_smrzd = tokenizer.batch_decode( translated_smrzd, skip_special_tokens=True )
-            tgt_text = list(set(tgt_text_pp + tgt_text_smrzd))
+            tgt_text_long = tokenizer.batch_decode( translated_long, skip_special_tokens=True)
+
+            tgt_text = list(set(tgt_text_pp + tgt_text_smrzd + translated_long))
             
             #Adding question mark on the end if it was removed.
             ends_in_qmark = txt[-1] == "?"
@@ -419,6 +422,7 @@ if __name__ == "__main__":
         try:
             gc.collect()
             main()
+            completed= True
         except Exception as e:
             print(e) 
             print("\n")
