@@ -341,7 +341,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     # the lambda statment: returns true if all labels in x are in the list of das_to_pp but not in the 
     # list of das to ignore
         #1)
-        idxs_to_pp = df[ df.apply(lambda row: row['da']!=None and all( (da != '') and ((da in li_da_labels_to_pp) or (da not in li_das_not_to_pp )) for da in row['da'].split(' ')  )  , axis=1) ].index.tolist()
+        idxs_to_pp = df[ df.apply(lambda row: all( row['da']!=None and all( (da != '') and ((da in li_da_labels_to_pp) or (da not in li_das_not_to_pp )) for da in row['da'].split(' ')  ) ) , axis=1) ].index.tolist()
 
             #  removing index 0 from list if there since cant get response to 0th index 
         idxs_to_pp = [idx for idx in idxs_to_pp if idx != 0]
