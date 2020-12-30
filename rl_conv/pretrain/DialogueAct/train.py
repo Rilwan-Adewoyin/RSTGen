@@ -467,7 +467,8 @@ class DataLoaderGenerator():
         elif self.cache == "ram":
             concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
             concat_dset = concat_dset.cache()
-        else self.cache == "none":
+        
+        elif self.cache == "none":
             concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
