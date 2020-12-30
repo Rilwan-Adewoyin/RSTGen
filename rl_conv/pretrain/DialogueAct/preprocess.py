@@ -401,7 +401,7 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
             tgt_text_smrzd = tokenizer.batch_decode( translated_smrzd, skip_special_tokens=True )
             tgt_text_long = tokenizer.batch_decode( translated_long, skip_special_tokens=True)
 
-            tgt_text = list(set(tgt_text_pp + tgt_text_smrzd + translated_long))
+            tgt_text = list(set(tgt_text_pp + tgt_text_smrzd + tgt_text_long))
             
             #Adding question mark on the end if it was removed.
             ends_in_qmark = txt[-1] == "?"
