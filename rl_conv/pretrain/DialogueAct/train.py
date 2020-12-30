@@ -27,6 +27,7 @@ from torch.utils.data._utils.collate import default_convert, default_collate
 
 from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
+import transformers
 
 import pytorch_lightning as pl
 
@@ -163,11 +164,12 @@ class TrainingModule(pl.LightningModule):
                     max_epochs=100,
                     gpus=1, 
                     context_history_len=1,
-                    learning_rate=1e-3,
+                    learning_rate=8e-4,
                     warmup_proportion=0.10,
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
+                    cache = 'ram',
                     *args,
                     **kwargs):
         super().__init__()
@@ -184,6 +186,8 @@ class TrainingModule(pl.LightningModule):
         self.model = model
         self.mode = mode
         self.workers = workers
+        self.cache = cache
+
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
                 
@@ -224,13 +228,14 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=20, type=int)
-        parser.add_argument('--learning_rate', default=1e-3, type=float)
+        parser.add_argument('--learning_rate', default=8e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.15)
         parser.add_argument('--workers', default=6, type=int)
         parser.add_argument('--gpus', default=0, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
         parser.add_argument('--version_name', default='', required=False)
         parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
+        parser.add_argument('--cache',default="ram","required"=False, choices = ['local','ram',"none"])
         #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
         tparams = parser.parse_known_args()[0]
@@ -351,7 +356,7 @@ class TrainingModule(pl.LightningModule):
         
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
             dir_test_set, self.batch_size, self.model.tokenizer, 
-            workers=self.workers, mode=self.mode
+            workers=self.workers, mode=self.mode, cache=self.cache
             )
         
         self.train_dl, self.val_dl, self.test_dl = dg()
@@ -367,14 +372,16 @@ class TrainingModule(pl.LightningModule):
 
     @lru_cache()
     def total_steps(self):
+         
+        steps = ( len( self.train_dl() )//self.gpus * self.max_epochs) // self.accumulate_grad_batches )
         
-        ds_size = self.train_dl.dataset.__len__()
-        steps = (ds_size * self.max_epochs) // (self.batch_size*self.accumulate_grad_batches )
+        steps = (self.max_epochs * train_batches) //self.accumulate_grad_batches
 
         return steps
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+        #optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+        optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
         
         total_steps = self.total_steps()
         warmup_steps = int( self.total_steps() * self.warmup_proportion )
@@ -406,6 +413,7 @@ class DataLoaderGenerator():
                     tokenizer, 
                     context_history_len=1,
                     workers=0, mode='train_new',
+                    cache="memory",
                     **kwargs):
 
         self.dir_train_set = dir_train_set
@@ -422,6 +430,7 @@ class DataLoaderGenerator():
         self.context_history_len = context_history_len
         self.workers  = workers
         self.mode = mode
+        self.cache = cache
 
     def prepare_datasets(self):
         """prepares a train, validation and test set
@@ -448,13 +457,19 @@ class DataLoaderGenerator():
         li_dsets = [ SingleDataset(_f, self.tokenizer, self.target_binarizer, 
             self.context_history_len) for _f in files ]
 
-        concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
         
-        _dir = f"./cache"
-        os.makedirs(os.path.abspath(_dir),exist_ok=True)
+        
+        if self.cache == "local":
+            _dir = f"./cache"
+            concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+            os.makedirs(os.path.abspath(_dir),exist_ok=True)
+            concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
+        elif self.cache == "ram":
+            concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+            concat_dset = concat_dset.cache()
+        else self.cache == "none":
+            concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
-        concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
-        #concat_dset = concat_dset.cache()
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
         
@@ -614,9 +629,6 @@ def main(tparams, mparams):
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
         #trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
         
-
-
-
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     

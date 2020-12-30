@@ -511,6 +511,7 @@ def _tree_to_rst_code(_tree):
     
     for depth in range( _tree.height(),1,-1 ):
         
+        # sublist of rst relation and nuclearity tag
         subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
         subli_rels_ns = [ [_li[0],''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
 
@@ -533,8 +534,11 @@ def _tree_to_rst_code(_tree):
 
 def _tree_to_edusstr(_tree):
 
-    li_edus = []
+    li_edusstr = []
     for depth in range( _tree.height(),1,-1 ):
+        subli_edu_str = 
+
+        li_edustr.extend( sub_li )
 
 
 

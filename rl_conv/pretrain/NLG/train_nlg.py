@@ -904,8 +904,8 @@ class TrainingModule(pl.LightningModule):
     @lru_cache()
     def total_steps(self):
 
-        ds_size = self.train_dl.dataset.__len__()
-        steps = (ds_size * self.max_epochs) // (self.batch_size*self.accumulate_grad_batches)
+        ds_size = self.train_dl.__len__() // self.gpus
+        steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
         return steps
 
     def configure_optimizers(self):
