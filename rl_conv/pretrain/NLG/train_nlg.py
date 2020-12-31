@@ -955,7 +955,7 @@ class DataLoaderGenerator():
         self.dir_data = dir_data
         self.tokenizer = tokenizer
         self.splits = splits
-        label_mapping = json.load(open(utils.get_path("../DialogueAct/label_mapping.json"),"r"))     
+        #label_mapping = json.load(open(utils.get_path("../DialogueAct/label_mapping.json"),"r"))     
 
         self.bs = batch_size
         self.workers  = workers
@@ -1112,7 +1112,8 @@ class SingleIterDataset(torch.utils.data.IterableDataset):
         self.line_start = line_start
         self.line_end = line_end
 
-        skiprows = self.linestart if self.line_start!=0 else None
+        skiprows = self.line_start if self.line_start!=0 else None
+
         with open(self.fp, 'r') as f:
             self.data = pd.read_csv(file_path, sep=',', header=0, skiprows=skiprows, nrows=(self.line_end-self.line_start) )
                     
@@ -1153,7 +1154,7 @@ class SingleIterDataset(torch.utils.data.IterableDataset):
             #( da_start_token, tnsr_das, tnsr_da_pos, rst_start_token, tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos,
                 #topics_start_token, tnsr_topics_phrase, tnsr_topics_score, bos_token, tknzd_utt ,padding_token, padding_count)      
         
-        map_datum = {**encoded_input, 'tknzed_utt': tknzed_target }
+        map_datum = {**encoded_input }
         
         return map_datum
 

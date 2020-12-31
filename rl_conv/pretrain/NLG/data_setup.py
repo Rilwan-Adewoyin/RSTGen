@@ -62,6 +62,7 @@ pattern_repdot = re.compile(r'[\.]{2,}')
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
 pattern_multwspace = re.compile(r'[\s]{2,}')
 pattern_emojis = re.compile(":[\S]{2,}:")
+pattern_amp = re.compile("&(amp)?"
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
 
@@ -358,6 +359,11 @@ def _preprocess(text):
 
     # remove multiple spaces
     text = re.sub(pattern_multwspace, ' ', text)
+
+    # swapping &amp for and
+    )
+    text = re.sub( pattern_amp, 'and', text )
+
 
     return text
 
