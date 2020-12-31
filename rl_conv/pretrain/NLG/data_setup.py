@@ -30,6 +30,7 @@ import json
 import pytextrank
 import spacy
 import en_core_web_sm
+sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
     #install using python -m spacy download en_core_web_sm
 nlp = en_core_web_sm.load()
 tr = pytextrank.TextRank()
@@ -59,7 +60,8 @@ pattern_hlinks2 =  re.compile("([\(]?(https|www|ftp|http){1}[\S]+)")
 pattern_repword = re.compile(r'\b([\S]+)(\s+\1)+\b')
 pattern_repdot = re.compile(r'[\.]{2,}')
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
-pattern_multwspace = r'[\s]{2,}'
+pattern_multwspace = re.compile(r'[\s]{2,}')
+pattern_emojis = re.compile(":[\S]{2,}:")
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
 
@@ -235,12 +237,11 @@ def main(danet_vname,
 
             li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
                             in li_thread_utterances ] 
-            li_li_uttedu = [ _dict['edus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
+            li_li_uttdu = [ _dict['dus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
 
-            
             li_dict_da = []
             li_li_da = []
-            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttedu):
+            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttdu):
                 #this prev_utt is added as context  to all the edus for a given long utterance
                 li_input = [ [prev_utt, curr_utt ] ]
 
@@ -329,7 +330,7 @@ def _preprocess(text):
     # remove general hyperlinks
     text = re.sub(pattern_hlinks2,"", text)
 
-    # replace emojis
+    # convert emojis to text and remove
     text = emoji.demojize( text )
         #TODO: need to remember to include emoji.emojize in the NLG decoding pipeline
         #TODO: "I'm sorry if that's how your interactions with friends go :sad_but_relieved_face:\n\nBut
@@ -341,7 +342,8 @@ def _preprocess(text):
                 #  not how any of my whatsapps with my friends happened. [SEP]"
 
                 #so need to have regex code to compress words between two colons (with underscores)
-        
+    text = re.sub(pattern_emojis,"",text)
+
     # remove repeated words
     text = re.sub(pattern_repword, r'\1', text)
 
@@ -469,15 +471,16 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
             li_subtrees.append(_)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
-        #TODO: ENTER CODE TO RETREIVE edus for a given utterance
-        li_rst_edus = [ _tree_to_edu_str(_tree) if _tree != None else None for _tree in li_subtrees  ]
+        
+        # A list of strings
+        li_dus = [ _tree_to_li_du(_tree) if _tree != None else None for _tree in li_subtrees ]
 
         # Keeping non erroneous utterances within a conversation - bad trees were assigned None
         assert len(li_rst_dict) == len(li_thread_utterances)
         new_li_thread_utterance = []
         for idx in range(len(li_rst_dict)):
             if li_rst_dict[idx]!=None:
-                li_thread_utterances[idx].update( {'rst':li_rst_dict[idx], 'edus':li_rst_edus[idx] } )
+                li_thread_utterances[idx].update( {'rst':li_rst_dict[idx], 'dus':li_dus[idx] } )
                 new_li_thread_utterance.append(li_thread_utterances[idx] )
             else:
                 pass
@@ -531,17 +534,50 @@ def _tree_to_rst_code(_tree):
 
     return li_dict_rels_ns_bintreepos
 
+def _tree_to_li_du(_tree, li_results=None):
+    ### Takes an RST encoded tree and extracts mutually exclusive discourse units
+        # that cover the whole span of the tree. This method uses recursive operations 
+        # and updates an th li_results object inplace
+    """ If li_results in passed as a list then the list is edited in place, otherwise leave as none"""
 
-def _tree_to_edusstr(_tree):
+    direct_childs = len(_tree)
 
-    li_edusstr = []
-    for depth in range( _tree.height(),1,-1 ):
-        subli_edu_str = 
+    li_sub_tree = [ _tree[idx] for idx in range(direct_childs) ]
 
-        li_edustr.extend( sub_li )
+    li_du_str = [ __parse_leaves(sub_tree.leaves()) for sub_tree in li_sub_tree ]
+
+    if(li_results == None):
+        li_results = []
+    
+    #if tree has two subnodes
+    for idx in range(direct_childs):
+        li_segmented_utt = sent_detector.tokenize(li_du_str[idx])
+
+        #If over two sentences long then perform the method again
+        if len(li_segmented_utt) <= 2:            
+            li_results.append(li_du_str[idx])
+            
+        elif len(li_segmented_utt) > 2 :
+            _tree_to_li_du(li_sub_tree[idx], li_results ) 
+    
+    return li_results
 
 
+def __parse_leaves(tree_leaves: list ):
+    """tree_leaves is list of subsections of an annotated discourse unit
+    example ['_!Three','new', 'issues', 'begin', 'trading', 'on', 'the',
+    'New', 'York', 'Stock', 'Exchange', 'today', ',!_', '_!and', 'one',
+    'began', 'trading', 'on', 'the', 'Nasdaq/National', 'Market', 'System',
+    'last', 'week', '.', '<P>!_'
+        ex:  """
+    #removing tree labels
+    _str = re.sub('(_\!|<P>|\!_|<s>)',"",' '.join(tree_leaves) )
+    # removing whitespace preceeding a punctuation
+    _str2 = re.sub('(\s){1,2}([,.!?\\-])',r'\2',_str )
 
+    _str3 = re.sub('  ',' ',_str2).strip()
+
+    return _str3
 
 def _topic(li_li_thread_utterances):
     for i, _ in enumerate(li_li_thread_utterances):
@@ -559,27 +595,26 @@ def _topic(li_li_thread_utterances):
         li_li_thread_utterances[i] = li_thread_utterances
     return li_li_thread_utterances
 
-def _rake_kw_extractor(str_utterance, topk=3):
+def _rake_kw_extractor(str_utterance, lowest_score=0.0):
     
     r1.extract_keywords_from_text(str_utterance)
     
     li_ranked_kws = r1.get_ranked_phrases_with_scores()
     
-    li_ranked_kws = li_ranked_kws[:topk]
-
-    li_ranked_kws = [ [ x[1], x[0] ] for x in li_ranked_kws ]
+    li_ranked_kws = [ [ x[1], x[0] ] for x in li_ranked_kws if x[0]>lowest_score ]
 
     return li_ranked_kws
 
-def _textrank_extractor(str_utterance,topk=3):
+def _textrank_extractor(str_utterance, lowest_score=0.0):
     # Add the below to docker file
     # os.system(') install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.1.0/en_core_web_sm-2.1.0.tar.gz')
     # os.system python -m spacy download en_core_web_sm
     # pytextrank using entity linking when deciding important phrases, for entity coreferencing
 
     doc = nlp(str_utterance)
-    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases ]
-    return li_ranked_kws[:topk]
+    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases if p.rank>lowest_score ]
+
+    return li_ranked_kws
         
 def _save_data(li_utterances, batch_save_size, dir_save_dataset):
     

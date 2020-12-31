@@ -196,7 +196,10 @@ class TrainingModule(pl.LightningModule):
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-            self.loss = nn.BCEWithLogitsLoss()
+            self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor([0.23957213924125886, 0.3381199031196672,0.5524659431430475,
+                        0.9963823048508232, 0.5307289471957359, 0.9082296604728215,
+                        0.5224808686855128, 1.5285742100318103, 2.786196235053967,
+                        0.7146542845340822, 1.0425275276577068, 1.8400679760135654]) )
             self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
             self.learning_rate = learning_rate
@@ -472,7 +475,8 @@ class DataLoaderGenerator():
             concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
-            shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
+            shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
+            prefetch_factor= self.bs//self.workers )
         
         return dataloader
 
