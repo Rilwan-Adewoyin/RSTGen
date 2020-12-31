@@ -196,10 +196,11 @@ class TrainingModule(pl.LightningModule):
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-            self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor([0.23957213924125886, 0.3381199031196672,0.5524659431430475,
-                        0.9963823048508232, 0.5307289471957359, 0.9082296604728215,
-                        0.5224808686855128, 1.5285742100318103, 2.786196235053967,
-                        0.7146542845340822, 1.0425275276577068, 1.8400679760135654]) )
+            self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor(
+                        [0.13531564604072643, 0.21422027968035948, 0.4122622939956707,
+                            0.9050396558843776, 0.3907778763587857, 0.7998843046911028,
+                            0.38270146487021667, 1.6013329426939653, 3.565456992178743,
+                            0.5810688617892928, 0.9613531989765262, 2.050586482840234]))
             self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
             self.learning_rate = learning_rate
@@ -416,7 +417,7 @@ class DataLoaderGenerator():
                     tokenizer, 
                     context_history_len=1,
                     workers=0, mode='train_new',
-                    cache="memory",
+                    cache="ram",
                     **kwargs):
 
         self.dir_train_set = dir_train_set
