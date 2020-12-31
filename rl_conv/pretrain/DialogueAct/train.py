@@ -476,7 +476,7 @@ class DataLoaderGenerator():
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
-            prefetch_factor= self.bs//self.workers )
+            prefetch_factor= int(4* self.bs//self.workers) )
         
         return dataloader
 
