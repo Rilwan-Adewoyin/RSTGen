@@ -398,7 +398,7 @@ def question_punctuation(utt):
     """Add question punctuation"""
     li_question_starters = ['What', "Wat" ,"Why","Where","How","Who","When","What","Which","Is","Did","Does","Are","Can",'Have',"Would"]
     if utt.split(' ')[0].capitalize() in li_question_starters:
-        if utt[-1] in [".","!"]:
+        if utt[-1] in [".","!","?"]:
             utt = utt[:-1]
         utt = utt + "?"
 
@@ -830,4 +830,4 @@ if __name__ == '__main__':
 
     #last bacth = 105
 #python3 -bps 20 --mp_count 16 --danet_name DaNet_v008
-#python3 -bps 120 --mp_count 16 --danet_vname DaNet_v009
+#CUDA_VISIBLE_DEVICES=0 python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v009
