@@ -621,7 +621,7 @@ def main(tparams, mparams):
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
         
-        trainer = pl.Trainer.from_argparse_args(tparams,  progress_bar_refresh_rate=self.tparams.accumulate_grad_batches,
+        trainer = pl.Trainer.from_argparse_args(tparams,  progress_bar_refresh_rate=tparams.accumulate_grad_batches,
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
@@ -637,7 +637,7 @@ def main(tparams, mparams):
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
 
-        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=self.tparams.accumulate_grad_batches,
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=tparams.accumulate_grad_batches,
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
