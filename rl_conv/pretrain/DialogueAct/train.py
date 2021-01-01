@@ -269,7 +269,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=20, type=int)
-        parser.add_argument('--learning_rate', default=8e-4, type=float)
+        parser.add_argument('--learning_rate', default=1e-3, type=float)
         parser.add_argument('-wp','--warmup_proportion', default=0.05, type=float)
         parser.add_argument('--workers', default=6, type=int)
         parser.add_argument('--gpus', default=1, type=int)
@@ -611,7 +611,7 @@ def main(tparams, mparams):
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
         min_delta=0.00,
-        patience=8,
+        patience=10,
         verbose=False,
         mode='auto'
 
@@ -621,7 +621,7 @@ def main(tparams, mparams):
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
         
-        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
+        trainer = pl.Trainer.from_argparse_args(tparams,  progress_bar_refresh_rate=self.tparams.accumulate_grad_batches,
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
@@ -629,7 +629,7 @@ def main(tparams, mparams):
                         #overfit_batches=5
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
-                        )
+                        ) 
         
     # Making training module
     elif tparams.mode in ["test","train_cont"]:
@@ -637,7 +637,7 @@ def main(tparams, mparams):
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
 
-        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=100,
+        trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=self.tparams.accumulate_grad_batches,
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
