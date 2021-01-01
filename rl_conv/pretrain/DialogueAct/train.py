@@ -44,6 +44,7 @@ import gc
 from pytorch_lightning import loggers as pl_loggers
 
 from collections import OrderedDict
+import spacy
 
 
 #from pytorch_lightning.loggers import TensorBoardLogger
@@ -75,6 +76,10 @@ class DaNet(nn.Module):
         self.tokenizer = dict_transformertokenizer['tokenizer']
         self.freeze_transformer = freeze_transformer
         self.dropout = dropout
+
+        # Create Entity masker
+        self.nem = NamedEntityMasker()
+
         # Freeze the Transformer model
         if self.freeze_transformer:
             for param in self.transformer.parameters():
@@ -161,6 +166,32 @@ class DaNet(nn.Module):
         params['dropout'] = self.dropout
         return params
 
+class NamedEntityMasker():
+
+    def __init__(self,
+                 batch_size=2,
+                 n_proc=1):
+
+        
+        self.batch_size = batch_size
+        self.n_proc = n_proc
+        self.nlp = spacy.load('en_core_web_sm',disable=["parser"])
+        self.nlp.add_pipe(self.mask_pipe, name="Entity_mask", last=True)
+        
+    def __call__(self,li_txt):
+        return self.pipeline(li_txt)
+        
+    def pipeline(self,li_txt):
+        return self.nlp.pipe(li_txt, as_tuples=False, batch_size = self.batch_size)
+
+    def mask_pipe(self, document):
+        text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in document])
+        
+        return text
+
+
+
+
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model=DaNet(), batch_size=20, 
@@ -234,7 +265,7 @@ class TrainingModule(pl.LightningModule):
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         #parser.add_argument('--gpus', default=None)
-        parser.add_argument('--max_epochs', default=100, type=int)
+        parser.add_argument('--max_epochs', default=80, type=int)
         parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=20, type=int)
@@ -311,6 +342,8 @@ class TrainingModule(pl.LightningModule):
             to a list of OrderedDictionaries where
             each dict contains the DA names and probabilities 
 
+            #done not operateon batches of predictions
+
 
         Args:
             preds ([type]): [description]
@@ -321,12 +354,11 @@ class TrainingModule(pl.LightningModule):
         if logits == True:
             preds = torch.sigmoid(preds)
         
-        li_li_da = preds.tolist()
+        li_da = preds.tolist()
 
-        li_dict_da = [ OrderedDict( zip(self.ordered_label_list, pred_da) )
-                            for pred_da in li_li_da ]
+        li_dict_da = [ OrderedDict( zip(self.ordered_label_list, da) ) for da in li_da ]
 
-        return li_li_da, li_dict_da
+        return li_da, li_dict_da
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch,"train")
@@ -365,7 +397,7 @@ class TrainingModule(pl.LightningModule):
         dir_test_set = os.path.join(self.dir_data,"test") 
         
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
-            dir_test_set, self.batch_size, self.model.tokenizer, 
+            dir_test_set, self.batch_size, self.model.tokenizer, self.model.nem,
             workers=self.workers, mode=self.mode, cache=self.cache
             )
         
@@ -420,7 +452,7 @@ class DataLoaderGenerator():
     """
     def __init__(self, dir_train_set, dir_val_set,
                     dir_test_set, batch_size,
-                    tokenizer, 
+                    tokenizer, nem,
                     context_history_len=1,
                     workers=0, mode='train_new',
                     cache="ram",
@@ -431,6 +463,7 @@ class DataLoaderGenerator():
         self.dir_test_set = dir_test_set
 
         self.tokenizer = tokenizer
+        self.nem = nem
         label_mapping = json.load(open(utils.get_path("./label_mapping.json"),"r"))     
         self.target_binarizer = sklp.MultiLabelBinarizer()
         self.target_binarizer.fit( [label_mapping['MCONV']['labels_list'] ] )
@@ -464,10 +497,8 @@ class DataLoaderGenerator():
         """
         files = glob.glob( os.path.join(dir_dset,"*") )
         random.shuffle(files)
-        li_dsets = [ SingleDataset(_f, self.tokenizer, self.target_binarizer, 
+        li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
             self.context_history_len) for _f in files ]
-
-        
         
         if self.cache == "local":
             _dir = f"./cache"
@@ -497,30 +528,40 @@ class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
-    def __init__(self, file_path, tokenizer, target_binarizer, context_history_len  ):
+    def __init__(self, file_path, tokenizer, named_entity_masker ,target_binarizer, context_history_len  ):
         self.fp = file_path
         self.tokenizer = tokenizer
+        self.nem = named_entity_masker
         self.target_binarizer = target_binarizer
         self.context_history_len = context_history_len
 
     #def parse_file(self, file_path):
         with open(self.fp, 'r') as f:
             self.data = pd.read_csv(file_path, sep='|', header=0)
-                    
+            self.lines = len(self.data)
+            self.data = self.data.T.values.tolist()
+            li_speakers, self.li_utterances, self.li_das = self.data
+            #self.li_utterances = list(self.nem(self.li_utterances))
+                
     def __len__(self):
-        return len(self.data) - self.context_history_len
+        return self.lines - self.context_history_len
     
     def __getitem__(self, index):
-        datum = self.data[index:index+1+self.context_history_len]
-        speaker, utterances, da = datum.T.values
+        #datum = self.data[index:index+1+self.context_history_len]
         
-        encoded_input = self.encode_tokenize( utterances.tolist() )
+        #speaker, utterances, da = self.data[ index:index+1+self.context_history_len, : ]
+        
+        utterances = self.li_utterances[ index:index+1+self.context_history_len ]
+        das = self.li_das[ index+self.context_history_len ]
+
+        masked_utterances = list(self.nem(utterances))
+        encoded_input = self.encode_tokenize( masked_utterances )
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                binarized_target = self.target_binarizer.transform( [ da[-1].split(" ") ] )
+                binarized_target = self.target_binarizer.transform( [ das.split(" ") ] )
         except AttributeError as e:
-            binarized_target = np.zeros((1,12))
+           binarized_target = np.zeros((1,12))
 
 
         map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
