@@ -9,7 +9,7 @@ sys.path.append( os.path.join( os.path.dirname(sys.path[0]),"DialogueAct" ) )
 import numpy
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+from itertools import groupby
 import convokit
 from convokit import Corpus, download
 import argparse
@@ -62,7 +62,7 @@ pattern_repdot = re.compile(r'[\.]{2,}')
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
 pattern_multwspace = re.compile(r'[\s]{2,}')
 pattern_emojis = re.compile(":[\S]{2,}:")
-pattern_amp = re.compile("&(amp)?"
+pattern_amp = re.compile("&(amp)?")
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
 
@@ -205,12 +205,17 @@ def main(danet_vname,
             li_thread_utterances  = [
                 _dict for _dict in li_thread_utterances
                 if _valid_utterance(_dict['txt_preproc']) ]
+            
+            # Removing the reply_to (id) for utterances which had their reply removed in previous step
+            for _dict in li_thread_utterances:
+                #Checks if there is any reply message specified
+                if _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) == '' :
+                    _dict['reply_to'] = None
 
             batch_li_li_thread_utterances.append(li_thread_utterances)
         timer.end("preprocessing")
         #endregion
         
-
         #region Predicting the RST Tag
         timer.start()
         mp_count_rst = mp_count
@@ -224,7 +229,6 @@ def main(danet_vname,
         timer.end("RST")
         #endregion
 
-
         #region DA assignment
         timer.start()
         for i, _ in enumerate(batch_li_li_thread_utterances):
@@ -236,23 +240,36 @@ def main(danet_vname,
             li_currutt =  [ _dict['txt_preproc'] for _dict
                             in li_thread_utterances ] 
 
-            li_prevutt = [ _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) for _dict
+            li_prevutt = [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances) for _dict
                             in li_thread_utterances ] 
             li_li_uttdu = [ _dict['dus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
 
             li_dict_da = []
             li_li_da = []
             for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttdu):
-                #this prev_utt is added as context  to all the edus for a given long utterance
-                li_input = [ [prev_utt, curr_utt ] ]
-
-                # If more than 2 EDUs we evaluate each EDU and the complete utterance
-                if len(li_uttedu) >= 3:
-                    li_input.extend( [ [ prev_utt, uttedu] for uttedu in li_uttedu  ] )
-
-                    encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
-                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
                 
+                #skipping preds for items with no prev_utteance
+                if prev_utt == '':
+                    li_da = None
+                    dict_da = None
+
+                else:
+                    #this prev_utt is added as context  to all the edus for a given long utterance
+                    if len(li_uttedu) < 2:
+                        li_input = [ [prev_utt, curr_utt ] ]
+                        
+                    # If more than 2 EDUs we evaluate each EDU and the complete utterance
+                    elif len(li_uttedu) >= 2:
+                        li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
+
+                    if len(li_uttedu) == 1 :
+                        encoded_input =  tokenizer(*li_input[0], add_special_tokens=True, padding='max_length', 
+                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                    else:
+                        encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                    
+
                     pred_da = danet_module.forward(encoded_input)
                     pred_da = torch.sigmoid( pred_da )
 
@@ -261,21 +278,28 @@ def main(danet_vname,
                     max_values, _ = torch.max(pred_da,axis=0)
                     pred_da = torch.where(max_values>=0.5, max_values, torch.mean( pred_da, axis=0) )
 
-                    li_da, dict_da = danet_module.format_preds(pred_da)
-                    li_li_da.append(li_li_da)
-                    li_dict_da.append(dict_da)
+                    # Formatting predictions to atain a list and a dictionary of da scores
+                    res = danet_module.format_preds( torch.unsqueeze(pred_da,axis=0), logits=False)
+                    li_da = res[0][0]
+                    dict_da = res[1][0]
+                            
+                li_li_da.append(li_da)
+                li_dict_da.append(dict_da)
             
                 #sequence of vectors, vector=logit score for each da class           
-            #TODO consider removing dialogues where 'reply_to'==None
-
             [
-                _dict.update({'dict_da':dict_da }) for _dict, li_da, dict_da in 
-                zip( li_thread_utterances, li_dict_da)
+                _dict.update({'li_da':li_da }) for _dict, li_da in 
+                zip( li_thread_utterances, li_li_da)
             ]
+
+            # Removing the utterances where the reply_to is none, they were needed for DA prediction of the next utterance but should not be used as they have no context
+            li_thread_utterances = [ _dict for _dict in li_thread_utterances if _dict['reply_to'] != None]
 
             batch_li_li_thread_utterances[i] = li_thread_utterances
         timer.end("DA")   
         #endregion
+
+        
 
         #region Topic extraction
         timer.start()
@@ -293,7 +317,7 @@ def main(danet_vname,
                 li_thread_utterances[idx].pop('reply_to')
                 li_thread_utterances[idx].pop('id_utt')
                 li_thread_utterances[idx].pop('speaker_id')
-                li_thread_utterances[idx].pop('edus')
+                li_thread_utterances[idx].pop('dus')
             
             batch_li_li_thread_utterances[i] = li_thread_utterances
         # end region
@@ -361,12 +385,24 @@ def _preprocess(text):
     text = re.sub(pattern_multwspace, ' ', text)
 
     # swapping &amp for and
-    )
     text = re.sub( pattern_amp, 'and', text )
 
+    # Possible ading questions marks to subsentences that start with a question word
+    li_segmented_txt = sent_detector.tokenize(text)
+    li_format_txt = [ question_punctuation(subtxt) for subtxt in li_segmented_txt]
+    text_new = ' '.join(li_format_txt)
 
-    return text
+    return text_new
 
+def question_punctuation(utt):
+    """Add question punctuation"""
+    li_question_starters = ['What', "Wat" ,"Why","Where","How","Who","When","What","Which","Is","Did","Does","Are","Can",'Have',"Would"]
+    if utt.split(' ')[0].capitalize() in li_question_starters:
+        if utt[-1] in [".","!"]:
+            utt = utt[:-1]
+        utt = utt + "?"
+
+    return utt
 
 def _valid_utterance(txt):
 
@@ -378,7 +414,7 @@ def _valid_utterance(txt):
 
     # post_not_deleted = txt!="[deleted]"
 
-    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]" and txt!="removed"
+    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]" and txt!="removed" and txt!="deleted"
 
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
@@ -388,8 +424,7 @@ def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
          if _dict['id_utt'] == reply_to_id )
     except StopIteration as e:
         prev_utterance = ''
-   
-
+    
     return prev_utterance
 
 def _rst(li_li_thread_utterances, fh_container_id ):
@@ -544,46 +579,73 @@ def _tree_to_li_du(_tree, li_results=None):
     ### Takes an RST encoded tree and extracts mutually exclusive discourse units
         # that cover the whole span of the tree. This method uses recursive operations 
         # and updates an th li_results object inplace
-    """ If li_results in passed as a list then the list is edited in place, otherwise leave as none"""
 
     direct_childs = len(_tree)
+    li_child = [ _tree[idx] for idx in range(direct_childs) ]
 
-    li_sub_tree = [ _tree[idx] for idx in range(direct_childs) ]
+    # Formatting children that arent trees, but are one word, by Combining consecutive one word children into an utterance
+    groups = []
+    keys = []
+    for k, g in groupby(li_child, type):  #grouping by type= str and nltk.tree.Tree
+        groups.append(list(g))      # Store group iterator as a list
+        keys.append(k)
 
-    li_du_str = [ __parse_leaves(sub_tree.leaves()) for sub_tree in li_sub_tree ]
-
+    _ = [ [' '.join(group)] if key==str else group for group,key in zip(groups,keys) ] #concatenating the string groups
+    li_child = sum( _, [] )
+    direct_childs = len(li_child)
+    
+    # Parsing children to strings
+    li_du_str = [ __parse_leaves(child.leaves()) if type(child)==nltk.tree.Tree else __parse_leaves(child) for child in li_child ]
+    
     if(li_results == None):
         li_results = []
     
     #if tree has two subnodes
     for idx in range(direct_childs):
+        
+        # If child was a string always add to list since it cant be broken down furhter
+        if type(li_child[idx]) == str:
+            li_results.append(li_du_str[idx])
+            continue
+
+        # otherwise segment to sentence
         li_segmented_utt = sent_detector.tokenize(li_du_str[idx])
+        # except  Exception as e:
+        #     print(type(li_du_str[idx]))
+        #     print(li_child)
+        #     raise Exception
 
         #If over two sentences long then perform the method again
         if len(li_segmented_utt) <= 2:            
             li_results.append(li_du_str[idx])
             
         elif len(li_segmented_utt) > 2 :
-            _tree_to_li_du(li_sub_tree[idx], li_results ) 
+            #try:
+            _tree_to_li_du(li_child[idx], li_results ) 
+            # except Exception as e:
+            #     print(li_child[idx])
+            #     raise Exception
     
     return li_results
 
+def __parse_leaves(tree_leaves ):
+   #     """tree_leaves is list of subsections of an annotated discourse unit
+   #     ['_!Three','new', 'issues', 'begin', 'trading', 'on', 'the',
+   #  'New', 'York', 'Stock', 'Exchange', 'today', ',!_', '_!and', 'one',
+   #  'began', 'trading', 'on', 'the', 'Nasdaq/National', 'Market', 'System',
+   #  'last', 'week', '.', '<P>!_'
+    
+   if type(tree_leaves) == list:
+      tree_leaves = ' '.join(tree_leaves)
 
-def __parse_leaves(tree_leaves: list ):
-    """tree_leaves is list of subsections of an annotated discourse unit
-    example ['_!Three','new', 'issues', 'begin', 'trading', 'on', 'the',
-    'New', 'York', 'Stock', 'Exchange', 'today', ',!_', '_!and', 'one',
-    'began', 'trading', 'on', 'the', 'Nasdaq/National', 'Market', 'System',
-    'last', 'week', '.', '<P>!_'
-        ex:  """
-    #removing tree labels
-    _str = re.sub('(_\!|<P>|\!_|<s>)',"",' '.join(tree_leaves) )
-    # removing whitespace preceeding a punctuation
-    _str2 = re.sub('(\s){1,2}([,.!?\\-])',r'\2',_str )
+   #removing tree labels
+   _str = re.sub('(_\!|<P>|\!_|<s>)',"", tree_leaves )
+   # removing whitespace preceeding a punctuation
+   _str2 = re.sub('(\s){1,2}([,.!?\\-\'])',r'\2',_str )
 
-    _str3 = re.sub('  ',' ',_str2).strip()
+   _str3 = re.sub('  ',' ',_str2).strip()
 
-    return _str3
+   return _str3
 
 def _topic(li_li_thread_utterances):
     for i, _ in enumerate(li_li_thread_utterances):
@@ -726,7 +788,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
 
-    parser.add_argument('--danet_vname', default="DaNet_v007",
+    parser.add_argument('--danet_vname', default="DaNet_v009",
         help="Version name of the DaNet model to use for dialogue act classifier ",
         type=str )
     
@@ -754,21 +816,17 @@ if __name__ == '__main__':
             main( **dict_args )
             completed = True
         except Exception as e:
-            # cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
-            # os.system(cmd)
-            # time.sleep(5)
-            # os.system(cmd)
-            # time.sleep(5)
             print(e)
             print(traceback.format_exc())
             dict_args['start_batch'] = batches_completed + 1
             
         finally :
-            cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q) "
+            #cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q)"
+            cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
             os.system(cmd)
             time.sleep(5)
             os.system(cmd)
             time.sleep(5)
 
     #last bacth = 105
-
+#python3 -bps 20 -mp_count 16 --danet_name DaNet_v008
