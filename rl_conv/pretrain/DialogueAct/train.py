@@ -126,9 +126,14 @@ class DaNet(nn.Module):
             [type]: [description]
         """
         #input_ids, attention_mask, token_type_ids = input_
-        input_ids = torch.squeeze(input_['input_ids'])
-        attention_mask = torch.squeeze(input_['attention_mask'])
-        token_type_ids = torch.squeeze(input_['token_type_ids'])
+        if input_['input_ids'].shape[0] != 1 and input_['input_ids'].dim() !=2 :
+            input_ids = torch.squeeze(input_['input_ids'])
+            attention_mask = torch.squeeze(input_['attention_mask'])
+            token_type_ids = torch.squeeze(input_['token_type_ids'])
+        else:
+            input_ids = input_['input_ids']
+            attention_mask = input_['attention_mask']
+            token_type_ids = input_['token_type_ids']
 
         # Feed input to BERT
         outputs = self.transformer(input_ids=input_ids,
@@ -190,17 +195,18 @@ class TrainingModule(pl.LightningModule):
 
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-                
+        self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor(
+                    [0.13531564604072643, 0.21422027968035948, 0.4122622939956707,
+                        0.9050396558843776, 0.3907778763587857, 0.7998843046911028,
+                        0.38270146487021667, 1.6013329426939653, 3.565456992178743,
+                        0.5810688617892928, 0.9613531989765262, 2.050586482840234]))
+
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-            self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor(
-                        [0.13531564604072643, 0.21422027968035948, 0.4122622939956707,
-                            0.9050396558843776, 0.3907778763587857, 0.7998843046911028,
-                            0.38270146487021667, 1.6013329426939653, 3.565456992178743,
-                            0.5810688617892928, 0.9613531989765262, 2.050586482840234]))
+  
             self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
             self.learning_rate = learning_rate
@@ -317,7 +323,7 @@ class TrainingModule(pl.LightningModule):
         
         li_li_da = preds.tolist()
 
-        li_dict_da = [ OrderedDict(zip( self.ordered_label_list, pred_da))
+        li_dict_da = [ OrderedDict( zip(self.ordered_label_list, pred_da) )
                             for pred_da in li_li_da ]
 
         return li_li_da, li_dict_da

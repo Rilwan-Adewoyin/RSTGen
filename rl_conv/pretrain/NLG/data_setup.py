@@ -829,4 +829,5 @@ if __name__ == '__main__':
             time.sleep(5)
 
     #last bacth = 105
-#python3 -bps 20 -mp_count 16 --danet_name DaNet_v008
+#python3 -bps 20 --mp_count 16 --danet_name DaNet_v008
+#python3 -bps 120 --mp_count 16 --danet_vname DaNet_v009
