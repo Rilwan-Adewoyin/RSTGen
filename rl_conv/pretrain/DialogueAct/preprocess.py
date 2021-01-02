@@ -138,21 +138,30 @@ def preprocess(args, str_subset):
     
         
     dataset_names = ['MRDA','SWDB-DAMSL','MIDAS']
-    li_li_fns = [li_fns_mrda, li_fns_swda, li_fns_midas ]
+    li_li_fns = [li_fns_mrda, li_fns_swda,li_fns_midas ]
  
     usecols = { 'MRDA':[0,1,4] ,'SWDB-DAMSL':None, 'MIDAS': [0,1]    }
     names = { 'MRDA':['speaker','utterance','da'] ,'SWDB-DAMSL':['speaker','utterance','da'], 'MIDAS': ["utterance","da"]    }
     seps = {'MRDA':'|', "SWDB-DAMSL":"|", "MIDAS":"##" }
 
-    paraphrase_counts = {
+    paraphrase_counts1 = {
                         'action-directive': 15,
                         'reject': 12,
                         'summarize': 18,
                         'quotation': 18,
                         'hedge': 18,
                         'elaboration': 9,
-                        'other-forward-function':9}  
+                        'other-forward-function':3}  
                         #NOTE: have to be even numbers, half half split for summarization and paraphrasing
+    
+    paraphrase_counts2 = {
+                        'action-directive': 6,
+                        'reject': 3,
+                        'summarize': 9,
+                        'quotation': 9,
+                        'hedge': 6,
+                        'elaboration': 3,
+                        'other-forward-function':3}  
     
     # Getting paraphraser
     model_name = 'tuner007/pegasus_paraphrase'
@@ -177,6 +186,9 @@ def preprocess(args, str_subset):
                 df_conv.to_csv( path, header=True, index=False, sep="|" )
 
                 li_df_convs  = [df_conv]
+            
+            # Paraphrasing (makes pphrases per file and saves them)
+                response = _mk_pphrase(li_df_convs, paraphrase_counts1, model, tokenizer, dir_dset, ds_name, fn )
 
             elif ds_name in ['MIDAS']:
                 li_df_convs = _annotate_dialog_act_v2(df_conv, ds_name, dict_da_map)
@@ -185,9 +197,11 @@ def preprocess(args, str_subset):
                 for idx, df in enumerate(li_df_convs):
                     path = os.path.join(dir_dset, f"midas_{idx:05d}.txt")
                     df.to_csv( path, header=True, index=False, sep="|")
-            
+
             # Paraphrasing (makes pphrases per file and saves them)
-            response = _mk_pphrase(li_df_convs, paraphrase_counts, model, tokenizer, dir_dset, ds_name, fn )
+                response = _mk_pphrase(li_df_convs, paraphrase_counts2, model, tokenizer, dir_dset, ds_name, fn )
+            
+            
             
             if counter+1 % 10 == 0:
                 print(f"\t\t Finished {counter} of {len(li_fns)}")
@@ -328,24 +342,24 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     # Then use the original indexes to select the preceeding utterance
 
     # Then return the list of two sentence paraphrased sentences.
-    
-    
 
     li_da_labels_to_pp = list(paraphrase_counts.keys())
     li_das_not_to_pp = [] #["backchannel","statement"]#,"understanding","question","agreement"]
     li_df_pphrased = []
 
     for df in li_df_conv:
-        
 
-    # Check for the any row that contains they above das but does not contain "statement"
+    # Check for the any row that contains the above das but does not contain "statement"
     # the lambda statment: returns true if all labels in x are in the list of das_to_pp but not in the 
     # list of das to ignore
         #1)
+##########################################################################
         idxs_to_pp = df[ df.apply(lambda row: all( (da != '') and ((da in li_da_labels_to_pp) and (da not in li_das_not_to_pp )) for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
 
             #  removing index 0 from list if there since cant get response to 0th index 
         idxs_to_pp = [idx for idx in idxs_to_pp if idx != 0]
+        if len(idxs_to_pp) == 0:
+            continue
         rows_to_pp = df.iloc[idxs_to_pp] #row idxs for the current utterance
         
     # Gather the amount of copies to make for each da label in rows_to_pp
@@ -358,7 +372,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
         li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist(), copies_to_make )
 
     # make a list of new dfs with the paraphrase
-        li_pp_df_copy = []
+        
         for idx, li_pp_txt, li_pp_txt_prev in zip(idxs_to_pp,  li_li_pp_text, li_li_pp_text_prev):
             if li_pp_txt==[] or li_pp_txt_prev==[]:
                 continue
@@ -370,8 +384,9 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
             for df_copy, pp_text, pp_text_prev in zip( li_pp_df_copy, li_pp_txt, li_pp_txt_prev):
                 df_copy.at[1,'utterance'] = pp_text
                 df_copy.at[0,'utterance'] = pp_text_prev
-             
-        li_df_pphrased.extend(li_pp_df_copy)
+        
+        #Add to list of pphrase comments
+            li_df_pphrased.extend(li_pp_df_copy)
 
     for idx3, df2 in enumerate(li_df_pphrased):
         path = os.path.join(dir_dset, f"{ds_name}_{os.path.split(fn)[-1]}_pp_{idx3:05d}.txt")
@@ -385,16 +400,16 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
     for txt, num_ret_seq in zip( li_input_text, li_num_return_sequences):
         txt_len = len(txt.split(' '))
 
-        if txt_len > 3:
+        if txt_len > 0:
             #max_len = int(txt_len*2)
             
             batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=True, early_stopping=True,top_k=75, repetition_penalty=1.0,  ) #no_repeat_ngram_size=2
+            translated_pp = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=False, early_stopping=True,top_k=75, repetition_penalty=1.0,  ) #no_repeat_ngram_size=2
    
-            translated_smrzd = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=8, temperature=2.2, do_sample=True, early_stopping=True, top_p=0.999, top_k=100,repetition_penalty=1.0, length_penalty=20.0 )
+            translated_smrzd = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=True, early_stopping=True, top_p=0.999, top_k=100,repetition_penalty=1.0, length_penalty=20.0 )
 
-            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.2, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repetition_penalty=1.0 )
+            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.1, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repetition_penalty=1.0 )
             
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
