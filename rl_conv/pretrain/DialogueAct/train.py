@@ -519,7 +519,7 @@ class DataLoaderGenerator():
         """
         dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
         set_names = ["train","val","test"]
-        li_shuffle = [True, False, False]
+        li_shuffle = [True, True, False]
         dataloaders = []
         
         dataloaders = [self.prepare_dataset(_dir, shuffle,name) for _dir,shuffle,name in zip(dir_sets,li_shuffle, set_names)]
@@ -659,6 +659,7 @@ def main(tparams, mparams):
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
+                        limit_train_batches = 0.4 ,
                         #track_grad_norm = True,
                         #overfit_batches=5
                         #,fast_dev_run=True, 
