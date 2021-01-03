@@ -226,11 +226,20 @@ class TrainingModule(pl.LightningModule):
 
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-        self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor(
-                    [0.13531564604072643, 0.21422027968035948, 0.4122622939956707,
-                        0.9050396558843776, 0.3907778763587857, 0.7998843046911028,
-                        0.38270146487021667, 1.6013329426939653, 3.565456992178743,
-                        0.5810688617892928, 0.9613531989765262, 2.050586482840234]))
+        self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor( 
+                        [0.3088291648106703,
+                        1.024000615817113,
+                        0.6991441820732512,
+                        0.3796431004385018,
+                        0.74682843474964,
+                        0.6538210826002997,
+                        0.48526149422196,
+                        0.8302135385261447,
+                        2.7958586868836464,
+                        1.387324107182697,
+                        0.5685039211966343,
+                        2.1205716714994423]
+                        ))
 
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
@@ -296,12 +305,14 @@ class TrainingModule(pl.LightningModule):
         target = target[keep_mask]
         output = output[keep_mask]
 
-        loss = self.loss( output, target)
+        loss = self.loss( torch.where(target==0,output/2,output), target )
+
         loss_key = f"{step_name}_loss"
         
         output =  output.to('cpu')
-        output_bnrzd = torch.where( output<0.5,0.0,1.0)
         target  = target.to('cpu')
+        output_bnrzd = torch.where( output<0.5,0.0,1.0)
+        
 
         self.dict_acc[step_name](output_bnrzd, target)
         correct_micro = output_bnrzd.eq(target).min(dim=1)[0]

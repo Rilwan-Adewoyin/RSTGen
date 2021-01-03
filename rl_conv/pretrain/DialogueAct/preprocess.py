@@ -43,6 +43,7 @@ def main(argv=None):
     #preprocessing train validation and test set
     
     sets = ['train','val','test']
+    #sets = ['val','test']
     for _set in sets:
         preprocess(args, _set )
     
