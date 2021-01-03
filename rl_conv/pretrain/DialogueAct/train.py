@@ -190,9 +190,6 @@ class NamedEntityMasker():
         
         return text
 
-
-
-
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model=DaNet(), batch_size=20, 
@@ -452,16 +449,16 @@ class TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         #optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        #optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
+        optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
         
 
-        optimizer = optim.Lamb(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.01,
-        )    
+        # optimizer = optim.Lamb(
+        #     self.model.parameters(),
+        #     lr=self.learning_rate,
+        #     betas=(0.9, 0.999),
+        #     eps=1e-8,
+        #     weight_decay=0.01,
+        # )    
 
 
         total_steps = self.total_steps()
@@ -563,7 +560,6 @@ class DataLoaderGenerator():
         return train_dl, val_dl, test_dl
     
 class SingleDataset(torch.utils.data.Dataset):
-#class SingleDataset(Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
@@ -613,7 +609,6 @@ class SingleDataset(torch.utils.data.Dataset):
             truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True )
                 
         return encoded_input
-
 
 def main(tparams, mparams):
     gc.collect()
@@ -694,6 +689,7 @@ def main(tparams, mparams):
         
         # restore the optimizers
         optimizer_states = checkpoint['optimizer_states']
+        
         for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
             optimizer.load_state_dict(opt_state)
 
@@ -704,6 +700,8 @@ def main(tparams, mparams):
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.cuda(trainer.root_gpu)
+        
+        
 
         # restore the lr schedulers
         lr_schedulers = checkpoint['lr_schedulers']
