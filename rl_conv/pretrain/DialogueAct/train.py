@@ -227,22 +227,7 @@ class TrainingModule(pl.LightningModule):
 
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-        # self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor( 
-        #                 [0.3088291648106703,
-        #                 1.024000615817113,
-        #                 0.6991441820732512,
-        #                 0.3796431004385018,
-        #                 0.74682843474964,
-        #                 0.6538210826002997,
-        #                 0.48526149422196,
-        #                 0.8302135385261447,
-        #                 2.7958586868836464,
-        #                 1.387324107182697,
-        #                 0.5685039211966343,
-        #                 2.1205716714994423]
-        #                 ))
-
-        self.loss = nn.BCELoss( weight=torch.FloatTensor( 
+        self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor( 
                         [0.3088291648106703,
                         1.024000615817113,
                         0.6991441820732512,
@@ -256,6 +241,21 @@ class TrainingModule(pl.LightningModule):
                         0.5685039211966343,
                         2.1205716714994423]
                         ))
+
+        # self.loss = nn.BCELoss( weight=torch.FloatTensor( 
+        #                 [0.3088291648106703,
+        #                 1.024000615817113,
+        #                 0.6991441820732512,
+        #                 0.3796431004385018,
+        #                 0.74682843474964,
+        #                 0.6538210826002997,
+        #                 0.48526149422196,
+        #                 0.8302135385261447,
+        #                 2.7958586868836464,
+        #                 1.387324107182697,
+        #                 0.5685039211966343,
+        #                 2.1205716714994423]
+        #                 ))
 
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
@@ -321,9 +321,9 @@ class TrainingModule(pl.LightningModule):
         target = target[keep_mask]
         output = output[keep_mask]
 
-        #loss = self.loss( torch.where(target==0,output/2,output), target )
-        output = torch.sigmoid(output)
-        loss = self.loss( torch.where(target==0,output/2,output), target )
+        loss = self.loss( output, target )
+        # output = torch.sigmoid(output)
+        # loss = self.loss( torch.where(target==0,output/2,output), target )
 
         loss_key = f"{step_name}_loss"
         
