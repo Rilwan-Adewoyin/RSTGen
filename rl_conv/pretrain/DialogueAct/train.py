@@ -242,7 +242,7 @@ class TrainingModule(pl.LightningModule):
         #                 2.1205716714994423]
         #                 ))
 
-        self.loss = nn.BCELoss( pos_weight=torch.FloatTensor( 
+        self.loss = nn.BCELoss( weight=torch.FloatTensor( 
                         [0.3088291648106703,
                         1.024000615817113,
                         0.6991441820732512,
