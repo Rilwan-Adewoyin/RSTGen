@@ -28,6 +28,7 @@ from torch.utils.data._utils.collate import default_convert, default_collate
 from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 import transformers
+import torch_optimizer as optim
 
 import pytorch_lightning as pl
 
@@ -434,8 +435,18 @@ class TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         #optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
+        #optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
         
+
+        optimizer = optim.Lamb(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,
+        )    
+
+
         total_steps = self.total_steps()
         warmup_steps = int( self.total_steps() * self.warmup_proportion )
 
@@ -703,3 +714,6 @@ if __name__ == '__main__':
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
     main(tparams, mparams)
+
+    #CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 560 --workers 8 --gpus 1 --cache ram --max_epochs 100  --learning_rate 4e-4
+    #CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 320 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 5e-5 --mode train_cont --version_name DaNet_v011
