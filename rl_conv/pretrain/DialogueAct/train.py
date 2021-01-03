@@ -519,7 +519,7 @@ class DataLoaderGenerator():
         """
         dir_sets = [self.dir_train_set, self.dir_val_set, self.dir_test_set]
         set_names = ["train","val","test"]
-        li_shuffle = [True, True, False]
+        li_shuffle = [True, False, False]
         dataloaders = []
         
         dataloaders = [self.prepare_dataset(_dir, shuffle,name) for _dir,shuffle,name in zip(dir_sets,li_shuffle, set_names)]
