@@ -677,7 +677,7 @@ def main(tparams, mparams):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
-                    accelerator= 'dp,'
+                    accelerator= 'ddp,'
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
