@@ -322,9 +322,9 @@ class TrainingModule(pl.LightningModule):
         target = target[keep_mask]
         output = output[keep_mask]
 
-        if self.loss_type = "BCE":
+        if self.loss_type == "BCE":
             loss = self.loss( output, target )
-        if self.loss_type = "MSE":
+        if self.loss_type == "MSE":
             loss = self.loss(output, target)
 
         # output = torch.sigmoid(output)
