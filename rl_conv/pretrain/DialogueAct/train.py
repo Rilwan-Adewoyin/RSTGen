@@ -661,6 +661,8 @@ def main(tparams, mparams):
                         precision=16, callbacks=callbacks,
                         limit_train_batches = 0.4 ,
                         accelerator= 'ddp',
+                        move_metrics_to_cpu= True,
+
                         #track_grad_norm = True,
                         #overfit_batches=5
                         #,fast_dev_run=True, 
@@ -677,7 +679,9 @@ def main(tparams, mparams):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
-                    accelerator= 'ddp,'
+                    accelerator= 'ddp',
+                                            move_metrics_to_cpu= True,
+
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
