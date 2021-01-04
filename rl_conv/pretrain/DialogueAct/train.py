@@ -536,17 +536,17 @@ class DataLoaderGenerator():
         li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
             self.context_history_len) for _f in files ]
         
-        if self.cache == "local":
-            _dir = f"./cache"
-            concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
-            os.makedirs(os.path.abspath(_dir),exist_ok=True)
-            concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
-        elif self.cache == "ram":
-            concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
-            concat_dset = concat_dset.cache()
+        # if self.cache == "local":
+        #     _dir = f"./cache"
+        #     concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+        #     os.makedirs(os.path.abspath(_dir),exist_ok=True)
+        #     concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
+        # elif self.cache == "ram":
+        #     concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
+        #     concat_dset = concat_dset.cache()
         
-        elif self.cache == "none":
-            concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+        # elif self.cache == "none":
+        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
