@@ -298,7 +298,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
         parser.add_argument('--version_name', default='', required=False)
         parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
-        parser.add_argument('--cache',default="ram",required=False, choices = ['local','ram',"none"])
+        parser.add_argument('--cache',default="ram",required=False, type=str ,choices = ['local','ram',"none"])
         #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
         tparams = parser.parse_known_args()[0]
