@@ -660,7 +660,7 @@ def main(tparams, mparams):
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
                         limit_train_batches = 0.4 ,
-                        accelerator= 'dp',
+                        accelerator= 'ddp',
                         #track_grad_norm = True,
                         #overfit_batches=5
                         #,fast_dev_run=True, 
