@@ -243,7 +243,7 @@ class TrainingModule(pl.LightningModule):
                             0.5685039211966343,
                             2.1205716714994423]
                             ), 
-            self.pos_weight= torch.FloatTensor(  [13,13,13,13,13,13,13,13,13,13,13,13] ) )
+                     pos_weight= torch.FloatTensor(  [13,13,13,13,13,13,13,13,13,13,13,13] ) )
         
         elif self.loss_type == "MSE":
             pass
