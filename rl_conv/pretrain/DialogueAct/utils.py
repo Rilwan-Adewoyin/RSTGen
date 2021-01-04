@@ -94,9 +94,9 @@ def get_best_ckpt_path(dir_path):
 
     li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
 
-    li_ckpts = [ re.findall( r"epoch=[\d]{3}" ,fname)[0][-3:] for fname in li_files ]
+    li_ckpts = [ re.findall( r"val_loss=[\S]{5}" ,fname)[-1][-3:] for fname in li_files ]
 
-    index = li_ckpts.index( max(li_ckpts, key=int) )
+    index = li_ckpts.index( max(li_ckpts, key=float) )
 
     ckpt_path = li_files[index]
 

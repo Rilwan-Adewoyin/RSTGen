@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import os
+
 import glob
 import pandas as pd
 import json
@@ -108,6 +109,7 @@ class DaNet(nn.Module):
         parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
+        parser.add_argument('--loss_type',default="BCE", required=False, type=str)
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
@@ -204,6 +206,7 @@ class TrainingModule(pl.LightningModule):
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
                     cache = 'ram',
+                    loss_type = 'BCE',
                     *args,
                     **kwargs):
         super().__init__()
@@ -224,20 +227,26 @@ class TrainingModule(pl.LightningModule):
 
         
         self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-        self.loss = nn.BCEWithLogitsLoss( pos_weight=torch.FloatTensor( 
-                        [0.3088291648106703,
-                        1.024000615817113,
-                        0.6991441820732512,
-                        0.3796431004385018,
-                        0.74682843474964,
-                        0.6538210826002997,
-                        0.48526149422196,
-                        0.8302135385261447,
-                        2.7958586868836464,
-                        1.387324107182697,
-                        0.5685039211966343,
-                        2.1205716714994423]
-                        ))
+        
+        if self.loss_type == "BCE":
+            self.loss = nn.BCEWithLogitsLoss( weight=torch.FloatTensor( 
+                            [0.3088291648106703,
+                            1.024000615817113,
+                            0.6991441820732512,
+                            0.3796431004385018,
+                            0.74682843474964,
+                            0.6538210826002997,
+                            0.48526149422196,
+                            0.8302135385261447,
+                            2.7958586868836464,
+                            1.387324107182697,
+                            0.5685039211966343,
+                            2.1205716714994423]
+                            ), 
+            self.pos_weight= torch.FloatTensor(  [13,13,13,13,13,13,13,13,13,13,13,13] ) )
+        
+        elif self.loss_type == "MSE":
+            pass
 
         # self.loss = nn.BCELoss( weight=torch.FloatTensor( 
         #                 [0.3088291648106703,
@@ -264,9 +273,7 @@ class TrainingModule(pl.LightningModule):
             self.create_data_loaders(self.workers)
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
-            self.dict_acc = {
-                k:pl.metrics.classification.Accuracy( ) for k in ["train",
-                    "val","test"] }
+
             self.dict_acc_micro = {
                 k:pl.metrics.classification.Accuracy( ) for k in ["train",
                     "val","test"] }
@@ -277,9 +284,6 @@ class TrainingModule(pl.LightningModule):
                 k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in ["train",
                     "val","test"] }
                     
-
-        
-
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
@@ -318,7 +322,11 @@ class TrainingModule(pl.LightningModule):
         target = target[keep_mask]
         output = output[keep_mask]
 
-        loss = self.loss( output, target )
+        if self.loss_type = "BCE":
+            loss = self.loss( output, target )
+        if self.loss_type = "MSE":
+            loss = self.loss(output, target)
+
         # output = torch.sigmoid(output)
         # loss = self.loss( torch.where(target==0,output/2,output), target )
 
@@ -329,7 +337,7 @@ class TrainingModule(pl.LightningModule):
         output_bnrzd = torch.where( output<0.5,0.0,1.0)
         
 
-        self.dict_acc[step_name](output_bnrzd, target)
+        #self.dict_acc[step_name](output_bnrzd, target)
         correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
         self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
         self.dict_recall[step_name](output_bnrzd, target)
@@ -352,7 +360,7 @@ class TrainingModule(pl.LightningModule):
                 
         _dict = { str_loss_key: loss }
         
-        self.log(f'{step_name}_acc_macro', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        #self.log(f'{step_name}_acc_macro', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
         self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
         self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
