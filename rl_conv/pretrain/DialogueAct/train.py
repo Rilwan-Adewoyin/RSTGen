@@ -611,8 +611,7 @@ class SingleDataset(torch.utils.data.Dataset):
         return encoded_input
 
 def main(tparams, mparams):
-    gc.collect()
-    torch.cuda.empty_cache()
+
 
     tparams.version_name =  tparams.version_name if tparams.version_name!= '' else utils.get_version_name(mparams.model_name)
     utils.save_version_params(tparams, mparams, tparams.version_name )
@@ -677,7 +676,7 @@ def main(tparams, mparams):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
-
+                        limit_train_batches = 0.5 ,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
