@@ -215,7 +215,7 @@ class TrainingModule(pl.LightningModule):
         self.gpus =  gpus
         self.context_history_len = context_history_len
         
-        
+        self.loss_type = loss_type
         self.save_hyperparameters('batch_size', 'accumulate_grad_batches', 
             'max_epochs', 'context_history_len', 'learning_rate',
             'warmup_proportion')
