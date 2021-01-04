@@ -550,7 +550,7 @@ class DataLoaderGenerator():
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
-            prefetch_factor= 2, pin_memory=True )
+             pin_memory=True )
         
         return dataloader
 
