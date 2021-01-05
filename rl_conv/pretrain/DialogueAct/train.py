@@ -109,7 +109,7 @@ class DaNet(nn.Module):
         parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
-        parser.add_argument('--loss_type',default="BCE", required=False, type=str)
+
         
         mparams = parser.parse_known_args( )[0]
         if mparams.config_file != None:
@@ -303,7 +303,9 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--version_name', default='', required=False)
         parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
         parser.add_argument('--cache',default="ram",required=False, type=str ,choices = ['local','ram',"none"])
-        #parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
+        parser.add_argument('--loss_type',default="BCE", required=False, type=str)
+        parser.add_argument('--gradient_clip_val',default=1.0, required=False, type=float)
+        parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
 
         tparams = parser.parse_known_args()[0]
         if tparams.config_file != None:
@@ -666,7 +668,7 @@ def main(tparams, mparams):
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
-                        limit_train_batches = 0.5 ,
+                        limit_train_batches = 0.4,
 
                         #track_grad_norm = True,
                         #overfit_batches=5
@@ -684,7 +686,7 @@ def main(tparams, mparams):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
-                        limit_train_batches = 0.5 ,
+                        limit_train_batches = 0.4,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
