@@ -6,7 +6,7 @@ import sklearn
 
 from pathlib import Path
 
-import torchdata as td
+#import torchdata as td
 #from torchdata import datasets,Dataset
 import torch
 import torch.nn as nn
@@ -29,7 +29,6 @@ from torch.utils.data._utils.collate import default_convert, default_collate
 from transformers import BertTokenizer, BertModel
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 import transformers
-import torch_optimizer as optim
 
 import pytorch_lightning as pl
 
@@ -209,7 +208,7 @@ class TrainingModule(pl.LightningModule):
                     loss_type = 'BCE',
                     *args,
                     **kwargs):
-        super().__init__()
+        super(TrainingModule, self).__init__()
 
         self.batch_size = batch_size
         self.gpus =  gpus
@@ -243,25 +242,11 @@ class TrainingModule(pl.LightningModule):
                             0.5685039211966343,
                             2.1205716714994423]
                             ), 
-                     pos_weight= torch.FloatTensor(  [13,13,13,13,13,13,13,13,13,13,13,13] ) )
+                     pos_weight= torch.FloatTensor(  [12,12,12,12,12,12,12,12,12,12,12,12] ) )
         
         elif self.loss_type == "MSE":
             pass
 
-        # self.loss = nn.BCELoss( weight=torch.FloatTensor( 
-        #                 [0.3088291648106703,
-        #                 1.024000615817113,
-        #                 0.6991441820732512,
-        #                 0.3796431004385018,
-        #                 0.74682843474964,
-        #                 0.6538210826002997,
-        #                 0.48526149422196,
-        #                 0.8302135385261447,
-        #                 2.7958586868836464,
-        #                 1.387324107182697,
-        #                 0.5685039211966343,
-        #                 2.1205716714994423]
-        #                 ))
 
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
@@ -274,14 +259,22 @@ class TrainingModule(pl.LightningModule):
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
 
-            self.step_names = ["train",
-                    "val","test"] 
-            self.dict_acc_micro = {
-                k:pl.metrics.classification.Accuracy( ) for k in self.step_names }
-            self.dict_prec = {
-                k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in self.step_names }
-            self.dict_recall =  {
-                k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in self.step_names }
+            self.step_names = ["train_label",
+                    "val_label","test_label"] 
+                        
+            #_ = { k:pl.metrics.classification.Accuracy() for k in self.step_names }
+
+            self.dict_acc_micro =  torch.nn.ModuleDict( {
+                "train_label":pl.metrics.classification.Accuracy(),
+                "val_label" :pl.metrics.classification.Accuracy(compute_on_step=False),
+                "test_label":pl.metrics.classification.Accuracy(compute_on_step=False)
+            })
+
+            self.dict_prec = torch.nn.ModuleDict( {
+                k:pl.metrics.classification.Precision( multilabel=True, num_classes=12) for k in self.step_names } )
+
+            self.dict_recall =  torch.nn.ModuleDict({
+                k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in self.step_names } )
                     
     @staticmethod
     def parse_train_specific_args(parent_parser):
@@ -325,7 +318,7 @@ class TrainingModule(pl.LightningModule):
         if step_name == "train":
             str_loss_key = "loss"
         else:
-            str_loss_key = loss_key
+            str_loss_key = step_name +"_loss"
 
         if self.loss_type == "BCE":
             loss = self.loss( output, target )
@@ -378,25 +371,30 @@ class TrainingModule(pl.LightningModule):
         return output
 
     def training_step_end(self, outputs:dict):
-        self.step_end_log( output, step_name, "train" )
+        self.step_end_log( outputs, "train" )
+        return outputs
 
     def validation_step_end(self, outputs:dict):
-        self.step_end_log( output, step_name, "val" )        
-    
+        self.step_end_log( outputs, "val" )        
+        return outputs
+
     def test_step_end(self, outputs:dict):
-        self.step_end_log( output, step_name, "test" )   
+        self.step_end_log( outputs,"test" )   
+        return outputs
     
-    def step_end_log(self, output, step_name ):
+    def step_end_log(self, outputs, step_name ):
 
         output =  outputs['output'] 
         target  = outputs['target']
         output_bnrzd = torch.where( output<0.5,0.0,1.0)
 
         correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
-        self.dict_acc_micro[step_name]( correct_micro, torch.ones_like(correct_micro) )
-        self.dict_recall[step_name](output_bnrzd, target)
-        self.dict_recall[step_name](output_bnrzd, target)
-        self.dict_prec[step_name](output_bnrzd, target)   
+        ones =  torch.ones_like(correct_micro).type_as(correct_micro)
+
+        self.dict_acc_micro[step_name+"_label"]( correct_micro, ones )
+        self.dict_recall[step_name+"_label"](output_bnrzd, target)
+        self.dict_recall[step_name+"_label"](output_bnrzd, target)
+        self.dict_prec[step_name+"_label"](output_bnrzd, target)   
       
         if step_name == 'train':
             on_step = True
@@ -408,13 +406,11 @@ class TrainingModule(pl.LightningModule):
             on_step = False
             on_epoch = True
             prog_bar = False
-            logger = True
-                
+            logger = True        
         
-        #self.log(f'{step_name}_acc_macro', self.dict_acc[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        self.log(f'{step_name}_rec', self.dict_recall[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
-        self.log(f'{step_name}_prec', self.dict_prec[step_name].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)             
+        self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
+        self.log(f'{step_name}_rec', self.dict_recall[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
+        self.log(f'{step_name}_prec', self.dict_prec[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)             
 
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs,"train")
@@ -431,7 +427,6 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-           
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
     def create_data_loaders(self, shuffle=False, **kwargs):
@@ -459,9 +454,7 @@ class TrainingModule(pl.LightningModule):
     def total_steps(self):
          
         train_batches = len( self.train_dl ) //self.gpus 
-        
         steps = (self.max_epochs * train_batches) //self.accumulate_grad_batches
-
         return steps
 
     def configure_optimizers(self):
@@ -657,8 +650,8 @@ def main(tparams, mparams):
     callbacks.append(early_stop_callback)
     
     if tparams.gpus not in [0,1]:
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '65600'
+        os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
+        os.environ['MASTER_PORT'] = '65302'
 
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
@@ -668,7 +661,7 @@ def main(tparams, mparams):
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
                         limit_train_batches = 0.4,
-                        
+                        accelerator='ddp'
                         #track_grad_norm = True,
                         #overfit_batches=5
                         #,fast_dev_run=True, 
@@ -686,6 +679,7 @@ def main(tparams, mparams):
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
                         limit_train_batches = 0.4,
+                    accelerator='ddp'
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
@@ -743,6 +737,8 @@ if __name__ == '__main__':
 
 #    CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 560 --workers 8 --gpus 1 --cache ram --max_epochs 50  --learning_rate 1e-3 --warmup_proportion 0.1
 
-#   CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 20 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 1e-3 --mode train_cont --version_name DaNet_v027
+#   CUDA_VISIBLE_DEVICES=0,1,2 python3 train.py -bs 8 -agb 20 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 1e-4 
+  
+# CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 20 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 1e-3 --mode train_cont --version_name DaNet_v027
 
-#   CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=1  --master_port 29501  main.py
+#   CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.launch --nproc_per_node=1  --master_port 29501  main.py
