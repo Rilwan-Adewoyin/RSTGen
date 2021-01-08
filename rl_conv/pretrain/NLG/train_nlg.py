@@ -1,3 +1,8 @@
+import os
+#os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+#os.environ["NCCL_DEBUG"]="INFO"
+#os.environ["TOKENIZERS_PARALLELISM"] = "false"
+#os.environ['NCCL_P2P_DISABLE'] = '1'
 #TODO: adding caching
 import numpy as np
 import warnings
@@ -8,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import os
+
 import glob
 import pandas as pd
 import json
@@ -40,23 +45,27 @@ import yaml
 import ast
 import types
 
-#Monkey Patching the save module
-#TODO: suggest this change on github pytorch lightning 
-def monkey_save_model(self, filepath: str, trainer, pl_module):
-    # in debugging, track when we save checkpoints
-    trainer.dev_debugger.track_checkpointing_history(filepath)
+# #Monkey Patching the save module
+# #TODO: suggest this change on github pytorch lightning 
+# def monkey_save_model(self, filepath: str, trainer, pl_module):
+#     # in debugging, track when we save checkpoints
+#     trainer.dev_debugger.track_checkpointing_history(filepath)
 
-    # make paths
-    if trainer.is_global_zero:
-        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
+#     # make paths
+#     if trainer.is_global_zero:
+#         self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    # delegate the saving to the trainer
-    if self.save_function is not None:
-        self.save_function(filepath, self.save_weights_only)
+#     # delegate the saving to the trainer
+#     if self.save_function is not None:
+#         self.save_function(filepath, self.save_weights_only)
     
-    self.to_yaml()
+#     self.to_yaml()
 
-ModelCheckpoint._save_model = monkey_save_model
+#     # torch.save({
+#     #     'epoch'
+#     # })
+
+# ModelCheckpoint._save_model = monkey_save_model
 
 #Monkey patching the forward on distill bert
 def forward(
@@ -476,7 +485,7 @@ class NLG_tokenizer():
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
                 config.save_pretrained(dir_tokenizer)
 
-        self.max_input_len =  512 #self.e2m_tokenizer.max_len
+        self.max_input_len = 216 #512 #self.e2m_tokenizer.max_len
     
     def encode_v1( self, das ,rst_rels, rst_ns, rst_pos,
         topics, topics_score, utterance ,prev_das=None, prev_rst=None):
@@ -591,8 +600,11 @@ class NLG_tokenizer():
         seq_len =  utt_dim 
         padding_len = self.max_input_len - utt_dim 
 
-        tknzd_utt = torch.cat( [tknzd_utt, torch.LongTensor(padding_token).repeat(padding_len)] )
-        
+        if padding_len>0:
+            tknzd_utt = torch.cat( [tknzd_utt, torch.LongTensor(padding_token).repeat(padding_len)] )
+        else:
+            tknzd_utt  = tknzd_utt[:padding_len]
+
             # creating mask
         attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
                     #pre_utterance general masking
@@ -613,16 +625,24 @@ class NLG_tokenizer():
         #Creating labels/targets for GPT Language Model Head
         labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
         
-        labels[0][drt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
+        if padding_len>0:
+            labels[0][drt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
+        else:
+            labels[0][drt_dim:utt_dim] = tknzd_utt[ : utt_dim- drt_dim ]
 
         # Creating Positional Emebeddings
             # ALL words in drt get a positional encoding of 0 -> No positional meaning
             # utterance has normal positional encoding        
         position_ids_drt = torch.zeros([drt_dim], dtype=torch.long) 
         position_ids_utt =  torch.arange( 1, utt_dim-drt_dim + 1  , dtype=torch.long)
-        position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
-        position_ids = torch.cat([position_ids_drt,position_ids_utt, position_ids_pad], axis=-1)
         
+
+        if padding_len>0:
+            position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
+            position_ids = torch.cat([position_ids_drt,position_ids_utt, position_ids_pad], axis=-1)
+        else:
+            position_ids = torch.cat([position_ids_drt,position_ids_utt[:padding_len]], axis=-1)
+
         # Creating Token Type Ids
             # 1:da, 
             # 2:rst, 
@@ -631,17 +651,21 @@ class NLG_tokenizer():
 
         token_type_ids_d = torch.zeros( [da_len ] , dtype=torch.long) + 1
         token_type_ids_r = torch.zeros( [rst_len], dtype=torch.long) + 2
-        
         token_type_ids_utt = torch.zeros( [utt_len], dtype=torch.long ) + 3
         
         _ = torch.zeros( [topics_len ], dtype=torch.long)
         _[ ta_tokens_pos ] = 1
         token_type_ids_t =  _.cumsum(axis=0) + 3
 
-        token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
+        if padding_len>0:
+            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
+            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
+                                token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
 
-        token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
-                            token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
+        else:
+            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
+                                token_type_ids_t, token_type_ids_utt[:padding_len] ] ) 
+
 
         return { 'da_start_token':da_start_token, 'tnsr_das':tnsr_das,
                  'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,
@@ -947,6 +971,7 @@ class TrainingModule(pl.LightningModule):
         checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
+        
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
