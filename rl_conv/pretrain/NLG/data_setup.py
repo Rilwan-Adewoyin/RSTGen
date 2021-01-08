@@ -179,7 +179,6 @@ def main(danet_vname,
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
-
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
     # endregion
