@@ -1,5 +1,5 @@
 import os
-os.environ["NCCL_DEBUG"]="INFO"
+
 import numpy as np
 import warnings
 import sklearn
@@ -459,7 +459,7 @@ class TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         #optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
+        #optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
         
         total_steps = self.total_steps()
         warmup_steps = int( self.total_steps() * self.warmup_proportion )

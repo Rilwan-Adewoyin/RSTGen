@@ -38,6 +38,7 @@ nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
 
 import csv
 import pickle
+#import dill as pickle
 import time
 import torch
 
@@ -48,7 +49,8 @@ from utils import get_path
 
 import regex as re
 import multiprocessing as mp
-
+# import torch.multiprocessing as mp
+# from torch.multiprocessing import set_start_method
 
 
 from unidecode import unidecode
@@ -91,6 +93,7 @@ def main(danet_vname,
             rst_method="feng-hirst",
             mp_count=5,
             start_batch=0,
+            mp_damodules =3,
             **kwargs):
     """[summary]
 
@@ -118,14 +121,26 @@ def main(danet_vname,
     mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
     tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
 
+    # li_danet_modules = [ ]
+    # torch.set_grad_enabled(False)
+    # for idx in range(mp_damodules):   
+    #     danet = DaNet(**vars(mparams)).to('cuda')
+    #     danet_module = TrainingModule(mode='inference', model=danet)
+    #     danet_module.load_state_dict(checkpoint['state_dict'] )
+    #     #danet_module.share_memory()
+    #     danet_module.eval()
+    #     #danet_module.model.eval()
+        
+    #     danet_module.to('cuda')
+        
+    #      li_danet_modules.append(danet_module)
+
     danet = DaNet(**vars(mparams))
-    
     danet_module = TrainingModule(mode='inference', model=danet)
     danet_module.load_state_dict(checkpoint['state_dict'] )
-
     danet_module.eval()
-    danet_module.model.eval()
     torch.set_grad_enabled(False)
+
     tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
 
     # setting up docker image for rst
@@ -163,7 +178,6 @@ def main(danet_vname,
     corpus = _load_data()
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
-
 
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
@@ -222,7 +236,7 @@ def main(danet_vname,
         contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
         contaier_ids = sum(contaier_ids, [])
         with mp.Pool(mp_count_rst) as pool:
-            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst) , contaier_ids  ) )
+            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ) , contaier_ids  ) )
         batch_li_li_thread_utterances = list( res ) 
         batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
@@ -231,71 +245,108 @@ def main(danet_vname,
 
         #region DA assignment
         timer.start()
+
+            #preppring for parrallelizing
+        
+        
+        # with mp.Pool(mp_damodules) as pool:
+        #     res = pool.starmap(_da_assigning, zip( _chunks(batch_li_li_thread_utterances,mp_damodules), li_danet_modules ,itertools.repeat(tokenizer) )  )
+        
+        # batch_li_li_thread_utterances = list(res)
+        # batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+
+        # processes =[]
+        # pipe_list =[]
+
+        # li_arg1 = _chunks(batch_li_li_thread_utterances, batch_process_size//mp_damodules)
+        # ctx = mp.get_context('spawn')
+
+        # for i in range(mp_damodules):
+        #     recv_end, send_end = mp.Pipe(False)
+        #     p = ctx.Process( target=_da_assigning, args=( next(li_arg1), li_danet_modules[i],tokenizer ) )
+        #     pipe_list.append(recv_end)
+        #     processes.append(p)
+        #     p.start()
+
+        # for p in processes:
+        #     p.join()
+        # res = [x.recv() for x in pipe_list]
+
+        #batch_li_li_thread_utterances = list(res)
+        #batch_li_li_thread_utterances = sum(res, [])
+
+
         for i, _ in enumerate(batch_li_li_thread_utterances):
             
-            li_thread_utterances = batch_li_li_thread_utterances[i]
+                li_thread_utterances = batch_li_li_thread_utterances[i]
 
-            # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
-                #list of prev utterance
-            li_currutt =  [ _dict['txt_preproc'] for _dict
-                            in li_thread_utterances ] 
+                # Here, for the larger utterances (3s) I perform DA analysis on each EDU of
+                    #list of prev utterance
+                    #masking tokens
+                li_currutt =  danet_module.model.nem( [ _dict['txt_preproc'] for _dict
+                                in li_thread_utterances ] )
 
-            li_prevutt = [ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances) for _dict
-                            in li_thread_utterances ] 
-            li_li_uttdu = [ _dict['dus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
+                li_prevutt = danet_module.model.nem([ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances) for _dict
+                                in li_thread_utterances ] )
+                li_li_uttdu = [ _dict['dus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
 
-            li_dict_da = []
-            li_li_da = []
-            for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttdu):
                 
-                #skipping preds for items with no prev_utteance
-                if prev_utt == '':
-                    li_da = None
-                    dict_da = None
 
-                else:
-                    #this prev_utt is added as context  to all the edus for a given long utterance
-                    if len(li_uttedu) < 2:
-                        li_input = [ [prev_utt, curr_utt ] ]
-                        
-                    # If more than 2 EDUs we evaluate each EDU and the complete utterance
-                    elif len(li_uttedu) >= 2:
-                        li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
-
-                    if len(li_uttedu) == 1 :
-                        encoded_input =  tokenizer(*li_input[0], add_special_tokens=True, padding='max_length', 
-                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
-                    else:
-                        encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
-                        truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                li_dict_da = []
+                li_li_da = []
+                for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttdu):
                     
+                    #skipping preds for items with no prev_utteance
+                    if prev_utt == '':
+                        li_da = None
+                        dict_da = None
 
-                    pred_da = danet_module.forward(encoded_input)
-                    pred_da = torch.sigmoid( pred_da )
-
-                    # Reducing the pred_da to one prediction
-                        # Take the maximum for each da label if
-                    max_values, _ = torch.max(pred_da,axis=0)
-                    pred_da = torch.where(max_values>=0.5, max_values, torch.mean( pred_da, axis=0) )
-
-                    # Formatting predictions to atain a list and a dictionary of da scores
-                    res = danet_module.format_preds( torch.unsqueeze(pred_da,axis=0), logits=False)
-                    li_da = res[0][0]
-                    dict_da = res[1][0]
+                    else:
+                        #this prev_utt is added as context  to all the edus for a given long utterance
+                        if len(li_uttedu) < 2:
+                            li_input = [ [prev_utt, curr_utt ] ]
                             
-                li_li_da.append(li_da)
-                li_dict_da.append(dict_da)
+                        # If more than 2 EDUs we evaluate each EDU and the complete utterance
+                        elif len(li_uttedu) >= 2:
+                            li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
+
+                        if len(li_uttedu) == 1 :
+                            encoded_input =  tokenizer(*li_input[0], add_special_tokens=True, padding='max_length', 
+                            truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                        else:
+                            encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                            truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                        
+
+                        pred_da = danet_module.forward(encoded_input)
+                        pred_da = torch.sigmoid( pred_da )
+
+                        # Reducing the pred_da to one prediction
+                            # Take the maximum for each da label if
+                        max_values, _ = torch.max(pred_da,axis=0)
+                        pred_da = torch.where(max_values>=0.5, max_values, torch.mean( pred_da, axis=0) )
+
+                        # Formatting predictions to atain a list and a dictionary of da scores
+                        res = danet_module.format_preds( torch.unsqueeze(pred_da,axis=0), logits=False)
+                        li_da = res[0][0]
+                        dict_da = res[1][0]
+                                
+                    li_li_da.append(li_da)
+                    li_dict_da.append(dict_da)
+                
+                    #sequence of vectors, vector=logit score for each da class           
+                
+
+                [
+                    _dict.update({'li_da':li_da }) for _dict, li_da in 
+                    zip( li_thread_utterances, li_li_da)
+                ]
+
+                # Removing the utterances where the reply_to is none, they were needed for DA prediction of the next utterance but should not be used as they have no context
+                li_thread_utterances = [ _dict for _dict in li_thread_utterances if _dict['reply_to'] != None]
+
+                batch_li_li_thread_utterances[i] = li_thread_utterances
             
-                #sequence of vectors, vector=logit score for each da class           
-            [
-                _dict.update({'li_da':li_da }) for _dict, li_da in 
-                zip( li_thread_utterances, li_li_da)
-            ]
-
-            # Removing the utterances where the reply_to is none, they were needed for DA prediction of the next utterance but should not be used as they have no context
-            li_thread_utterances = [ _dict for _dict in li_thread_utterances if _dict['reply_to'] != None]
-
-            batch_li_li_thread_utterances[i] = li_thread_utterances
         timer.end("DA")   
         #endregion
 
@@ -528,6 +579,83 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
         new_li_li_thread_utterances.append(new_li_thread_utterance)
     return new_li_li_thread_utterances
+
+
+def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
+
+    new_li_li_thread_utterances = []
+
+    for idx in range(len(li_li_thread_utterances)):
+
+        li_thread_utterances = li_li_thread_utterances[idx]
+
+        li_currutt =  danet_module.model.nem( [ _dict['txt_preproc'] for _dict
+                        in li_thread_utterances ] )
+
+        li_prevutt = danet_module.model.nem([ _select_utt_by_reply( _dict['reply_to'], li_thread_utterances) for _dict
+                        in li_thread_utterances ] )
+        li_li_uttdu = [ _dict['dus'] for _dict in li_thread_utterances ] #list of lists of the EDU sentences for a given utterance
+
+        li_dict_da = []
+        li_li_da = []
+
+        for curr_utt, prev_utt, li_uttedu in zip(li_currutt, li_prevutt, li_li_uttdu):
+            
+            #skipping preds for items with no prev_utteance
+            if prev_utt == '':
+                li_da = None
+                dict_da = None
+
+            else:
+                #this prev_utt is added as context  to all the edus for a given long utterance
+                if len(li_uttedu) < 2:
+                    li_input = [ [prev_utt, curr_utt ] ]
+                    
+                # If more than 2 EDUs we evaluate each EDU and the complete utterance
+                elif len(li_uttedu) >= 2:
+                    li_input = [ [ prev_utt, uttedu] for uttedu in li_uttedu  ]
+
+                if len(li_uttedu) == 1 :
+                    encoded_input =  tokenizer(*li_input[0], add_special_tokens=True, padding='max_length', 
+                    truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                else:
+                    encoded_input =  tokenizer(li_input, add_special_tokens=True, padding='max_length', 
+                    truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True)
+                
+                #encoded_input.to("cuda")
+
+                pred_da = danet_module.forward(encoded_input)
+                pred_da = torch.sigmoid( pred_da )
+
+                # Reducing the pred_da to one prediction
+                    # Take the maximum for each da label if
+                max_values, _ = torch.max(pred_da,axis=0)
+                pred_da = torch.where(max_values>=0.5, max_values, torch.mean( pred_da, axis=0) )
+
+                # Formatting predictions to atain a list and a dictionary of da scores
+                res = danet_module.format_preds( torch.unsqueeze(pred_da,axis=0), logits=False)
+                li_da = res[0][0]
+                dict_da = res[1][0]
+                        
+            li_li_da.append(li_da)
+            li_dict_da.append(dict_da)
+        
+            #sequence of vectors, vector=logit score for each da class           
+        
+
+        [
+            _dict.update({'li_da':li_da }) for _dict, li_da in 
+            zip( li_thread_utterances, li_li_da)
+        ]
+
+        # Removing the utterances where the reply_to is none, they were needed for DA prediction of the next utterance but should not be used as they have no context
+        li_thread_utterances = [ _dict for _dict in li_thread_utterances if _dict['reply_to'] != None]
+
+    new_li_li_thread_utterances.append(li_thread_utterances)
+    
+    return new_li_thread_utterance
+
+
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -806,11 +934,15 @@ if __name__ == '__main__':
 
     parser.add_argument('--start_batch', default=0, type=int)
 
+    parser.add_argument('--mp_damodules', default=3, type=int)
+
     args = parser.parse_args()
     
     dict_args = vars(args)
 
     completed = False
+    #set_start_method('spawn')
+
     while completed == False:
         try:
             main( **dict_args )
@@ -830,4 +962,4 @@ if __name__ == '__main__':
 
     #last bacth = 105
 #python3 -bps 20 --mp_count 16 --danet_name DaNet_v008
-#CUDA_VISIBLE_DEVICES=0 python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v009
+#CUDA_VISIBLE_DEVICES=1 python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v007

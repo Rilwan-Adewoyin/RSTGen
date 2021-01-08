@@ -1,0 +1,42 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${fileDirname}"
+        },
+        {
+            "name": "Pretrain",
+            "console": "integratedTerminal",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "cwd": "/home/u1862646/01_Mcv/mastering-conversation/rl_conv/pretrain/NLG"
+        },
+        {
+            "name": "Python: testing DaNet train",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": ["--workers","0", "--gpus","1", "--batch_size","400","--freeze_transformer","True", "--version_name","DaNet_v003","--test_only","True"]
+
+        },
+        {
+            "name": "Python: testing DaNet train 1",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "C:/Users/Rilwa/ 01_Mcv/MasteringConversation/rl_conv/pretrain/DialogueAct"
+        }
+    ]
+}
