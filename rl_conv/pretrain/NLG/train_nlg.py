@@ -4,15 +4,15 @@ import os
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
 #os.environ['NCCL_P2P_DISABLE'] = '1'
 #TODO: adding caching
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import multiprocessing as mp
+
 import numpy as np
 import warnings
 import sklearn
 import gc
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 import glob
 import pandas as pd
@@ -144,7 +144,7 @@ def forward(
         # Since we need a 3D attn, an  implementation similar to the origin al GPT model is used
         # This allows different masking per batch
         attention_mask = attention_mask[:, None, :, :]
-        attention_mask = attention_mask.to(dtype=self.dtype) # fp16 compatibility
+        attention_mask = attention_mask.type_as(inputs_embeds) # fp16 compatibility
         attention_mask = (1.0 - attention_mask) *-10000.0
 
     # If a 2D ou 3D attention mask is provided for the cross-attention
@@ -252,16 +252,17 @@ class NLG(nn.Module):
         
         self.base_model_name = base_model_name   
         self.model_name = model_name
-        self.reset_base_transformer = reset_base_transformer
+        
 
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
-                
+        
+
         self.nlg_tokenizer = NLG_tokenizer(base_model_name,
                                 os.path.join( ("./models"), f"{model_name}_tokenizer"))
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
-        self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
+        #self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
 
         # Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -275,8 +276,9 @@ class NLG(nn.Module):
         self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
         self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
         
-
         self.loss_type = loss_type 
+        self.loss_fct = CrossEntropyLoss()
+        
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -309,10 +311,10 @@ class NLG(nn.Module):
         # Feed input to distilgpt2
         if self.loss_type == "CrossEntropy":      
             outputs = self.transformer( inputs_embeds=input_['input_embeds'],
-                                        attention_mask = input_['attn_mask'],
-                                        position_ids=input_['position_ids'], #check pos_ids are being removed
+                                        #attention_mask = input_['attn_mask'],
+                                        #position_ids=input_['position_ids'], #check pos_ids are being removed
                                         token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
-                                        return_dict=False )
+                                        return_dict=False)
         
         # Add LM head to model
             hidden_states = outputs[0]
@@ -321,13 +323,11 @@ class NLG(nn.Module):
             # must output loss 
             # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = input_['labels'][..., 1:].contiguous()
+            shift_labels = input_['labels'][..., 1:].contiguous() 
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-
-
+            
+            loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+ 
         elif self.loss_type == "UtteranceSimilarity":
             raise NotImplementedError
         
@@ -367,14 +367,14 @@ class NLG(nn.Module):
             ) #dim [bs, 1024, dim1]
         
         # token type embeddings
-        token_type_embedding = self.token_type_embeddings( input_['token_type_ids'])
+        token_type_embedding = self.token_type_embeddings( input_['token_type_ids'] )
 
         input_embeds += token_type_embedding
         input_['input_embeds'] = input_embeds
 
         # padding/shrinking input_embeds based on the max seq_len in batch
-        _ = input_embeds.shape
-        max_seq_len = torch.max( input_['seq_len'] )
+        #_ = input_embeds.shape
+        #max_seq_len = torch.max( input_['seq_len'] )
 
         #By default NLG tokenizer pads it to 1024, This gives the option to reduce it all down        
         # if truncate :
@@ -406,7 +406,6 @@ class NLG(nn.Module):
         params = {}
 
         params['base_model_name'] = self.base_model_name
-        params['reset_base_transformer'] = self.reset_base_transformer
         params['loss_type'] = self.loss_type 
 
         return params
@@ -423,7 +422,6 @@ class NLG(nn.Module):
         raise NotImplementedError
 
         return None
-
 class NLG_tokenizer():
     """Rough Implmentation of the tokenizer for the NLG model
 
@@ -480,6 +478,7 @@ class NLG_tokenizer():
             
             if str(special_tokens_dict['additional_special_tokens']) != \
                     self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens',''):
+                
                 num_added_toks = self.e2m_tokenizer.add_special_tokens(special_tokens_dict)
                 os.makedirs(dir_tokenizer)
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
@@ -527,7 +526,7 @@ class NLG_tokenizer():
         padding_dim = self.max_input_len - nopad_dim
         
             # creating mask
-        attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
+        attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))  #.type_as( )
                 #pre_utt masking
         attn_mask[ :drt_dim , :drt_dim ] = 1 
         
@@ -855,7 +854,6 @@ class NLG_tokenizer():
             diff = 0
 
         return tknzd_utt, diff
-
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
@@ -882,10 +880,18 @@ class TrainingModule(pl.LightningModule):
         
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
+            #self.model.transformer.training = True
+            
             self.create_data_loaders(self.workers)
             self.accumulate_grad_batches = accumulate_grad_batches
 
         if self.mode in ['train_new','train_cont']:
+            # Put the transformer in training mode
+            self.model.train(True)
+            self.model.transformer.train(True)
+            # for name, param in self.model.transformer.named_parameters():
+            #     param.requires_grad = True
+                #param.training=True
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
@@ -1006,7 +1012,7 @@ class TrainingModule(pl.LightningModule):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                     precision=16,
-                    accelerator='ddp',
+                    accelerator='ddp_spawn',
                     limit_train_batches = 0.4,
                     log_every_n_steps=1,                    
                     #track_grad_norm = True,
@@ -1074,7 +1080,7 @@ class TrainingModule(pl.LightningModule):
 
 
     def step(self, batch, step_name):
-      
+        
         input_= batch
         loss = self.forward(input_)
         loss_key = f"{step_name}_loss"
@@ -1109,6 +1115,7 @@ class TrainingModule(pl.LightningModule):
         return predicted_utterance
 
     def training_step(self, batch, batch_idx):
+        self.model.train(True)
         output = self.step(batch,"train")
         return output
 
@@ -1158,7 +1165,7 @@ class TrainingModule(pl.LightningModule):
     @lru_cache()
     def total_steps(self):
 
-        ds_size = self.train_dl.__len__() // self.gpus
+        ds_size = len(self.train_dl) // self.gpus
         steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
         return steps
 
@@ -1370,8 +1377,7 @@ class SingleDataset(torch.utils.data.Dataset):
 def main(tparams={}, mparams={}):
     gc.collect()
     torch.cuda.empty_cache()
-     
-           
+                
     # Defining Logger
     tb_logger = pl_loggers.TensorBoardLogger( 
                     save_dir = os.path.abspath(tparams['model_dir']),
@@ -1398,9 +1404,11 @@ if __name__ == '__main__':
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
     if tparams.gpus not in [0,1]:
+        #mp.set_start_method('spawn')
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
 
     main(vars(tparams), vars(mparams))
+
 
 # CUDA_DEVICES_AVAILABLE=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 1 
