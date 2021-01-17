@@ -45,27 +45,27 @@ import yaml
 import ast
 import types
 
-# #Monkey Patching the save module
-# #TODO: suggest this change on github pytorch lightning 
-# def monkey_save_model(self, filepath: str, trainer, pl_module):
-#     # in debugging, track when we save checkpoints
-#     trainer.dev_debugger.track_checkpointing_history(filepath)
+#Monkey Patching the save module
+#TODO: suggest this change on github pytorch lightning 
+def monkey_save_model(self, filepath: str, trainer, pl_module):
+    # in debugging, track when we save checkpoints
+    trainer.dev_debugger.track_checkpointing_history(filepath)
 
-#     # make paths
-#     if trainer.is_global_zero:
-#         self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
+    # make paths
+    if trainer.is_global_zero:
+        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-#     # delegate the saving to the trainer
-#     if self.save_function is not None:
-#         self.save_function(filepath, self.save_weights_only)
+    # delegate the saving to the trainer
+    if self.save_function is not None:
+        self.save_function(filepath, self.save_weights_only)
     
-#     self.to_yaml()
+    self.to_yaml()
 
-#     # torch.save({
-#     #     'epoch'
-#     # })
+    # torch.save({
+    #     'epoch'
+    # })
 
-# ModelCheckpoint._save_model = monkey_save_model
+ModelCheckpoint._save_model = monkey_save_model
 
 #Monkey patching the forward on distill bert
 def forward(
@@ -269,7 +269,7 @@ class NLG(nn.Module):
         self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1 )
         self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
         self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
-        self.token_type_embeddings = torch.nn.Embedding( 3 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
+        self.token_type_embeddings = torch.nn.Embedding( 4 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
                                             #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                             #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
         
@@ -880,18 +880,10 @@ class TrainingModule(pl.LightningModule):
         
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
-            #self.model.transformer.training = True
-            
             self.create_data_loaders(self.workers)
             self.accumulate_grad_batches = accumulate_grad_batches
 
         if self.mode in ['train_new','train_cont']:
-            # Put the transformer in training mode
-            self.model.train(True)
-            self.model.transformer.train(True)
-            # for name, param in self.model.transformer.named_parameters():
-            #     param.requires_grad = True
-                #param.training=True
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
@@ -920,6 +912,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
+        parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
         
             #TODO: check --version of required type None actually works
         tparams = parser.parse_known_args()[0]
@@ -995,7 +988,7 @@ class TrainingModule(pl.LightningModule):
                         default_root_dir=tparams['dir_checkpoints'],
                         check_val_every_n_epoch=1, logger=tb_logger,
                         log_every_n_steps=1,
-                        precision=16, callbacks=callbacks,
+                        precision=tparams['precision'], callbacks=callbacks,
                         accelerator='ddp',
                         limit_train_batches = 0.4,
                         #track_grad_norm = True,
@@ -1011,8 +1004,8 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(tparams,
                     check_val_every_n_epoch=1, logger=tb_logger,
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
-                    precision=16,
-                    accelerator='ddp_spawn',
+                    precision=tparams['precision'],
+                    accelerator='ddp',
                     limit_train_batches = 0.4,
                     log_every_n_steps=1,                    
                     #track_grad_norm = True,
@@ -1115,7 +1108,6 @@ class TrainingModule(pl.LightningModule):
         return predicted_utterance
 
     def training_step(self, batch, batch_idx):
-        self.model.train(True)
         output = self.step(batch,"train")
         return output
 
@@ -1409,6 +1401,4 @@ if __name__ == '__main__':
         os.environ['MASTER_PORT'] = '65302'
 
     main(vars(tparams), vars(mparams))
-
-
-# CUDA_DEVICES_AVAILABLE=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 1 
+# CUDA_VISIBLE_DEVICES=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 3 
