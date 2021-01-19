@@ -49,6 +49,7 @@ from utils import get_path
 
 import regex as re
 import multiprocessing as mp
+import distutils
 # import torch.multiprocessing as mp
 # from torch.multiprocessing import set_start_method
 
@@ -110,6 +111,7 @@ def main(danet_vname,
     
     #region  Setup    
     # setting up model for Da prediction
+    print(annotate_da)
     if annotate_da == True:
         model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
         checkpoint_dir = f'{model_dir}/logs'
@@ -372,14 +374,19 @@ def _load_data(reddit_dataset_version):
         corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
     elif reddit_dataset_version == 'large':
-        _list = [ 'relationship_advice', 'CasualConversation','interestingasfuck','penpals','science','askscience']
+        _list = [ 'CasualConversation' ] #,'interestingasfuck','penpals','science'] 
+            #'relationship_advice' (9,995,066,31Kb)
+            # CasualConversation 735,386,980
+            # interestingasfuck 354770199
+            # penpals 35372354
         
         for idx, subreddit in enumerate( _list ):
             if idx == 0:
-                merged_corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+                merged_corpus = Corpus(filename=download(f"subreddit-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
             else:
-                _corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+                _corpus = Corpus(filename=download(f"subreddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
                 merged_corpus.merge(_corpus)
+
         corpus = merged_corpus
     
     corpus.print_summary_stats()
@@ -874,13 +881,14 @@ if __name__ == '__main__':
 
     parser.add_argument('--mp_damodules', default=3, type=int)
 
-    parser.add_argument('--annotate_da',default=True, type=bool)
+    parser.add_argument('-ad','--annotate_da',default=True, type=lambda x: bool(int(x)) )
 
-    parser.add_argument('--annotate_rst',default=True, type=bool)
 
-    parser.add_argument('--annotate_topic',default=True, type=bool)
+    parser.add_argument('-ar','--annotate_rst',default=True, type=lambda x: bool(int(x)) ) 
 
-    parser.add_argument('--reddit_dataset_version',default='small', type=str, choices=['small','large'])
+    parser.add_argument('-at','--annotate_topic',default=True, type=lambda x: bool(int(x)) )
+
+    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=['small','large'])
 
     args = parser.parse_args()
     
@@ -910,6 +918,6 @@ if __name__ == '__main__':
 
 #CUDA_VISIBLE_DEVICES= python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v008
 
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
+#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 0 --mp_count 4
+#python3 -bps 120 --mp_count 4 --danet_name DaNet_v008 -sb
+#python3 -bps 120 --mp_count 4 --danet_name DaNet_v008 -sb
