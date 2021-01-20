@@ -35,10 +35,12 @@ import argparse
 import utils_nlg as utils
 import random 
 
-from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
+import transformers
+from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
-from transformers import Adafactor
-
+from transformers import Adafactor, AdamW
+#import torch_optimizer as optim
+#from torch import optim
 from pytorch_lightning import loggers as pl_loggers
 from collections import OrderedDict
 import yaml
@@ -47,25 +49,29 @@ import types
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
-def monkey_save_model(self, filepath: str, trainer, pl_module):
-    # in debugging, track when we save checkpoints
-    trainer.dev_debugger.track_checkpointing_history(filepath)
+# def monkey_save_model(self, filepath: str, trainer, pl_module):
+#     # in debugging, track when we save checkpoints
+#     trainer.dev_debugger.track_checkpointing_history(filepath)
 
-    # make paths
-    if trainer.is_global_zero:
-        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
+#     # make paths
+#     if trainer.is_global_zero:
+#         self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    # delegate the saving to the trainer
-    if self.save_function is not None:
-        self.save_function(filepath, self.save_weights_only)
+#     # delegate the saving to the trainer
+#     if self.save_function is not None:
+#         self.save_function(filepath, self.save_weights_only)
     
-    self.to_yaml()
+#    self.to_yaml()
 
-    # torch.save({
-    #     'epoch'
-    # })
+#ModelCheckpoint._save_model = monkey_save_model
 
-ModelCheckpoint._save_model = monkey_save_model
+def save_model_decorater(method):
+    def decorate_save_model(self=None):
+        return method(self) + self.to_yaml()
+    
+    return decorate_save_model
+
+
 
 #Monkey patching the forward on distill bert
 def forward(
@@ -239,6 +245,23 @@ def forward(
         raise NotImplementedError
 
 
+#Monkey patching approx_sq_grad 
+#@staticmethod
+# def _approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col):
+#     r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_()
+#     c_factor = exp_avg_sq_col.rsqrt()
+     
+#     # r_factor = r_factor.unsqueeze(-1)
+#     # c_factor = c_factor.unsqueeze(0)
+#     #raise Exception(f"{r_factor.shape}\n\n{c_factor.shape}")
+#     #return torch.matmul(r_factor, c_factor)
+#     #return torch.mm(r_factor, c_factor)
+    
+#     #return torch.mm(r_factor.unsqueeze(-1), c_factor.unsqueeze(0))
+#     #return torch.matmul(r_factor.unsqueeze(-1), c_factor.unsqueeze(0))
+#     return torch.mm( r_factor.reshape([ -1,1]) , c_factor.reshape([1,-1] ) )
+
+
 class NLG(nn.Module):
     """NLG unit
     """
@@ -246,32 +269,45 @@ class NLG(nn.Module):
     def __init__(self, 
         base_model_name= 'distilgpt2', model_name="NLG",
         reset_base_transformer=True, loss_type="CrossEntropy",
-        **kwargs):
+        fda=True, frst=True, ftopic=True, **kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
         
         self.base_model_name = base_model_name   
         self.model_name = model_name
         
-
+        self.fda = fda 
+        self.frst = frst
+        self.ftopic = ftopic
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
         
 
         self.nlg_tokenizer = NLG_tokenizer(base_model_name,
-                                os.path.join( ("./models"), f"{model_name}_tokenizer"))
+                                os.path.join( ("./models"), f"{model_name}_tokenizer"),
+                                fda=fda, frst=frst, ftopic=ftopic, **kwargs)
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
         self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
 
         # Embedding Layers
+        
         self.embd_outp_dim = self.transformer.config.n_embd
-        self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1 )
-        self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
-        self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
-        self.token_type_embeddings = torch.nn.Embedding( 4 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
+        if self.fda and self.frst:
+            self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1 )
+            self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
+            self.token_type_embeddings = torch.nn.Embedding( 4 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
                                             #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                             #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
+        
+        if self.fda == False and self.frst:
+            self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
+            self.token_type_embeddings = torch.nn.Embedding( 3 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
+                                            #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
+                                            #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
+        
+
+        self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
         
         self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
         self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
@@ -282,13 +318,24 @@ class NLG(nn.Module):
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
-        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
+        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
                 
         parser.add_argument('--base_model_name', default='distilgpt2', required=False)
         parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='NLG', required=False)
         parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
             choices=['CrossEntropy','UtteranceSimilarity']) 
+        
+        parser.add_argument( '-fda' ,'--fda', type= lambda x: bool(int(x) )
+             ,help="whether or not to include da in feature", default=True  )
+        
+        parser.add_argument( '-frst' ,'--frst', type= lambda x: bool(int(x) )
+             ,help="whether or not to include rst info in feature", default=True  )
+
+        parser.add_argument( '-ftopic' ,'--ftopic', type= lambda x: bool(int(x) )
+             ,help="whether or not to include topic info in feature", default=True  )
+        
+        parser.add_argument('-mil','--max_input_len', type=int, default=264)
         
         mparams = parser.parse_known_args( )[0]
        
@@ -305,7 +352,10 @@ class NLG(nn.Module):
         """
         
         # Creating embedded inputs and attention mask
-        input_ = self.layer_embedding( input_ )
+        if self.fda and self.frst:
+            input_ = self.layer_embedding( input_ )
+        elif self.fda==False and self.frst:
+                input_ = self.layer_embedding_exda( input_ )
         
         
         # Feed input to distilgpt2
@@ -374,11 +424,53 @@ class NLG(nn.Module):
         
         return input_
 
+    def layer_embedding_exda(self, input_):
+        """Performs the input embedding and token type embedding calcs
+
+        Args:
+            input_ ([type]): [description]
+
+        Returns:
+            input_embedded [type]: [description]
+            
+            Note: logic for token_type_ids embedding is usually performed in transformer, but has been moved here
+                since gpt-2 code indicates that 
+        """
+        # token embedding
+
+        rst_start_embed = self.transformer.wte( input_['rst_start_token'] ).unsqueeze(1)
+        rst_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ).permute(0,2,1) # (bs, channels, seq_len)
+
+        topics_phrase_embed = self.transformer.wte(input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
+        topics_score_embed = self.embedding_topics_score( input_['tnsr_topics_score']).permute(0,2,1)
+
+        topics_embed = topics_phrase_embed + topics_score_embed
+
+        utt_embed = self.transformer.wte(input_['tknzd_utt'] ) #TODO: Add positional encoding for each word too
+
+        input_embeds = torch.cat(
+            [rst_start_embed, rst_embed,
+             topics_embed,
+             utt_embed], axis = 1
+            ) #dim [bs, 1024, dim1]
+        
+        # token type embeddings
+        token_type_embedding = self.token_type_embeddings( input_['token_type_ids'] )
+
+        input_embeds += token_type_embedding
+        input_['input_embeds'] = input_embeds
+        
+        return input_
+
     def return_params(self):
         params = {}
 
         params['base_model_name'] = self.base_model_name
         params['loss_type'] = self.loss_type 
+        params['max_input_len'] = self.max_input_len
+        params['fda'] = self.fda
+        params['frst'] = self.frst
+        params['ftopic'] = self.ftopic
 
         return params
 
@@ -394,6 +486,7 @@ class NLG(nn.Module):
         raise NotImplementedError
 
         return None
+
 class NLG_tokenizer():
     """Rough Implmentation of the tokenizer for the NLG model
 
@@ -406,29 +499,53 @@ class NLG_tokenizer():
 
     def __init__(self,
                  e2m_base_model_name='distilgpt2',
-                 dir_tokenizer='./models/NLG_tokenizer'):
+                 dir_tokenizer='./models/NLG_tknzr',
+                 fda = True,
+                 frst = True,
+                 ftopic = True,
+                 max_input_len = 216,
+                 **kwargs
+                 ):
 
         self.e2m_base_model_name = e2m_base_model_name
 
-        # RST utilities
+        self.fda = fda
+        self.frst = frst
+        self.ftopic = ftopic
+
+        self.max_input_len = max_input_len #512 #self.e2m_tokenizer.max_len
+    
+        # Setting up RST utilities
             #TODO: add case when rel == 'n' when it could not be classified
-        self.rst_rel_li = ['Attribution',
-            'Background','Cause','Comparison','Condition',
-            'Contrast','Elaboration','Enablement','Evaluation',
-            'Explanation','Joint','Manner-Means','Topic-Comment',
-            'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
+        if self.frst:
+            self.rst_rel_li = ['Attribution',
+                'Background','Cause','Comparison','Condition',
+                'Contrast','Elaboration','Enablement','Evaluation',
+                'Explanation','Joint','Manner-Means','Topic-Comment',
+                'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
 
 
-        self.rst_rel_binarizer = sklp.MultiLabelBinarizer()
-        self.rst_rel_binarizer.fit( [ self.rst_rel_li ] )
+            self.rst_rel_binarizer = sklp.MultiLabelBinarizer()
+            self.rst_rel_binarizer.fit( [ self.rst_rel_li ] )
 
-        self.rst_ns_li = ['NN','NS','SN','a'] #TODO: add this to config
-        self.rst_ns_binarizer = sklp.MultiLabelBinarizer()
-        self.rst_ns_binarizer.fit( [ self.rst_ns_li ] )
+            self.rst_ns_li = ['NN','NS','SN','a'] #TODO: add this to config
+            self.rst_ns_binarizer = sklp.MultiLabelBinarizer()
+            self.rst_ns_binarizer.fit( [ self.rst_ns_li ] )
 
-        self.context_len = { 'da':2, 'rst':8, 'topics':16, 'utt':208 } #add this to config
+        # Setting up context lengths
+        if self.fda and self.frst and self.ftopic:
+            self.context_len = { 'da':2, 'rst':8, 'topics':16 } #add this to config
+        
+        elif self.fda==False and self.frst and self.ftopic:
+                self.context_len = { 'rst':6, 'topics':14 } #add this to config
+        
+        self.context_len['utt'] = self.max_input_len - sum(self.context_len.values())
+
+        #print(self.context_len)
+
         
         # Initalising tokenzier
+
         if os.path.isdir(dir_tokenizer):
             self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_tokenizer)
 
@@ -444,9 +561,16 @@ class NLG_tokenizer():
             elif exists==False:
                 self.e2m_tokenizer = AutoTokenizer.from_pretrained(self.e2m_base_model_name)
                 config = AutoConfig.from_pretrained(self.e2m_base_model_name)
-            
+
+            # Adding special tokens
             special_tokens_dict = {'additional_special_tokens':
-                    ['<|da|>','<|rst|>','<|ta|>']}
+                    []}
+            if self.fda:
+                special_tokens_dict['additional_special_tokens'].append('<|da|>')
+            if self.frst:
+                special_tokens_dict['additional_special_tokens'].append('<|rst|>')
+            if self.ftopic:
+                special_tokens_dict['additional_special_tokens'].append('<|ta|>')
             
             if str(special_tokens_dict['additional_special_tokens']) != \
                     self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens',''):
@@ -456,77 +580,24 @@ class NLG_tokenizer():
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
                 config.save_pretrained(dir_tokenizer)
 
-        self.max_input_len = 216 #512 #self.e2m_tokenizer.max_len
-    
-    def encode_v1( self, das ,rst_rels, rst_ns, rst_pos,
-        topics, topics_score, utterance ,prev_das=None, prev_rst=None):
 
-        """Return 
-
-            attn_mask : Bidirectional up to bos token, Causal Up till EOS, 0s till end of padding
-
-        Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
-            and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
-        """
+    def __call__(self, das=None, rst_rels=None, topics=None, topics_score=None, 
+                    utterance=None, prev_das=None, prev_rst=None):
         
-        #Getting Vectors
-        tnsr_das = self.encode_da( das ) #dims (n2, 20), (n2,) # Use an upscaling convolution layer  and an embedding layer
-        tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst(rst_rels, rst_ns, rst_pos)   # dims (n1, 13) (n1, 3) (n1,) # Use an upscaling convolution layer, upscaling convolution layer, embedding layer  
-        tnsr_topics_phrase, tnsr_topics_score = self.encode_topic( topics, topics_score) #dims (n3, ) (n3, )  # Use an embedding layer E, upscaling convolutional layer
-        tknzd_utt = self.encode_utterance(utterance)
-            #This will already have a EOS token
-            #TODO: make sure to remove CLS token
+        if self.fda and self.frst and self.ftopic:
 
-        #Getting Special Tokens
-        da_start_token = self.e2m_tokenizer.encode('<|da|>')
-        rst_start_token = self.e2m_tokenizer.encode("<|rst|>") 
-        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") # 
+            outp = self.encode_v2(das ,rst_rels,topics, topics_score, 
+                    utterance)
         
-                
-        # Building Attention Mask
-            #da rst topics dimension length
-        drt_dim = tnsr_das.shape[0] + \
-                      tnsr_rst_rels.shape[0]+ \
-                      tnsr_topics_phrase.shape[1]+ \
-                      2 # da, rst, ta, tokens
-            #utterance dimension len
-        utt_dim = tknzd_utt.shape[1]
+        elif self.fda==False and self.frst and self.ftopic:
+            
+            outp = self.encode_v2_exda(rst_rels, topics, topics_score, 
+                    utterance)
+        else:
+            NotImplementedError
+            
+        return outp
 
-            # padding dimension
-        nopad_dim = drt_dim + utt_dim
-        
-        padding_dim = self.max_input_len - nopad_dim
-        
-            # creating mask
-        attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))  #.type_as( )
-                #pre_utt masking
-        attn_mask[ :drt_dim , :drt_dim ] = 1 
-        
-                #padding masking
-        attn_mask[ -padding_dim: , : ] = 0 
-                #utt_dim
-        attn_mask[ drt_dim:drt_dim+utt_dim, drt_dim:drt_dim+utt_dim] \
-                    = torch.tril(torch.ones([ utt_dim,utt_dim])) 
-
-
-        #Creating labels/targets for GPT Language Model Head
-        labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
-        labels[0][drt_dim:nopad_dim] = tknzd_utt[0]
-
-        #Method 1a: RST: -> pad each rst subtype to the first 4/8 elements
-        #Method 1b: tnsr_topic and tnsr score -> pad each one to 10 elements
-        #Method 1c: tknzd_utt -> padd to 100 length 
-        #Method 1d: correct the attn_mask
-
-        # Full information Version
-        return { 'da_start_token':da_start_token, 'tnsr_das':tnsr_das,
-                 'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,'tnsr_rst_ns':tnsr_rst_ns,'tnsr_rst_pos':tnsr_rst_pos,
-                 'tnsr_topics_phrase':tnsr_topics_phrase, 'tnsr_topics_score': tnsr_topics_score,
-                 'tknzd_utt':tknzd_utt,
-                 'padding_token':padding_token, 'padding_count':padding_dim,
-                 'attn_mask':attn_mask,
-                 'labels':labels}
-  
     def encode_v2( self, das ,rst_rels,topics, topics_score, 
                     utterance, prev_das=None, prev_rst=None):
 
@@ -557,7 +628,7 @@ class NLG_tokenizer():
         tnsr_das = self.encode_da( das ) #dims (1, 20), 
         tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=rst_len - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
         tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=topics_len, padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, max_padding=utt_len, padding_token=padding_token)
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, max_len=self.context_len['utt'], padding_token=padding_token)
                             
         # Building Attention Mask
 
@@ -598,6 +669,10 @@ class NLG_tokenizer():
         
         if padding_len>0:
             labels[0][drt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
+        
+        elif padding_len == 0:
+            labels[0][drt_dim:utt_dim] = tknzd_utt[:utt_dim- drt_dim]
+
         else:
             labels[0][drt_dim:utt_dim] = tknzd_utt[ : utt_dim- drt_dim ]
 
@@ -611,6 +686,8 @@ class NLG_tokenizer():
         if padding_len>0:
             position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
             position_ids = torch.cat([position_ids_drt,position_ids_utt, position_ids_pad], axis=-1)
+        elif padding_len == 0:
+            position_ids = torch.cat([position_ids_drt,position_ids_utt], axis=-1)
         else:
             position_ids = torch.cat([position_ids_drt,position_ids_utt[:padding_len]], axis=-1)
 
@@ -632,6 +709,9 @@ class NLG_tokenizer():
             token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
             token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
                                 token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
+        elif padding_len == 0:
+            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
+                    token_type_ids_t, token_type_ids_utt] ) 
 
         else:
             token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
@@ -649,24 +729,133 @@ class NLG_tokenizer():
                  'seq_len':torch.IntTensor( [seq_len] )
                  }
 
-    def encode_rst(self, rst_rels, rst_ns, rst_pos):
-        """Converts the three lists into a seeries of vectors
+    def encode_v2_exda( self,rst_rels,topics, topics_score, 
+                    utterance, prev_das=None, prev_rst=None):
 
-        Args:
-            rst_rels ([type]): [description]
-            rst_ns ([type]): [description]
-            rst_pos ([type]): [description]
+        """
+            This version is a smaller output space than v1, by dropping rst_pos and rst_ns
+            Return 
+            w/o da
+            dictionary
+            attn_mask : Bidirectional up to bos token, Causal Up till EOS, 0s till end of padding
+
+        Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
+            and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
         """
         
-        rst_rel_encoded = self.rst_rel_binarizer.transform(rst_rels)
-        rst_ns_encoded = self.rst_ns_binarizer.transform( rst_ns )
-        rst_pos = rst_pos
+        #Getting Special Tokens
+        rst_start_token = self.e2m_tokenizer.encode("<|rst|>")[0] 
+        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") 
 
-        tnsr_rels = torch.FloatTensor( rst_rel_encoded )
-        tnsr_ns = torch.from_numpy( rst_ns_encoded )    #dim [ n, encode_dim2]
-        tnsr_pos = torch.FloatTensor( rst_pos )          #dim [ n, encode_dim3]
+        #Defining max len for subsections
+        rst_len = self.context_len['rst']
+        topics_len = self.context_len['topics'] # This means at least topics_len/2 topics included
+        utt_len = self.context_len['utt']
 
-        return tnsr_rels, tnsr_ns, tnsr_pos
+        #Getting Vectors
+        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=rst_len - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=topics_len, padding_token=padding_token) # dims (max_padding, 13) 
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, max_len=self.context_len['utt'],
+                                    padding_token=padding_token)
+                            
+        # Building Attention Mask
+
+            # calc the ending cumulative dim for, rst, topics, utt, segments,
+        r_dim = rst_len       # tnsr_rst_rels.shape[0]
+        rt_dim = r_dim +topics_len    # dr_dim + tnsr_topics_phrase.shape[1]
+        utt_dim = rt_dim + utt_len  
+
+            # padding dimensions (after utterance end)
+        seq_len =  utt_dim 
+        padding_len = self.max_input_len - utt_dim 
+
+        if padding_len>0:
+            tknzd_utt = torch.cat( [tknzd_utt, torch.LongTensor(padding_token).repeat(padding_len)] )
+        elif padding_len == 0:
+            pass
+        else:
+            tknzd_utt  = tknzd_utt[:padding_len]
+
+            # creating mask
+        attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
+                    #pre_utterance general masking
+        attn_mask[ :rt_dim , :rt_dim ] = 1 
+
+                    #correcting for padding in rst section
+        attn_mask[ r_dim-rst_pad_count:r_dim ,:] = 0
+        attn_mask[ :, r_dim-rst_pad_count:r_dim] = 0
+
+                    #correcting for padding in topic section
+        attn_mask[ rt_dim-topics_pad_count: rt_dim, :  ] = 0
+        attn_mask[ :, rt_dim-topics_pad_count: rt_dim ] = 0
+                
+                #correcting for padding in and after utterance section
+        attn_mask[ utt_dim-utt_pad_count: , : ] = 0
+
+        #Creating labels/targets for GPT Language Model Head
+        labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
+        
+        if padding_len>0:
+            labels[0][rt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
+        
+        elif padding_len == 0:
+            labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
+        
+        else:
+            labels[0][rt_dim:utt_dim] = tknzd_utt[ : utt_dim- rt_dim ]
+
+        # Creating Positional Emebeddings
+            # ALL words in drt get a positional encoding of 0 -> No positional meaning
+            # utterance has normal positional encoding        
+        position_ids_rt = torch.zeros([rt_dim], dtype=torch.long) 
+        position_ids_utt =  torch.arange( 1, utt_dim-rt_dim + 1  , dtype=torch.long)
+        
+
+        if padding_len>0:
+            position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
+            position_ids = torch.cat([position_ids_rt,position_ids_utt, position_ids_pad], axis=-1)
+        
+        elif padding_len==0:
+            position_ids = torch.cat([position_ids_rt,position_ids_utt], axis=-1)
+        
+        else:
+            position_ids = torch.cat([position_ids_rt,position_ids_utt[:padding_len]], axis=-1)
+
+        # Creating Token Type Ids
+            # 1:da, 
+            # 2:rst, 
+            # n<m for each word in each topic phrase i of length m_i including leading <ta> where 4>=n>=4+topics_len//2
+            # 3:utterance part
+
+        token_type_ids_r = torch.zeros( [rst_len], dtype=torch.long) + 1
+        token_type_ids_utt = torch.zeros( [utt_len], dtype=torch.long ) + 2
+        
+        _ = torch.zeros( [topics_len ], dtype=torch.long)
+        _[ ta_tokens_pos ] = 1
+        token_type_ids_t =  _.cumsum(axis=0) + 2
+
+        if padding_len>0:
+            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
+            token_type_ids = torch.cat( [token_type_ids_r,\
+                                token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
+        elif padding_len==0:
+            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
+            token_type_ids = torch.cat( [token_type_ids_r,\
+                                token_type_ids_t, token_type_ids_utt] ) 
+        else:
+            token_type_ids = torch.cat( [token_type_ids_r,\
+                                token_type_ids_t, token_type_ids_utt[:padding_len] ] ) 
+
+
+        return { 'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,
+                 'tnsr_topics_phrase':tnsr_topics_phrase, 'tnsr_topics_score': tnsr_topics_score,
+                 'tknzd_utt':tknzd_utt,
+                 'attn_mask':attn_mask,
+                 'labels':labels,
+                 'position_ids':position_ids,
+                 'token_type_ids':token_type_ids,
+                 'seq_len':torch.IntTensor( [seq_len] )
+                 }
 
     def encode_rst_v2(self,rst_rels, max_padding=8):
         """Converts rst_rels in a series of vectors
@@ -700,45 +889,6 @@ class NLG_tokenizer():
         tnsr_das = torch.unsqueeze( torch.FloatTensor( das), axis=-1 ) #dim [encode_dim1, 1]
         
         return tnsr_das
-
-    def encode_topic(self, topics, topics_score):
-        """[summary]
-
-        Args:
-            topics ([type]): [list of topics (phrases or words)]
-            topics_score ([type]): [list of float scores for each topic relevancy]
-
-        Raises:
-            Exception: [description]
-
-        Returns:
-            [type]: [description]
-        """
-        str_topics = ''.join([ '<|ta|>'+topic  for topic in topics ])
-        dict_encoding = self.e2m_tokenizer(str_topics, add_special_tokens=False,
-                                                 return_attention_mask = False, 
-                                                 truncation = True,
-                                                 padding='do_not_pad', 
-                                                 return_tensors='np',
-                                                 return_token_type_ids=None,
-                                                 return_special_tokens_mask=False,
-                                                 return_length=True) # shape () topic_count, )
-        tnsr_topic_phrases = dict_encoding['input_ids']
-        
-        #Repeating each score in the case where the score is allocated to a phrase topic which is broken down into constituent words
-                # e.g. topics - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
-                # have to do it after tokenization due to bytepair encoding 
-            # get index of where <|ta|> idxs occur
-        ta_idxs = np.where( tnsr_topic_phrases[0]==self.e2m_tokenizer('<|ta|>',return_attention_mask=False)['input_ids'] )[0]
-            #get difference in index position between <|ta|> tag n and <|ta|> tag n+1 ( for final tag use difference between tag and end of list)
-        ta_phrase_lens = np.diff( ta_idxs, append=dict_encoding['length'] ) 
-            # copies each score phrase_len time and handles case where there is 
-        topics_score = [ [score]*phrase_len for score, phrase_len in zip(topics_score, ta_phrase_lens) ]
-        topics_score = sum(topics_score,[]) #flattening list
-
-        tnsr_score = torch.unsqueeze( torch.FloatTensor( topics_score ) , dim=0 ) # shape (topic_count, )
-        # tnr_topic = torch.cat( [tnsr_topics_phrase, tnsr_score], axis=1 )
-        return torch.FloatTensor(tnsr_topic_phrases), tnsr_score
 
     def encode_topic_v2(self, topics, topics_score, max_padding=16, padding_token="<|endoftext|>"):
         """[summary]
@@ -794,17 +944,7 @@ class NLG_tokenizer():
 
         return topic_phrases , tnsr_score, diff, ta_idxs
 
-
-    def encode_utterance(self, utterance, max_padding=208):
-        tknzd_utt = self.e2m_tokenizer( '<|endoftext|>' +utterance + '<|endoftext|>' ,add_special_tokens=True,
-                                        return_attention_mask = False, 
-                                        padding='do_not_pad', truncation=True, 
-                                        return_tensors='pt',
-                                        return_token_type_ids=None)['input_ids']
-        
-        return tknzd_utt
-
-    def encode_utterance_v2(self, utterance, max_padding=208, padding_token='<|endoftext|>'):
+    def encode_utterance_v2(self, utterance, max_len=208, padding_token='<|endoftext|>'):
         
         utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
         encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
@@ -817,15 +957,21 @@ class NLG_tokenizer():
         
         tknzd_utt = encoded['input_ids'][0]
         _len = encoded['length']
-        diff = (max_padding - _len)[0]
+        diff = (max_len - _len)[0]
         
         if diff>0:
             tknzd_utt = torch.cat( [ tknzd_utt, torch.ones([diff], dtype=torch.int64)*padding_token[0]] )
+        
+        elif diff == 0:
+            pass
+            
+
         else:
-            tknzd_utt = tknzd_utt[:max_padding]
+            tknzd_utt = tknzd_utt[:max_len]
             diff = 0
 
         return tknzd_utt, diff
+
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
@@ -833,12 +979,13 @@ class TrainingModule(pl.LightningModule):
                     accumulate_grad_batches=1,
                     max_epochs=100,
                     gpus=1, 
-                    learning_rate=1e-4,
+                    learning_rate=1e-3,
                     warmup_proportion=0.1,
                     workers=0,
                     lr_schedule='hard_restarts',
                     mode = 'train_new',
                     data_splits = {'train':0.6,'val':0.2,'test':0.2},
+                    optimizer_type="AdamW",
                     *args,
                     **kwargs):
         super().__init__()
@@ -849,6 +996,7 @@ class TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.data_splits = data_splits
+        self.optimizer_type = optimizer_type
         
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
@@ -870,7 +1018,7 @@ class TrainingModule(pl.LightningModule):
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
-        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
+        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--dir_data', default="./dataset/reddit_small_mc", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=80, type=int)
@@ -878,13 +1026,14 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-bs','--batch_size', default=5, type=int)
         parser.add_argument('--learning_rate', default=2e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.15)
-        parser.add_argument('--workers', default=0, type=int) #TODO: change to 6
+        parser.add_argument('--workers', default=16, type=int) #TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
-        parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
+        parser.add_argument('--lr_schedule', default='constant', required=False, choices =['LROnPlateau','hard_restarts','constant'])
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
+        parser.add_argument('-opt','--optimizer_type', default="AdamW",required=True, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         
             #TODO: check --version of required type None actually works
         tparams = parser.parse_known_args()[0]
@@ -906,32 +1055,39 @@ class TrainingModule(pl.LightningModule):
         elif tparams['mode'] in ["test", "train_cont", "inference"]:
             
             #Retreiving best checkpoint from specific model-version
-            checkpoint_yaml_file = os.path.join( tparams['dir_checkpoints'],"best_k_models.yaml" )
-            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
-            best_ckpt_path = min(scores_dict, key=scores_dict.get)
+            # checkpoint_yaml_file = os.path.join( tparams['dir_checkpoints'],"best_k_models.yaml" )
+            # scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            # best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
-            if torch.cuda.is_available():
-                checkpoint = torch.load(best_ckpt_path)
-            else:
-                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))
+
+            # if torch.cuda.is_available():
+            #     checkpoint = torch.load(best_ckpt_path)
+            # else:
+            #     checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))
+
+
+            checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
             #restore/update param files from the checkpoint
             tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'batch_size', 'lr_schedule', 'learning_rate']} )
+                'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type']} )
 
             mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name','reset_base_transformer','loss_type','model_name']} )
+                'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len']} )
 
+            del checkpoint
+            torch.cuda.empty_cache()
+            
             #Restore/update Training Module
-            training_module = TrainingModule(**vars(tparams), mparams=mparams)
-            training_module.load_state_dict(checkpoint['state_dict'])
-        
+            training_module = TrainingModule(**tparams, model_params=mparams)
+            
+
         else:
             raise ValueError("tparams['mode'] must be in range [train_new, train_cont, test, inference]")
         return training_module
 
     @staticmethod
-    def instatiate_trainer( tparams, tb_logger):
+    def instatiate_trainer( tparams, tb_logger, training_module):
         """[summary]
 
             Creates The Trainer and callbacks
@@ -943,10 +1099,13 @@ class TrainingModule(pl.LightningModule):
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
         
+        #checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
+        checkpoint_callback._save_model = save_model_decorater(checkpoint_callback._save_model)
+
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=8,
+            patience=30,
             verbose=False,
             mode='auto'
         )
@@ -962,7 +1121,7 @@ class TrainingModule(pl.LightningModule):
                         log_every_n_steps=1,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator='ddp',
-                        limit_train_batches = 0.4,
+                        limit_train_batches = 0.5,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -973,13 +1132,15 @@ class TrainingModule(pl.LightningModule):
             #restoring checkpoint             
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
-            trainer = pl.Trainer.from_argparse_args(tparams,
-                    check_val_every_n_epoch=1, logger=tb_logger,
+            training_module.load_state_dict(checkpoint['state_dict'])
+
+            trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
-                    precision=tparams['precision'],
+                    check_val_every_n_epoch=1, logger=tb_logger,
+                    log_every_n_steps=1,   
+                    precision=tparams['precision'],callbacks=callbacks,
                     accelerator='ddp',
-                    limit_train_batches = 0.4,
-                    log_every_n_steps=1,                    
+                    limit_train_batches = 0.5,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
@@ -1006,8 +1167,12 @@ class TrainingModule(pl.LightningModule):
 
             # restore the lr schedulers
             lr_schedulers = checkpoint['lr_schedulers']
+
             for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
                 scheduler['scheduler'].load_state_dict(lrs_state)
+
+            del checkpoint
+            torch.cuda.empty_cache()
 
         return trainer
     
@@ -1019,7 +1184,9 @@ class TrainingModule(pl.LightningModule):
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
             if torch.cuda.is_available():
-                checkpoint = torch.load(best_ckpt_path)
+                #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage) )
+                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))  
+                                
             else:
                 checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))            
         else:
@@ -1111,7 +1278,9 @@ class TrainingModule(pl.LightningModule):
     def create_data_loaders(self, shuffle=False, **kwargs):
        
         dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.model.nlg_tokenizer, 
-            workers=self.workers, mode=self.mode, split=self.data_splits )
+                workers=self.workers, mode=self.mode, split=self.data_splits,
+                fda=self.model.fda, frst=self.model.frst,
+                ftopic=self.model.ftopic)
         _dict_dl = dg()
         self.train_dl = _dict_dl['train_dl']
         self.val_dl = _dict_dl['val_dl']
@@ -1134,29 +1303,32 @@ class TrainingModule(pl.LightningModule):
         return steps
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        #optimizer = Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
+        
+        if self.optimizer_type == "AdamW":
+            
+            optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
+            
+            warmup_steps = self.warmup_proportion*self.total_steps()
 
-        total_steps = self.total_steps()
-        warmup_steps = int( total_steps * self.warmup_proportion )
+            lr_schedule = transformers.get_constant_schedule_with_warmup( optimizer, warmup_steps )
 
-        if self.lr_schedule == "hard_restarts" :
-            lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps,
-                num_cycles = 3)
+            return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step"}]
+        
+        elif self.optimizer_type == "Adafactor":
+                    # optimizer = Adafactor(
+        #     self.model.parameters(), lr=self.learning_rate,
+        #     eps=(1e-30, 1e-3),
+        #     clip_threshold=1.0,
+        #     decay_rate=-0.8,
+        #     beta1=None,
+        #     weight_decay=0.0,
+        #     relative_step=False,
+        #     scale_parameter=True,
+        #     warmup_init=False
+        # )
 
-        elif self.lr_schedule == "LROnPlateau":
-            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
-
-        return [optimizer], [{"scheduler": lr_scheduler, "interval": "epoch", "monitor":"val_loss"}]
-
-    def get_progress_bar_dict(self):
-        # don't show the version number
-        items = super().get_progress_bar_dict()
-        items.pop("v_num", None)
-        return items
+            # return [optimizer]
+            raise NotImplementedError
 
     def return_params(self):
         params = {}
@@ -1166,6 +1338,7 @@ class TrainingModule(pl.LightningModule):
         params['learning_rate'] = self.learning_rate
         params['max_epochs'] = self.max_epochs
         params['warmup_proportion'] = self.warmup_proportion 
+        params['optimizer_type'] = self.optimizer_type
 
         return params
 
@@ -1176,6 +1349,7 @@ class DataLoaderGenerator():
                     tokenizer, 
                     workers=0, mode='train_new',
                     splits={'train':0.6,'val':0.2,'test':0.2},
+                    fda=True, frst=True, ftopic=True,
                     **kwargs):
         
         self.dir_data = dir_data
@@ -1186,6 +1360,10 @@ class DataLoaderGenerator():
         self.bs = batch_size
         self.workers  = workers
         self.mode = mode
+
+        self.fda = fda
+        self.frst = frst 
+        self.ftopic = ftopic
 
     def prepare_dataloaders(self):
         """prepares a train, validation and test set
@@ -1247,7 +1425,7 @@ class DataLoaderGenerator():
             line_ends = files_sizes
             shuffle = False
 
-        li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end) 
+        li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end, self.fda, self.frst, self.ftopic) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
@@ -1262,6 +1440,95 @@ class DataLoaderGenerator():
         return dict_dl
     
 class SingleDataset(torch.utils.data.Dataset):
+    """creates a dataloader given a directory of text files each containing a conversation
+
+    """
+    def __init__(self, file_path, tokenizer, line_start, line_end, fda, frst, ftopic ):
+        self.fp = file_path
+        self.tokenizer = tokenizer
+        self.line_start = line_start
+        self.line_end = line_end
+
+        self.fda = fda
+        self.frst = frst 
+        self.ftopic = ftopic
+        
+        skiprows = self.line_start if self.line_start!=0 else None
+        with open(self.fp, 'r') as f:
+            if self.line_start == 0:
+            
+                self.data = pd.read_csv(file_path, sep=',', header=0, 
+                    skiprows =skiprows, nrows=(self.line_end-self.line_start) )
+            
+            else: 
+                #names = ['text','subreddit','txt_preproc','rst','li_da','topic_textrank']
+                names = open(file_path,"r").readline().strip().split(',')
+                            
+                self.data = pd.read_csv(file_path, sep=',', 
+                    names = names,
+                    skiprows =skiprows, nrows=(self.line_end-self.line_start) )
+                    
+    def __len__(self):
+        return (self.line_end - self.line_start)
+    
+    def __getitem__(self, index):
+        datum = self.data[index:index+1]
+
+        #Dialogue Act
+        if self.fda:
+            das = json.loads(datum['li_da'].values[0])
+        else:
+            das = None
+        #RST
+        if self.frst:
+            try:
+                li_rst = json.loads(datum['rst'].values[0])  #list of dictionaries 
+            
+            except json.decoder.JSONDecodeError as e:
+                li_rst = ast.literal_eval(datum['rst'].values[0])
+        
+            rst_rels = [ [ _dict['rel'] for _dict in li_rst ] ]
+            rst_ns = [ [_dict['ns']] for _dict in li_rst ]
+            rst_pos = [ _dict['pos'] for _dict in li_rst ]
+        
+        else:
+            rst_rels = None
+            rst_ns = None
+            rst_pos = None
+        
+        if self.ftopic:
+            #Topic scores
+            try:
+                topics_textrank = json.loads(datum['topic_textrank'].values[0])
+            except json.decoder.JSONDecodeError as e:
+                topics_textrank = ast.literal_eval(datum['topic_textrank'].values[0])
+
+            if len(topics_textrank)!=0: #TODO: remove later
+                topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
+            else:
+                topics = [""]
+                topics_score = [0.0]
+        else:
+            topics = None
+            topics_score = None
+        
+        #Utterance
+        utterance = datum['txt_preproc'].values[0].strip('\"')
+                    
+        encoded = self.tokenizer(das, rst_rels, topics, 
+                                    topics_score, utterance,
+                                    prev_das=None, prev_rst=None )      
+            # encoded May include some of the following
+            #( da_start_token, tnsr_das,    
+             #rst_start_token, tnsr_rst_rels,
+             #tnsr_topics_phrase, tnsr_topics_score, 
+             # tknzd_utt,
+             # attn_mask
+             # labels)
+        return encoded
+
+    
+class SingleDataset_exda(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
@@ -1317,19 +1584,9 @@ class SingleDataset(torch.utils.data.Dataset):
         
         #Utterance
         utterance = datum['txt_preproc'].values[0].strip('\"')
-        
-        #encoding inputs
-        #encoded = self.tokenizer.encode(das, rst_rels, rst_ns, rst_pos, topics, topics_score, utterance, prev_das=None, prev_rst=None )
-            #( da_start_token, tnsr_das,    
-             #rst_start_token, tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos,
-             #tnsr_topics_phrase, tnsr_topics_score, 
-             # tknzd_utt,
-             # padding_token, padding_count,
-             # attn_mask
-             # labels)
-            
-            #v2 does not include rst_ns and rst_pos
-        encoded = self.tokenizer.encode_v2(das, rst_rels, topics, topics_score, utterance, prev_das=None, prev_rst=None )      
+                    
+        encoded = self.tokenizer(das, rst_rels, topics, topics_score, utterance, prev_das=None, prev_rst=None )      
+            # encoded May include some of the following
             #( da_start_token, tnsr_das,    
              #rst_start_token, tnsr_rst_rels,
              #tnsr_topics_phrase, tnsr_topics_score, 
@@ -1338,9 +1595,18 @@ class SingleDataset(torch.utils.data.Dataset):
              # labels)
         return encoded
 
+
 def main(tparams={}, mparams={}):
     gc.collect()
     torch.cuda.empty_cache()
+
+    #Adapting Model Name to handle testing of different scenarios
+    if not mparams['fda']:
+        mparams['model_name'] = f"{mparams['model_name']}_exda"
+    if not mparams['frst']:
+        mparams['model_name'] = f"{mparams['model_name']}_exrst"
+    if not mparams['ftopic']:
+        mparams['model_name'] = f"{mparams['model_name']}_extopic"
                 
     # Defining Logger
     tb_logger = pl_loggers.TensorBoardLogger( 
@@ -1355,11 +1621,11 @@ def main(tparams={}, mparams={}):
 
     # initiating training loop
     training_module = TrainingModule.instatiate_training_module( tparams, mparams)
-    trainer = TrainingModule.instatiate_trainer( tparams,  tb_logger)
+    trainer = TrainingModule.instatiate_trainer( tparams,  tb_logger, training_module)
     TrainingModule.start(trainer, tparams, training_module)
                 
 if __name__ == '__main__':
-    parent_parser = argparse.ArgumentParser(add_help=False) 
+    parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False) 
     
     # add model specific args
     mparams = NLG.parse_model_specific_args(parent_parser)
@@ -1373,4 +1639,9 @@ if __name__ == '__main__':
         os.environ['MASTER_PORT'] = '65302'
 
     main(vars(tparams), vars(mparams))
+
+
 # CUDA_VISIBLE_DEVICES=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 3 
+
+# Training with no DA
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train_nlg.py -bs 28 -agb 3 --gpus 4 -fda 0 --workers 16

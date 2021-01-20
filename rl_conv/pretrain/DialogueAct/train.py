@@ -575,7 +575,7 @@ class SingleDataset(torch.utils.data.Dataset):
             self.data = pd.read_csv(file_path, sep='|', header=0)
             self.lines = len(self.data)
             self.data = self.data.T.values.tolist()
-            li_speakers, self.li_utterances, self.li_das = self.data
+            _, self.li_utterances, self.li_das = self.data
             #self.li_utterances = list(self.nem(self.li_utterances))
                 
     def __len__(self):
@@ -670,9 +670,11 @@ def main(tparams, mparams):
         
     # Making training module
     elif tparams.mode in ["test","train_cont"]:
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path,map_location=torch.device('cpu'))  
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
+
+        #training_module.to(device)
 
         trainer = pl.Trainer.from_argparse_args(tparams, progress_bar_refresh_rate=tparams.accumulate_grad_batches,
                     check_val_every_n_epoch=1, logger=tb_logger,
@@ -712,6 +714,10 @@ def main(tparams, mparams):
         lr_schedulers = checkpoint['lr_schedulers']
         for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
             scheduler['scheduler'].load_state_dict(lrs_state)
+
+        del checkpoint
+        torch.cuda.empty_cache()
+        
 
     if tparams.mode in ["train_new","train_cont"]:    
         trainer.fit(training_module)
