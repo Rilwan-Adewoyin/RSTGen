@@ -169,7 +169,7 @@ def main(danet_vname,
     #Creating Save directory
     if reddit_dataset_version == "small":
         dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_annotated",_dir=True)
-    elif reddit_dataset_version == "large":
+    else: 
         dir_save_dataset = utils_nlg.get_path("./dataset/reddit_large_annotated",_dir=True)
 
     # setting up corpus data
@@ -369,7 +369,7 @@ def _load_data(reddit_dataset_version):
     if reddit_dataset_version == 'small':
         _dir_path = utils_nlg.get_path("./dataset/reddit_small")
     
-    elif reddit_dataset_version == 'large':
+    else:
         _dir_path = utils_nlg.get_path("./dataset/reddit_large")
 
     os.makedirs(_dir_path, exist_ok=True)
@@ -380,8 +380,9 @@ def _load_data(reddit_dataset_version):
         use_local = os.path.exists(_dir_path)
         corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
-    elif reddit_dataset_version == 'large':
-        _list = [ 'CasualConversation','relationship_advice','interestingasfuck','science' ]
+    else:
+
+        #_list_options = [ 'CasualConversation','relationship_advice','interestingasfuck','science' ]
         #_list = ['interestingasfuck']
         #_list = ['science' ] #,'interestingasfuck','penpals','science'] 
             #'relationship_advice' (9,995,066,31 bytes)
@@ -389,25 +390,25 @@ def _load_data(reddit_dataset_version):
             # interestingasfuck 354770199
             # penpals 35372354
         
-        for idx, subreddit in enumerate( _list ):
-            subdir = f"subreddit-{subreddit}"
+        #for idx, subreddit in enumerate( _list ):
+        subdir = f"subreddit-{subreddit}"
 
-            full_path = os.path.join(_dir_path,subdir)
-            use_local = os.path.exists(full_path)
-            print(full_path)
+        full_path = os.path.join(_dir_path,subdir)
+        use_local = os.path.exists(full_path)
+        print(full_path)
 
-            _corpus = Corpus(filename=download(f"subreddit-{subreddit}",
-                                data_dir=full_path,use_local=use_local),
-                                merge_lines=False)
+        corpus = Corpus(filename=download(f"subreddit-{subreddit}",
+                            data_dir=full_path,use_local=use_local),
+                            merge_lines=False)
             
-            _corpus.print_summary_stats()
+        corpus.print_summary_stats()
 
-            if idx == 0:
-                merged_corpus = _corpus
-            else:
-                merged_corpus.merge(_corpus,warnings=False)
+        #     if idx == 0:
+        #         merged_corpus = _corpus
+        #     else:
+        #         merged_corpus.merge(_corpus,warnings=False)
 
-        corpus = merged_corpus
+        # corpus = merged_corpus
     
     print('\n')
     corpus.print_summary_stats()
@@ -911,7 +912,7 @@ if __name__ == '__main__':
 
     parser.add_argument('-at','--annotate_topic',default=True, type=lambda x: bool(int(x)) )
 
-    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=['small','large'])
+    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=['small','CasualConversation','relationship_advice','interestingasfuck','science'])
 
     args = parser.parse_args()
     
