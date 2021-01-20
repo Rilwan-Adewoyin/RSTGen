@@ -262,7 +262,7 @@ class NLG(nn.Module):
                                 os.path.join( ("./models"), f"{model_name}_tokenizer"))
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
-        #self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
+        self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
 
         # Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -311,8 +311,8 @@ class NLG(nn.Module):
         # Feed input to distilgpt2
         if self.loss_type == "CrossEntropy":      
             outputs = self.transformer( inputs_embeds=input_['input_embeds'],
-                                        #attention_mask = input_['attn_mask'],
-                                        #position_ids=input_['position_ids'], #check pos_ids are being removed
+                                        attention_mask = input_['attn_mask'],
+                                        position_ids=input_['position_ids'], #check pos_ids are being removed
                                         token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                         return_dict=False)
         
@@ -371,34 +371,6 @@ class NLG(nn.Module):
 
         input_embeds += token_type_embedding
         input_['input_embeds'] = input_embeds
-
-        # padding/shrinking input_embeds based on the max seq_len in batch
-        #_ = input_embeds.shape
-        #max_seq_len = torch.max( input_['seq_len'] )
-
-        #By default NLG tokenizer pads it to 1024, This gives the option to reduce it all down        
-        # if truncate :
-
-        # if max_seq_len>_[1]:
-        #     padding =  torch.zeros([_[0],max_seq_len-_[1],_[2]],dtype=torch.int32).type_as(max_seq_len) #This model does not have a padding token. uses attention to mask it out.
-            
-        #     input_embeds = torch.cat( [input_embeds, padding ], axis=1 )
-        #     input_['input_embeds'] = input_embeds
-
-        #     #padding position_ids
-        #     padding_posids =  torch.zeros([_[0],max_seq_len-_[1],],dtype=torch.int32).type_as(max_seq_len) #This model does not have a padding token. uses attention to mask it out.
-        #     input_['position_ids'] = torch.cat( [input_['position_ids'], padding_posids ], axis=1 )
-
-        # elif max_seq_len == _[1]:
-            
-            
-
-        # else:
-        #     input_embeds = input_embeds[:, :max_seq_len, :]
-        #     input_['attn_mask'] = input_['attn_mask'][:, :max_seq_len, :max_seq_len ]
-
-        #     #TODO: make sure to slice the tensors that are above as well 
-        #     raise NotImplementedError
         
         return input_
 

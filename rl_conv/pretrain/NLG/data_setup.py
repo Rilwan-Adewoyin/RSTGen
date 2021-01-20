@@ -94,6 +94,10 @@ def main(danet_vname,
             mp_count=5,
             start_batch=0,
             mp_damodules =3,
+            annotate_rst=True,
+            annotate_da=True,
+            annotate_topic= True,
+            reddit_dataset_version='small',
             **kwargs):
     """[summary]
 
@@ -106,76 +110,67 @@ def main(danet_vname,
     
     #region  Setup    
     # setting up model for Da prediction
-    model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
-    checkpoint_dir = f'{model_dir}/logs'
+    if annotate_da == True:
+        model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
+        checkpoint_dir = f'{model_dir}/logs'
 
-    checkpoint_path = get_best_ckpt_path(checkpoint_dir) #TOdO: need to insert changes from da branch into nlg branch
-    
-    if torch.cuda.is_available():
-        checkpoint = torch.load(checkpoint_path)
-    else:
-        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
-    
-    # init_params = checkpoint['hyper_parameters']
-    # init_params.pop('mode')
-    mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
-    tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
-
-    # li_danet_modules = [ ]
-    # torch.set_grad_enabled(False)
-    # for idx in range(mp_damodules):   
-    #     danet = DaNet(**vars(mparams)).to('cuda')
-    #     danet_module = TrainingModule(mode='inference', model=danet)
-    #     danet_module.load_state_dict(checkpoint['state_dict'] )
-    #     #danet_module.share_memory()
-    #     danet_module.eval()
-    #     #danet_module.model.eval()
+        checkpoint_path = get_best_ckpt_path(checkpoint_dir) #TOdO: need to insert changes from da branch into nlg branch
         
-    #     danet_module.to('cuda')
+        if torch.cuda.is_available():
+            checkpoint = torch.load(checkpoint_path)
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
         
-    #      li_danet_modules.append(danet_module)
 
-    danet = DaNet(**vars(mparams))
-    danet_module = TrainingModule(mode='inference', model=danet)
-    danet_module.load_state_dict(checkpoint['state_dict'] )
-    danet_module.eval()
-    torch.set_grad_enabled(False)
+        mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
+        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
 
-    tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
+
+        danet = DaNet(**vars(mparams))
+        danet_module = TrainingModule(mode='inference', model=danet)
+        danet_module.load_state_dict(checkpoint['state_dict'] )
+        danet_module.eval()
+        torch.set_grad_enabled(False)
+
+        tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
 
     # setting up docker image for rst
         #Platform dependent way to start docker
         # linux: If an error in next line, changeother "other" permission on /var/run/docker.sock to read write execute chmod o=7 /var/run/docker.sock
-    try:
-        client = docker.from_env(timeout=int(60*3))
-    except docker.DockerException:
-        os.system('chmod o=rwx var/run/docker.sock')
-        client = docker.from_env(timeout=int(60*60))
-    
-    image_name = 'akanni96/feng-hirst-rst-parser'
-    image_li = client.images.list('akanni96/feng-hirst-rst-parser')
-    
-        # (building)docker image
-    if len(image_li)==0: 
-        #Use this method during develomment
-        dir_dockferfile =  utils_nlg.get_path("../DockerImages/feng-hirst-rst-parser",_dir=True)
-        image = client.images.build(path=dir_dockferfile,
-            nocache=True, pull=False, rm=True,forcerm=True,
-            tag="akanni96/feng-hirst-rst-parser")[0]
+    if annotate_rst == True:
+        try:
+            client = docker.from_env(timeout=int(60*3))
+        except docker.DockerException:
+            os.system('chmod o=rwx var/run/docker.sock')
+            client = docker.from_env(timeout=int(60*60))
         
-    else:
-        image = client.images.get(image_name)
+        image_name = 'akanni96/feng-hirst-rst-parser'
+        image_li = client.images.list('akanni96/feng-hirst-rst-parser')
+        
+            # (building)docker image
+        if len(image_li)==0: 
+            #Use this method during develomment
+            dir_dockferfile =  utils_nlg.get_path("../DockerImages/feng-hirst-rst-parser",_dir=True)
+            image = client.images.build(path=dir_dockferfile,
+                nocache=True, pull=False, rm=True,forcerm=True,
+                tag="akanni96/feng-hirst-rst-parser")[0]
+            
+        else:
+            image = client.images.get(image_name)
 
-    li_fh_container = [ client.containers.run(image, detach=True, 
-        entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
+        li_fh_container = [ client.containers.run(image, detach=True, 
+            entrypoint=None,command="/bin/bash",auto_remove=True,tty=True) for x in range(mp_count) ]  
 
-    li_fh_container_id = [container.id for container in li_fh_container ]     
+        li_fh_container_id = [container.id for container in li_fh_container ]     
 
     #Creating Save directory
-    dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_mc",_dir=True)
-    
+    if reddit_dataset_version == "small":
+        dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_annotated",_dir=True)
+    elif reddit_dataset_version == "large":
+        dir_save_dataset = utils_nlg.get_path("./dataset/reddit_large_annotated",_dir=True)
+
     # setting up corpus data
-    corpus = _load_data()
+    corpus = _load_data(reddit_dataset_version)
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
@@ -197,10 +192,10 @@ def main(danet_vname,
         #region preprocessing
         timer.start()
         for id_dictconv  in batch_li_id_dictconv:
-            conv_id  = id_dictconv[0]
+            #conv_id  = id_dictconv[0]
             dictconv = id_dictconv[1]
             tree_conv_paths = dictconv.get_root_to_leaf_paths() 
-            paths_count = len(tree_conv_paths)
+            #paths_count = len(tree_conv_paths)
 
             # Gathering utterances in thread
             li_thread_utterances = [
@@ -226,57 +221,31 @@ def main(danet_vname,
                 if _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) == '' :
                     _dict['reply_to'] = None
 
-            batch_li_li_thread_utterances.append(li_thread_utterances)
+            # Only append if more than ten comments in the conversation
+            if len(li_thread_utterances)>=10:
+                batch_li_li_thread_utterances.append(li_thread_utterances)
+
         timer.end("preprocessing")
         #endregion
         
         #region Predicting the RST Tag
         timer.start()
-        mp_count_rst = mp_count
-        contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
-        contaier_ids = sum(contaier_ids, [])
-        with mp.Pool(mp_count_rst) as pool:
-            res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ) , contaier_ids  ) )
-        batch_li_li_thread_utterances = list( res ) 
-        batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
-        batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
+        if annotate_rst == True:
+            mp_count_rst = mp_count
+            contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
+            contaier_ids = sum(contaier_ids, [])
+            with mp.Pool(mp_count_rst) as pool:
+                res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ) , contaier_ids  ) )
+            batch_li_li_thread_utterances = list( res ) 
+            batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+            batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
         timer.end("RST")
         #endregion
 
         #region DA assignment
         timer.start()
-
-            #preppring for parrallelizing
-        
-        
-        # with mp.Pool(mp_damodules) as pool:
-        #     res = pool.starmap(_da_assigning, zip( _chunks(batch_li_li_thread_utterances,mp_damodules), li_danet_modules ,itertools.repeat(tokenizer) )  )
-        
-        # batch_li_li_thread_utterances = list(res)
-        # batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
-
-        # processes =[]
-        # pipe_list =[]
-
-        # li_arg1 = _chunks(batch_li_li_thread_utterances, batch_process_size//mp_damodules)
-        # ctx = mp.get_context('spawn')
-
-        # for i in range(mp_damodules):
-        #     recv_end, send_end = mp.Pipe(False)
-        #     p = ctx.Process( target=_da_assigning, args=( next(li_arg1), li_danet_modules[i],tokenizer ) )
-        #     pipe_list.append(recv_end)
-        #     processes.append(p)
-        #     p.start()
-
-        # for p in processes:
-        #     p.join()
-        # res = [x.recv() for x in pipe_list]
-
-        #batch_li_li_thread_utterances = list(res)
-        #batch_li_li_thread_utterances = sum(res, [])
-
-
-        for i, _ in enumerate(batch_li_li_thread_utterances):
+        if annotate_da == True and annotate_rst == True:
+            for i, _ in enumerate(batch_li_li_thread_utterances):
             
                 li_thread_utterances = batch_li_li_thread_utterances[i]
 
@@ -354,10 +323,11 @@ def main(danet_vname,
 
         #region Topic extraction
         timer.start()
-        with mp.Pool(mp_count) as pool:
-            res = pool.map( _topic, _chunks(batch_li_li_thread_utterances,batch_process_size//mp_count) )
-        batch_li_li_thread_utterances = list( res ) 
-        batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+        if annotate_topic == True:
+            with mp.Pool(mp_count) as pool:
+                res = pool.map( _topic, _chunks(batch_li_li_thread_utterances,batch_process_size//mp_count) )
+            batch_li_li_thread_utterances = list( res ) 
+            batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
         timer.end("Topic")
         #endregion
 
@@ -365,10 +335,10 @@ def main(danet_vname,
         for i, _ in enumerate(batch_li_li_thread_utterances):
             li_thread_utterances = batch_li_li_thread_utterances[i]
             for idx in range(len(li_thread_utterances)):
-                li_thread_utterances[idx].pop('reply_to')
-                li_thread_utterances[idx].pop('id_utt')
-                li_thread_utterances[idx].pop('speaker_id')
-                li_thread_utterances[idx].pop('dus')
+                li_thread_utterances[idx].pop('reply_to',None)
+                li_thread_utterances[idx].pop('id_utt',None)
+                li_thread_utterances[idx].pop('speaker_id',None)
+                li_thread_utterances[idx].pop('dus',None)
             
             batch_li_li_thread_utterances[i] = li_thread_utterances
         # end region
@@ -384,17 +354,36 @@ def main(danet_vname,
         timer.end("Saving")
         #end region    
 
-def _load_data():
+    
+def _load_data(reddit_dataset_version):
     # Donwload reddit-corpus-small if it doesnt exist
-    _dir_path = utils_nlg.get_path("./dataset/reddit_small")
+    if reddit_dataset_version == 'small':
+        _dir_path = utils_nlg.get_path("./dataset/reddit_small")
+    elif reddit_dataset_version == 'large':
+        _dir_path = utils_nlg.get_path("./dataset/reddit_large")
+
     if os.path.exists(_dir_path):
         use_local = True
     else:
         use_local = False
         os.makedirs(_dir_path, exist_ok=True)
 
-    corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+    if reddit_dataset_version == 'small':
+        corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
+    elif reddit_dataset_version == 'large':
+        _list = [ 'relationship_advice', 'CasualConversation','interestingasfuck','penpals','science','askscience']
+        
+        for idx, subreddit in enumerate( _list ):
+            if idx == 0:
+                merged_corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+            else:
+                _corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+                merged_corpus.merge(_corpus)
+        corpus = merged_corpus
+    
+    corpus.print_summary_stats()
+
     return corpus
 
 def _preprocess(text):
@@ -467,7 +456,6 @@ def _valid_utterance(txt):
 
     return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]" and txt!="removed" and txt!="deleted"
 
-
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
     try:
         prev_utterance = next( _dict['txt_preproc'] for 
@@ -477,52 +465,6 @@ def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
         prev_utterance = ''
     
     return prev_utterance
-
-def _rst(li_li_thread_utterances, fh_container_id ):
-    client = docker.from_env(timeout=int(60*3))
-    fh_container = client.containers.get(fh_container_id)
-    new_li_li_thread_utterances = []
-
-    for i, _ in enumerate(li_li_thread_utterances):
-        
-        li_thread_utterances = li_li_thread_utterances[i]
-        li_utterance  = [ thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ]        
-        json_li_utterance = json.dumps(li_utterance)
-
-        cmd = ['python','parser_wrapper2.py','--li_utterances', json_li_utterance]
-        exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
-                            demux=True)
-        stdout, stderr = output
-        #stdout = stdout.decode('utf-8')
-        # a=0
-        try:
-            stdout_ = json.loads(stdout)
-        except (TypeError, json.JSONDecodeError) as e:
-
-            continue
-
-
-        li_trees = []
-        for idx, pt_str in enumerate(stdout_):
-            try:
-                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-            except ValueError:
-                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-                pass
-            li_trees.append(_)
-
-        li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_trees ]
-
-        [
-            thread_utterance.update( {'rst':rst_dict}) for thread_utterance, rst_dict in 
-            zip( li_thread_utterances, li_rst_dict)
-        ]
-
-        #li_li_thread_utterances[i] = li_thread_utterances
-        new_li_li_thread_utterances.append(li_thread_utterances)
-    
-    return new_li_li_thread_utterances
-
 
 def _rst_v2(li_li_thread_utterances, fh_container_id ):
     client = docker.from_env(timeout=int(60*3))
@@ -575,7 +517,6 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
         new_li_li_thread_utterances.append(new_li_thread_utterance)
     return new_li_li_thread_utterances
-
 
 def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
 
@@ -650,8 +591,6 @@ def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
     new_li_li_thread_utterances.append(li_thread_utterances)
     
     return new_li_thread_utterance
-
-
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -928,9 +867,17 @@ if __name__ == '__main__':
     parser.add_argument('--mp_count', default=6,
         type=int)
 
-    parser.add_argument('--start_batch', default=0, type=int)
+    parser.add_argument('-sb','--start_batch', default=0, type=int)
 
     parser.add_argument('--mp_damodules', default=3, type=int)
+
+    parser.add_argument('--annotate_da',default=True, type=bool)
+
+    parser.add_argument('--annotate_rst',default=True, type=bool)
+
+    parser.add_argument('--annotate_topic',default=True, type=bool)
+
+    parser.add_argument('--reddit_dataset_version',default='small', type=str, choices=['small','large'])
 
     args = parser.parse_args()
     
@@ -957,5 +904,9 @@ if __name__ == '__main__':
             time.sleep(5)
 
     #last bacth = 105
-#python3 -bps 20 --mp_count 16 --danet_name DaNet_v008
-#CUDA_VISIBLE_DEVICES=1 python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v007
+
+#CUDA_VISIBLE_DEVICES= python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v008
+
+#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008
+#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
+#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
