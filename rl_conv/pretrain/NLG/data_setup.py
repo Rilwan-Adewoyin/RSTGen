@@ -498,10 +498,9 @@ def _rst(li_li_thread_utterances, fh_container_id ):
         try:
             stdout_ = json.loads(stdout)
         except (TypeError, json.JSONDecodeError) as e:
-            #[ dict_.update( { 'rst': None } ) for dict_ in li_thread_utterances ]
-            #li_li_thread_utterances[i] = li_thread_utterances
+
             continue
-        #li_trees = [ nltk.tree.Tree.fromstring(pt_str) for pt_str in stdout_ ] 
+
 
         li_trees = []
         for idx, pt_str in enumerate(stdout_):
@@ -529,9 +528,6 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
     client = docker.from_env(timeout=int(60*3))
     fh_container = client.containers.get(fh_container_id)
     new_li_li_thread_utterances = []
-
-    #TODO: need to get rid of the utterances that equal == "empty" (these cases are currently )
-    #li_li_thread_utterances = [ [thread_utt for thread_utt in li_thread_utterances if thread_utt['txt_preproc'] != "removed"  ] for li_thread_utterances in li_li_thread_utterances]
 
     li_li_utterances = [ [thread_utt['txt_preproc'] for thread_utt in li_thread_utterances ] for li_thread_utterances in li_li_thread_utterances] #li of li of utts
 
