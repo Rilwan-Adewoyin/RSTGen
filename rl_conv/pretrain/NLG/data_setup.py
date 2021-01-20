@@ -94,6 +94,7 @@ def main(danet_vname,
             rst_method="feng-hirst",
             mp_count=5,
             start_batch=0,
+            end_batch = 0,
             mp_damodules =3,
             annotate_rst=True,
             annotate_da=True,
@@ -111,7 +112,7 @@ def main(danet_vname,
     
     #region  Setup    
     # setting up model for Da prediction
-    print(annotate_da)
+    
     if annotate_da == True:
         model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
         checkpoint_dir = f'{model_dir}/logs'
@@ -176,8 +177,12 @@ def main(danet_vname,
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
+    if end_batch != 0:
+        li_id_dictconv = li_id_dictconv[ : end_batch*batch_process_size] 
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
+
+
     # endregion
     
     timer = Timer()
@@ -185,7 +190,7 @@ def main(danet_vname,
     global batches_completed
     batches_completed = start_batch
 
-    while len(li_id_dictconv) > 0:
+    while len(li_id_dictconv) > 0 :
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
@@ -224,7 +229,7 @@ def main(danet_vname,
                     _dict['reply_to'] = None
 
             # Only append if more than ten comments in the conversation
-            if len(li_thread_utterances)>=10:
+            if len(li_thread_utterances)>=5:
                 batch_li_li_thread_utterances.append(li_thread_utterances)
 
         timer.end("preprocessing")
@@ -354,41 +359,57 @@ def main(danet_vname,
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
         timer.end("Saving")
+
         #end region    
 
+    print(f"Finished at batch {batches_completed}")        
     
 def _load_data(reddit_dataset_version):
     # Donwload reddit-corpus-small if it doesnt exist
     if reddit_dataset_version == 'small':
         _dir_path = utils_nlg.get_path("./dataset/reddit_small")
+    
     elif reddit_dataset_version == 'large':
         _dir_path = utils_nlg.get_path("./dataset/reddit_large")
 
-    if os.path.exists(_dir_path):
-        use_local = True
-    else:
-        use_local = False
-        os.makedirs(_dir_path, exist_ok=True)
+    os.makedirs(_dir_path, exist_ok=True)
+
+
 
     if reddit_dataset_version == 'small':
+        use_local = os.path.exists(_dir_path)
         corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
     elif reddit_dataset_version == 'large':
-        _list = [ 'CasualConversation' ] #,'interestingasfuck','penpals','science'] 
-            #'relationship_advice' (9,995,066,31Kb)
+        _list = [ 'CasualConversation','relationship_advice','interestingasfuck','science' ]
+        #_list = ['interestingasfuck']
+        #_list = ['science' ] #,'interestingasfuck','penpals','science'] 
+            #'relationship_advice' (9,995,066,31 bytes)
             # CasualConversation 735,386,980
             # interestingasfuck 354770199
             # penpals 35372354
         
         for idx, subreddit in enumerate( _list ):
+            subdir = f"subreddit-{subreddit}"
+
+            full_path = os.path.join(_dir_path,subdir)
+            use_local = os.path.exists(full_path)
+            print(full_path)
+
+            _corpus = Corpus(filename=download(f"subreddit-{subreddit}",
+                                data_dir=full_path,use_local=use_local),
+                                merge_lines=False)
+            
+            _corpus.print_summary_stats()
+
             if idx == 0:
-                merged_corpus = Corpus(filename=download(f"subreddit-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
+                merged_corpus = _corpus
             else:
-                _corpus = Corpus(filename=download(f"subreddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
-                merged_corpus.merge(_corpus)
+                merged_corpus.merge(_corpus,warnings=False)
 
         corpus = merged_corpus
     
+    print('\n')
     corpus.print_summary_stats()
 
     return corpus
@@ -879,6 +900,8 @@ if __name__ == '__main__':
 
     parser.add_argument('-sb','--start_batch', default=0, type=int)
 
+    parser.add_argument('-eb','--end_batch', default=0, type=int, help="Final batch to finish on. Set to 0 to run until end")
+
     parser.add_argument('--mp_damodules', default=3, type=int)
 
     parser.add_argument('-ad','--annotate_da',default=True, type=lambda x: bool(int(x)) )
@@ -918,6 +941,10 @@ if __name__ == '__main__':
 
 #CUDA_VISIBLE_DEVICES= python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v008
 
-#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 0 --mp_count 4
-#python3 -bps 120 --mp_count 4 --danet_name DaNet_v008 -sb
-#python3 -bps 120 --mp_count 4 --danet_name DaNet_v008 -sb
+#-sb 0 -eb 127    
+#-sb 1400 -eb 1410
+#-sb 1800 -eb 2100 
+
+#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 800 -eb 1400 --mp_count 4
+#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 1410 -eb 1600 --mp_count 2
+#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 2101 -eb 2137 --mp_count 2
