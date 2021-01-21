@@ -46,32 +46,23 @@ from collections import OrderedDict
 import yaml
 import ast
 import types
+from functools import wraps
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
-# def monkey_save_model(self, filepath: str, trainer, pl_module):
-#     # in debugging, track when we save checkpoints
-#     trainer.dev_debugger.track_checkpointing_history(filepath)
+def monkey_save_model(self, filepath: str, trainer, pl_module):
+    # in debugging, track when we save checkpoints
+    trainer.dev_debugger.track_checkpointing_history(filepath)
 
-#     # make paths
-#     if trainer.is_global_zero:
-#         self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
+    # make paths
+    if trainer.is_global_zero:
+        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-#     # delegate the saving to the trainer
-#     if self.save_function is not None:
-#         self.save_function(filepath, self.save_weights_only)
+    # delegate the saving to the trainer
+    if self.save_function is not None:
+        self.save_function(filepath, self.save_weights_only)
     
-#    self.to_yaml()
-
-#ModelCheckpoint._save_model = monkey_save_model
-
-def save_model_decorater(method):
-    def decorate_save_model(self=None):
-        return method(self) + self.to_yaml()
-    
-    return decorate_save_model
-
-
+    self.to_yaml()
 
 #Monkey patching the forward on distill bert
 def forward(
@@ -244,6 +235,8 @@ def forward(
     else:
         raise NotImplementedError
 
+def get_output_embeddings(self):
+    return self.lm_head
 
 #Monkey patching approx_sq_grad 
 #@staticmethod
@@ -269,7 +262,7 @@ class NLG(nn.Module):
     def __init__(self, 
         base_model_name= 'distilgpt2', model_name="NLG",
         reset_base_transformer=True, loss_type="CrossEntropy",
-        fda=True, frst=True, ftopic=True, **kwargs ):
+        fda=True, frst=True, ftopic=True, max_input_len=264 ,**kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
         
@@ -279,17 +272,23 @@ class NLG(nn.Module):
         self.fda = fda 
         self.frst = frst
         self.ftopic = ftopic
+
+        
+
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
         
 
         self.nlg_tokenizer = NLG_tokenizer(base_model_name,
                                 os.path.join( ("./models"), f"{model_name}_tokenizer"),
-                                fda=fda, frst=frst, ftopic=ftopic, **kwargs)
+                                fda=fda, frst=frst, ftopic=ftopic,
+                                 **kwargs)
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
         self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
-
+        self.transformer.prepare_inputs_for_generation = self.prepare_inputs_for_generation
+        # For compatibility with hugging face generate
+        self.transformer.get_output_embeddings = lambda : self.lm_head
         # Embedding Layers
         
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -306,15 +305,38 @@ class NLG(nn.Module):
                                             #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                             #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
         
-
         self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
         
         self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
         self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
         
+
+        
         self.loss_type = loss_type 
         self.loss_fct = CrossEntropyLoss()
         
+    def generate(self, encoded_input, decode_method, generate_params):
+        
+        #Embedded the inputs
+        input_ = self.layer_embedding_exda(encoded_input)
+            
+        # Generating output
+            #Ensure that all inputs have a batch dimension
+
+        output = self.transformer.generate(  
+                        inputs_embeds = input_['input_embeds'],
+                         position_ids=input_['position_ids'],
+                        attention_mask = input_['attn_mask'],
+                        token_type_ids = None,
+                        **generate_params )
+                        #may need to add other special tokens to the mix here
+
+        if decode_method == 'beam':
+            decoded = self.nlg_tokenizer.e2m_tokenizer.decode( output[0], skip_special_tokens=True ) 
+    
+
+    
+
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -341,6 +363,17 @@ class NLG(nn.Module):
        
         return mparams
 
+    def forward_embedding(self, input_):
+        #Partially does the emebddign for our new inputs to the transformer
+
+        # Creating embedded inputs and attention mask
+        if self.fda and self.frst:
+            input_ = self.layer_embedding( input_ )
+        elif self.fda==False and self.frst:
+            input_ = self.layer_embedding_exda( input_ )
+        
+        return input_
+
     def forward(self, input_):
         """[summary]
 
@@ -350,14 +383,9 @@ class NLG(nn.Module):
         Returns:
             [type]: [description]
         """
-        
-        # Creating embedded inputs and attention mask
-        if self.fda and self.frst:
-            input_ = self.layer_embedding( input_ )
-        elif self.fda==False and self.frst:
-                input_ = self.layer_embedding_exda( input_ )
-        
-        
+        # Handles embedding of our new non word features
+        input_ = self.forward_embedding(input_)
+                
         # Feed input to distilgpt2
         if self.loss_type == "CrossEntropy":      
             outputs = self.transformer( inputs_embeds=input_['input_embeds'],
@@ -446,7 +474,8 @@ class NLG(nn.Module):
 
         topics_embed = topics_phrase_embed + topics_score_embed
 
-        utt_embed = self.transformer.wte(input_['tknzd_utt'] ) #TODO: Add positional encoding for each word too
+        
+        utt_embed = self.transformer.wte(input_['tknzd_utt'] )
 
         input_embeds = torch.cat(
             [rst_start_embed, rst_embed,
@@ -462,12 +491,13 @@ class NLG(nn.Module):
         
         return input_
 
+
     def return_params(self):
         params = {}
 
         params['base_model_name'] = self.base_model_name
         params['loss_type'] = self.loss_type 
-        params['max_input_len'] = self.max_input_len
+        params['max_input_len'] = self.nlg_tokenizer.max_input_len
         params['fda'] = self.fda
         params['frst'] = self.frst
         params['ftopic'] = self.ftopic
@@ -487,6 +517,35 @@ class NLG(nn.Module):
 
         return None
 
+    def prepare_inputs_for_generation(self, input_ids, input_embeds, past=None, **kwargs):
+        token_type_ids = kwargs.get("token_type_ids", None)
+        # only last token for inputs_ids if past is defined in kwargs
+        if past:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+        else:
+            position_ids = None
+        return {
+            "input_ids": None,
+            'input_embeds':input_embeds,
+            "past_key_values": past,
+            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        }
+
 class NLG_tokenizer():
     """Rough Implmentation of the tokenizer for the NLG model
 
@@ -503,9 +562,10 @@ class NLG_tokenizer():
                  fda = True,
                  frst = True,
                  ftopic = True,
-                 max_input_len = 216,
+                 max_input_len = 216,                 
                  **kwargs
                  ):
+
 
         self.e2m_base_model_name = e2m_base_model_name
 
@@ -582,8 +642,15 @@ class NLG_tokenizer():
 
 
     def __call__(self, das=None, rst_rels=None, topics=None, topics_score=None, 
-                    utterance=None, prev_das=None, prev_rst=None):
+                    utterance=None, prev_das=None, prev_rst=None,
+                    stem_context_utterance = -1):
         
+        #Stem context utterance decides whether or not to reduce the size of the context.
+            #This is only helpful when evaluating how model produces output given a fixed small starting to the sentence
+
+        if stem_context_utterance != -1:
+            utterance = ' '.join( utterance.split(' ')[:stem_context_utterance] )
+
         if self.fda and self.frst and self.ftopic:
 
             outp = self.encode_v2(das ,rst_rels,topics, topics_score, 
@@ -1009,12 +1076,14 @@ class TrainingModule(pl.LightningModule):
             self.lr_schedule = lr_schedule
             self.learning_rate = learning_rate
         
-
-        if self.mode in ['train_new']:
             train_params_to_save = self.return_params()
             model_params_to_save = self.model.return_params()
             self.save_hyperparameters( train_params_to_save )
             self.save_hyperparameters( model_params_to_save )
+        
+        if self.mode in ['inference']:
+            self.eval() 
+            self.freeze() 
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
@@ -1069,12 +1138,14 @@ class TrainingModule(pl.LightningModule):
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
             #restore/update param files from the checkpoint
-            tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type']} )
+            try:
+                tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                    'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type']} )
 
-            mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len']} )
-
+                mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                    'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len']} )
+            except KeyError:
+                pass
             del checkpoint
             torch.cuda.empty_cache()
             
@@ -1099,8 +1170,7 @@ class TrainingModule(pl.LightningModule):
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
         
-        #checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
-        checkpoint_callback._save_model = save_model_decorater(checkpoint_callback._save_model)
+        checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
@@ -1121,7 +1191,7 @@ class TrainingModule(pl.LightningModule):
                         log_every_n_steps=1,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator='ddp',
-                        limit_train_batches = 0.5,
+                        limit_train_batches = 0.6,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -1140,7 +1210,7 @@ class TrainingModule(pl.LightningModule):
                     log_every_n_steps=1,   
                     precision=tparams['precision'],callbacks=callbacks,
                     accelerator='ddp',
-                    limit_train_batches = 0.5,
+                    limit_train_batches = 0.6,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
@@ -1208,6 +1278,8 @@ class TrainingModule(pl.LightningModule):
             trainer.test(test_dataloaders=training_module.test_dl, ckpt_path='best')
         
         elif tparams['mode'] in ['infernece']: 
+            training_module.eval() 
+            training_module.freeze() 
             raise NotImplementedError   
 
 
@@ -1443,7 +1515,7 @@ class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
-    def __init__(self, file_path, tokenizer, line_start, line_end, fda, frst, ftopic ):
+    def __init__(self, file_path, tokenizer, line_start, line_end, fda, frst, ftopic, stem_context_utterance = -1 ):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.line_start = line_start
@@ -1452,6 +1524,9 @@ class SingleDataset(torch.utils.data.Dataset):
         self.fda = fda
         self.frst = frst 
         self.ftopic = ftopic
+
+        # Used to stem the context utterance for observing model's performance with varying levels of context input
+        self.stem_context_utterance = stem_context_utterance
         
         skiprows = self.line_start if self.line_start!=0 else None
         with open(self.fp, 'r') as f:
@@ -1517,7 +1592,8 @@ class SingleDataset(torch.utils.data.Dataset):
                     
         encoded = self.tokenizer(das, rst_rels, topics, 
                                     topics_score, utterance,
-                                    prev_das=None, prev_rst=None )      
+                                    prev_das=None, prev_rst=None,
+                                    stem_context_utterance=self.stem_context_utterance )      
             # encoded May include some of the following
             #( da_start_token, tnsr_das,    
              #rst_start_token, tnsr_rst_rels,
@@ -1526,76 +1602,7 @@ class SingleDataset(torch.utils.data.Dataset):
              # attn_mask
              # labels)
         return encoded
-
-    
-class SingleDataset_exda(torch.utils.data.Dataset):
-    """creates a dataloader given a directory of text files each containing a conversation
-
-    """
-    def __init__(self, file_path, tokenizer, line_start, line_end  ):
-        self.fp = file_path
-        self.tokenizer = tokenizer
-        self.line_start = line_start
-        self.line_end = line_end
-
-        skiprows = self.line_start if self.line_start!=0 else None
-        with open(self.fp, 'r') as f:
-            if self.line_start == 0:
-            
-                self.data = pd.read_csv(file_path, sep=',', header=0, 
-                    skiprows =skiprows, nrows=(self.line_end-self.line_start) )
-            
-            else:    
-                self.data = pd.read_csv(file_path, sep=',', 
-                    names = ['text', 'subreddit', 'txt_preproc', 'rst', 'li_da', 'topic_textrank'],
-                    skiprows =skiprows, nrows=(self.line_end-self.line_start) )
-                    
-    def __len__(self):
-        return (self.line_end - self.line_start)
-    
-    def __getitem__(self, index):
-        datum = self.data[index:index+1]
-
-        #Dialogue Act
-        das = json.loads(datum['li_da'].values[0])
-        
-        #RST
-        try:
-            li_rst = json.loads(datum['rst'].values[0])  #list of dictionaries 
-        except json.decoder.JSONDecodeError as e:
-            li_rst = ast.literal_eval(datum['rst'].values[0])
-        
-        rst_rels = [ [ _dict['rel'] for _dict in li_rst ] ]
-        rst_ns = [ [_dict['ns']] for _dict in li_rst ]
-        rst_pos = [ _dict['pos'] for _dict in li_rst ]
-
-        
-        #Topic scores
-        try:
-            topics_textrank = json.loads(datum['topic_textrank'].values[0])
-        except json.decoder.JSONDecodeError as e:
-            topics_textrank = ast.literal_eval(datum['topic_textrank'].values[0])
-
-        if len(topics_textrank)!=0: #TODO: remove later
-            topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
-        else:
-            topics = [""]
-            topics_score = [0.0]
-        
-        #Utterance
-        utterance = datum['txt_preproc'].values[0].strip('\"')
-                    
-        encoded = self.tokenizer(das, rst_rels, topics, topics_score, utterance, prev_das=None, prev_rst=None )      
-            # encoded May include some of the following
-            #( da_start_token, tnsr_das,    
-             #rst_start_token, tnsr_rst_rels,
-             #tnsr_topics_phrase, tnsr_topics_score, 
-             # tknzd_utt,
-             # attn_mask
-             # labels)
-        return encoded
-
-
+ 
 def main(tparams={}, mparams={}):
     gc.collect()
     torch.cuda.empty_cache()
