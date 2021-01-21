@@ -47,6 +47,7 @@ import yaml
 import ast
 import types
 from functools import wraps
+from copy import deepcopy
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
@@ -63,6 +64,14 @@ def monkey_save_model(self, filepath: str, trainer, pl_module):
         self.save_function(filepath, self.save_weights_only)
     
     self.to_yaml()
+
+def _monitor_candidates(self, trainer):
+    ckpt_name_metrics = deepcopy(trainer.logger_connector.logged_metrics)
+    ckpt_name_metrics.update(trainer.logger_connector.progress_bar_metrics)
+    ckpt_name_metrics.update(trainer.logger_connector.callback_metrics)
+
+    return ckpt_name_metrics
+
 
 #Monkey patching the forward on distill bert
 def forward(
@@ -81,6 +90,9 @@ def forward(
         output_hidden_states=None,
         return_dict=None,
     ):
+    
+    input_ids = None # Our model should ignore any input_ids entered into the model
+
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -315,15 +327,34 @@ class NLG(nn.Module):
         self.loss_type = loss_type 
         self.loss_fct = CrossEntropyLoss()
         
-    def generate(self, encoded_input, decode_method, generate_params):
-        
+    def generate(self, encoded_input, generate_params):
+        ## generate_params :    max_length, min_length,
+            # do_sample: Optional[bool] = None,
+            # early_stopping: Optional[bool] = None,
+            # num_beams: Optional[int] = None,
+            # temperature: Optional[float] = None,
+            # top_k: Optional[int] = None,
+            # top_p: Optional[float] = None,
+            # repetition_penalty: Optional[float] = None,
+            # bad_words_ids: Optional[Iterable[int]] = None,
+            # bos_token_id: Optional[int] = None,
+            # pad_token_id: Optional[int] = None,
+            # eos_token_id: Optional[int] = None,
+            # length_penalty: Optional[float] = None,
+            # no_repeat_ngram_size: Optional[int] = None,
+            # num_return_sequences: Optional[int] = None,
+
         #Embedded the inputs
-        input_ = self.layer_embedding_exda(encoded_input)
+        input_ = self.forward_embedding(encoded_input)
             
         # Generating output
             #Ensure that all inputs have a batch dimension
-
+        
+        #TODO: batch size is calculated on line 280 uses first index of input_ids or set to 1
+        # input_embeds should be two dimensionl
         output = self.transformer.generate(  
+                        inputs_ids = input_['input_ids'],
+
                         inputs_embeds = input_['input_embeds'],
                          position_ids=input_['position_ids'],
                         attention_mask = input_['attn_mask'],
@@ -331,12 +362,11 @@ class NLG(nn.Module):
                         **generate_params )
                         #may need to add other special tokens to the mix here
 
-        if decode_method == 'beam':
-            decoded = self.nlg_tokenizer.e2m_tokenizer.decode( output[0], skip_special_tokens=True ) 
+        
+        decoded = self.nlg_tokenizer.e2m_tokenizer.decode( output, skip_special_tokens=True ) 
     
 
-    
-
+        return decoded
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -387,22 +417,22 @@ class NLG(nn.Module):
         input_ = self.forward_embedding(input_)
                 
         # Feed input to distilgpt2
-        if self.loss_type == "CrossEntropy":      
-            outputs = self.transformer( inputs_embeds=input_['input_embeds'],
-                                        attention_mask = input_['attn_mask'],
-                                        position_ids=input_['position_ids'], #check pos_ids are being removed
-                                        token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
-                                        return_dict=False)
         
-        # Add LM head to model
+        outputs = self.transformer( inputs_embeds=input_['input_embeds'],
+                                    attention_mask = input_['attn_mask'],
+                                    position_ids=input_['position_ids'], #check pos_ids are being removed
+                                    token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
+                                                            # Further we handle token_type embedding in forward_embedding layer
+                                    return_dict=False)
+        
+        if self.loss_type == "CrossEntropy":      
+        
             hidden_states = outputs[0]
             lm_logits = self.lm_head( hidden_states )
 
-            # must output loss 
             # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = input_['labels'][..., 1:].contiguous() 
-            # Flatten the tokens
             
             loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
  
@@ -455,14 +485,14 @@ class NLG(nn.Module):
     def layer_embedding_exda(self, input_):
         """Performs the input embedding and token type embedding calcs
 
-        Args:
-            input_ ([type]): [description]
+            Args:
+                input_ ([type]): [description]
 
-        Returns:
-            input_embedded [type]: [description]
-            
-            Note: logic for token_type_ids embedding is usually performed in transformer, but has been moved here
-                since gpt-2 code indicates that 
+            Returns:
+                input_embedded [type]: [description]
+                
+                Note: logic for token_type_ids embedding is usually performed in transformer, but has been moved here
+                    since gpt-2 code indicates that 
         """
         # token embedding
 
@@ -489,8 +519,8 @@ class NLG(nn.Module):
         input_embeds += token_type_embedding
         input_['input_embeds'] = input_embeds
         
+        
         return input_
-
 
     def return_params(self):
         params = {}
@@ -518,32 +548,22 @@ class NLG(nn.Module):
         return None
 
     def prepare_inputs_for_generation(self, input_ids, input_embeds, past=None, **kwargs):
-        token_type_ids = kwargs.get("token_type_ids", None)
+        
         # only last token for inputs_ids if past is defined in kwargs
         if past:
             input_ids = input_ids[:, -1].unsqueeze(-1)
-            if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
-
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
-
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
-        else:
-            position_ids = None
+            input_embeds = input_embeds[:, -1, :].unsqueeze(-2)
+            #TODO: may also have to crop the input_embeds and attneiton_mask
+        
         return {
-            "input_ids": None,
+            "input_ids": input_ids,
             'input_embeds':input_embeds,
+            "attention_mask": kwargs.get("attention_mask"),
+            "position_ids": kwargs.get("position_ids"),
+
             "past_key_values": past,
-            "use_cache": kwargs.get("use_cache"),
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
+
+            "token_type_ids": None,
         }
 
 class NLG_tokenizer():
@@ -1012,7 +1032,9 @@ class NLG_tokenizer():
         return topic_phrases , tnsr_score, diff, ta_idxs
 
     def encode_utterance_v2(self, utterance, max_len=208, padding_token='<|endoftext|>'):
-        
+        #TODO: Generation: here the utterance/input_ids is padding to fit a certain length.
+            #   This may not fit our purpose for geeration
+
         utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
         encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
@@ -1171,6 +1193,7 @@ class TrainingModule(pl.LightningModule):
             filename='{epoch:03d}_{val_loss:.5f}')
         
         checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
+        checkpoint_callback._monitor_candidates = types.MethodType(_monitor_candidates, checkpoint_callback) # monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
