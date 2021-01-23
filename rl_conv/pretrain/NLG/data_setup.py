@@ -22,7 +22,7 @@ from transformers import AutoTokenizer, AutoModel
 import docker
 import math
 import itertools
-
+import pandas as pd
 import nltk
 nltk.download('stopwords')
 import rake_nltk
@@ -49,6 +49,7 @@ from utils import get_path
 
 import regex as re
 import multiprocessing as mp
+import distutils
 # import torch.multiprocessing as mp
 # from torch.multiprocessing import set_start_method
 
@@ -93,6 +94,7 @@ def main(danet_vname,
             rst_method="feng-hirst",
             mp_count=5,
             start_batch=0,
+            end_batch = 0,
             mp_damodules =3,
             annotate_rst=True,
             annotate_da=True,
@@ -110,6 +112,7 @@ def main(danet_vname,
     
     #region  Setup    
     # setting up model for Da prediction
+    
     if annotate_da == True:
         model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
         checkpoint_dir = f'{model_dir}/logs'
@@ -166,7 +169,7 @@ def main(danet_vname,
     #Creating Save directory
     if reddit_dataset_version == "small":
         dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_annotated",_dir=True)
-    elif reddit_dataset_version == "large":
+    else: 
         dir_save_dataset = utils_nlg.get_path("./dataset/reddit_large_annotated",_dir=True)
 
     # setting up corpus data
@@ -174,8 +177,12 @@ def main(danet_vname,
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
+    if end_batch != 0:
+        li_id_dictconv = li_id_dictconv[ : end_batch*batch_process_size] 
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
+
+
     # endregion
     
     timer = Timer()
@@ -183,7 +190,7 @@ def main(danet_vname,
     global batches_completed
     batches_completed = start_batch
 
-    while len(li_id_dictconv) > 0:
+    while len(li_id_dictconv) > 0 :
 
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
@@ -222,7 +229,7 @@ def main(danet_vname,
                     _dict['reply_to'] = None
 
             # Only append if more than ten comments in the conversation
-            if len(li_thread_utterances)>=10:
+            if len(li_thread_utterances)>=5:
                 batch_li_li_thread_utterances.append(li_thread_utterances)
 
         timer.end("preprocessing")
@@ -347,41 +354,63 @@ def main(danet_vname,
         timer.start()
             # format = subreddit/convo_code
         li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
-        _save_data(li_utterances, batch_save_size, dir_save_dataset)
+        _save_data(li_utterances, batch_save_size, dir_save_dataset, batches_completed, batch_process_size )
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
         timer.end("Saving")
+
         #end region    
 
+    print(f"Finished at batch {batches_completed}")        
     
 def _load_data(reddit_dataset_version):
     # Donwload reddit-corpus-small if it doesnt exist
     if reddit_dataset_version == 'small':
         _dir_path = utils_nlg.get_path("./dataset/reddit_small")
-    elif reddit_dataset_version == 'large':
+    
+    else:
         _dir_path = utils_nlg.get_path("./dataset/reddit_large")
 
-    if os.path.exists(_dir_path):
-        use_local = True
-    else:
-        use_local = False
-        os.makedirs(_dir_path, exist_ok=True)
+    os.makedirs(_dir_path, exist_ok=True)
+
+
 
     if reddit_dataset_version == 'small':
+        use_local = os.path.exists(_dir_path)
         corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
-    elif reddit_dataset_version == 'large':
-        _list = [ 'relationship_advice', 'CasualConversation','interestingasfuck','penpals','science','askscience']
+    else:
+
+        #_list_options = [ 'CasualConversation','relationship_advice','interestingasfuck','science' ]
+        #_list = ['interestingasfuck']
+        #_list = ['science' ] #,'interestingasfuck','penpals','science'] 
+            #'relationship_advice' (9,995,066,31 bytes)
+            # CasualConversation 735,386,980
+            # interestingasfuck 354770199
+            # penpals 35372354
         
-        for idx, subreddit in enumerate( _list ):
-            if idx == 0:
-                merged_corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
-            else:
-                _corpus = Corpus(filename=download(f"reddit-corpus-{subreddit}", data_dir=_dir_path, use_local=use_local), merge_lines=True)
-                merged_corpus.merge(_corpus)
-        corpus = merged_corpus
+        #for idx, subreddit in enumerate( _list ):
+        subdir = f"subreddit-{reddit_dataset_version}"
+
+        full_path = os.path.join(_dir_path,subdir)
+        use_local = os.path.exists(full_path)
+        print(full_path)
+
+        corpus = Corpus(filename=download(f"subreddit-{reddit_dataset_version}",
+                            data_dir=full_path,use_local=use_local),
+                            merge_lines=False)
+            
+        corpus.print_summary_stats()
+
+        #     if idx == 0:
+        #         merged_corpus = _corpus
+        #     else:
+        #         merged_corpus.merge(_corpus,warnings=False)
+
+        # corpus = merged_corpus
     
+    print('\n')
     corpus.print_summary_stats()
 
     return corpus
@@ -750,7 +779,7 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
 
     return li_ranked_kws
         
-def _save_data(li_utterances, batch_save_size, dir_save_dataset):
+def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
     
     # Split list of utterances by the subreddit name
     # Then for each sublist
@@ -768,6 +797,7 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
         subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
         
         _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
+        
         #unlimited batch_size
         if batch_save_size < 0:
             files_ = os.listdir(subreddit_dir)
@@ -792,6 +822,18 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 dict_writer.writerows(_li_utterances)
             
             os.rename( old_fp, new_fp )
+
+        
+
+            # Updating record of last batch operated on for each subreddit
+            new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
+            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+            df_records = df_records.append(new_record, ignore_index=False)
+
+            for k,v in new_record.items():
+                df_records.loc[ subreddit, [k] ] =  k
+
+            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
 
         #limited batch save size - saving to existing file and any new files
         else:
@@ -872,15 +914,18 @@ if __name__ == '__main__':
 
     parser.add_argument('-sb','--start_batch', default=0, type=int)
 
+    parser.add_argument('-eb','--end_batch', default=0, type=int, help="Final batch to finish on. Set to 0 to run until end")
+
     parser.add_argument('--mp_damodules', default=3, type=int)
 
-    parser.add_argument('--annotate_da',default=True, type=bool)
+    parser.add_argument('-ad','--annotate_da',default=True, type=lambda x: bool(int(x)) )
 
-    parser.add_argument('--annotate_rst',default=True, type=bool)
 
-    parser.add_argument('--annotate_topic',default=True, type=bool)
+    parser.add_argument('-ar','--annotate_rst',default=True, type=lambda x: bool(int(x)) ) 
 
-    parser.add_argument('--reddit_dataset_version',default='small', type=str, choices=['small','large'])
+    parser.add_argument('-at','--annotate_topic',default=True, type=lambda x: bool(int(x)) )
+
+    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=['small','CasualConversation','relationship_advice','interestingasfuck','science'])
 
     args = parser.parse_args()
     
@@ -910,6 +955,11 @@ if __name__ == '__main__':
 
 #CUDA_VISIBLE_DEVICES= python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v008
 
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
-#python3 -bps 20 --mp_count 4 --danet_name DaNet_v008 -sb
+#-sb 0 -eb 127    
+#-sb 1400 -eb 1410
+#-sb 1800 -eb 2100 
+
+#python3 data_setup.py -bps 120 -ad 0 -rdv CasualConversation -sb  -eb 3000 --mp_count 2 
+#3675 #python3 data_setup.py -bps 120 -ad 0 -rdv relationship_advice -sb  0 -eb 1500 --mp_count 2
+#1604 #python3 data_setup.py -bps 120 -ad 0 -rdv interestingasfuck -sb 500 -eb 1500 --mp_count 2
+#python3 data_setup.py -bps 120 -ad 0 -rdv science -sb 2101 -eb 2137 --mp_count 2
