@@ -1,4 +1,11 @@
 import os
+#os.environ['export NCCL_DEBUG']='INFO'
+#os.environ['NCCL_IB_DISABLE'] = "1"
+#export NCCL_DEBUG=INFO
+#os.environ['NCCL_P2P_DISABLE']='1'
+
+os.environ['CUDA_LAUNCH_BLOCKING']="1"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -708,7 +715,7 @@ class NLG(nn.Module):
             input_ids = torch.cat([input_ids, tokens_to_add.unsqueeze(-1)], dim=-1) 
             input_embeds = torch.cat( [input_embeds, next_input_embed ], axis=-2 ).contiguous()
             
-            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device() )
+            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device )
             position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
 
             token_type_ids = torch.cat( [token_type_ids, next_token_type_ids[None, ...] ] )
@@ -716,7 +723,7 @@ class NLG(nn.Module):
                 #The new utterance token will be able to attend to all prev values
             old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
             _ = old_attnm_shape.shape
-            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device() )
+            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device )
             
             new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
             new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
@@ -952,13 +959,13 @@ class NLG(nn.Module):
             token_type_ids = torch.cat( [token_type_ids, next_token_type_ids[None, ...] ] )
 
             #Joining new outputs to existing or redifining old inputs                        
-            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device() )
+            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
                        
                 #The new utterance token will be able to attend to all prev values
             old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
             _ = old_attnm_shape.shape
-            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device() )
+            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device)
             
             new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
             new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
@@ -1061,15 +1068,15 @@ class NLG(nn.Module):
        
         return mparams
 
-    def __call__(self, input_, skip_embed1=False):
+    # def __call__(self, input_, skip_embed1=False):
 
-        if skip_embed1 == False:
-            input_ = self.forward_embedding(input_)
+    #     if skip_embed1 == False:
+    #         input_ = self.forward_embedding(input_)
         
-        outputs = self.transformer(input_)
-        lm_logits = self.lm_head( outputs[0] )
+    #     outputs = self.transformer(input_)
+    #     lm_logits = self.lm_head( outputs[0] )
 
-        return lm_logits # Only returns the logits from the output layer
+    #     return lm_logits # Only returns the logits from the output layer
 
 
     def forward_embedding(self, input_):
@@ -1083,7 +1090,7 @@ class NLG(nn.Module):
         
         return input_
 
-    def forward(self, input_):
+    def forward(self, input_, skip_embed1=False):
         """[summary]
 
         Args:
@@ -1093,7 +1100,8 @@ class NLG(nn.Module):
             [type]: [description]
         """
         # Handles embedding of our new non word features
-        input_ = self.forward_embedding(input_)
+        if skip_embed1 == False:
+            input_ = self.forward_embedding(input_)
                 
         # Feed input to distilgpt2
         
@@ -1103,22 +1111,26 @@ class NLG(nn.Module):
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                                             # Further we handle token_type embedding in forward_embedding layer
                                     return_dict=False)
+        hidden_states = outputs[0]
+        lm_logits = self.lm_head( hidden_states )
 
-        if self.loss_type == "CrossEntropy":      
-        
-            hidden_states = outputs[0]
-            lm_logits = self.lm_head( hidden_states )
-
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = input_['labels'][..., 1:].contiguous() 
+        if 'labels' in input_:
             
-            loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            if self.loss_type == "CrossEntropy":      
+        
+                # Shift so that tokens < n predict n
+                shift_logits = lm_logits[..., :-1, :].contiguous()
+                shift_labels = input_['labels'][..., 1:].contiguous() 
+                
+                loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        elif self.loss_type == "UtteranceSimilarity":
-            raise NotImplementedError
+            elif self.loss_type == "UtteranceSimilarity":
+                raise NotImplementedError
     
-        return loss #dictionary
+            return (lm_logits, loss) 
+
+        else:
+            return lm_logits
     
     def layer_embedding(self, input_):
         """Performs the input embedding and token type embedding calcs
@@ -1305,7 +1317,7 @@ class NLG_tokenizer():
         # Initalising tokenzier
 
         if os.path.isdir(dir_tokenizer):
-            self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_tokenizer)
+            self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_tokenizer,use_fast=False)
 
         # retreiving base tokenizer from online or from local distillgpt2
         else:
@@ -1313,11 +1325,11 @@ class NLG_tokenizer():
             exists = os.path.isdir(dir_transformer)            
 
             if exists==True:
-                self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_transformer)
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_transformer, use_fast=False)
                 config = AutoConfig.from_pretrained(dir_transformer)
 
             elif exists==False:
-                self.e2m_tokenizer = AutoTokenizer.from_pretrained(self.e2m_base_model_name)
+                self.e2m_tokenizer = AutoTokenizer.from_pretrained(self.e2m_base_model_name,use_fast=False)
                 config = AutoConfig.from_pretrained(self.e2m_base_model_name)
 
             # Adding special tokens
@@ -1486,7 +1498,7 @@ class NLG_tokenizer():
             # n<m for each word in each topic phrase i of length m_i including leading <ta> where 4>=n>=4+topics_len//2
             # 3:utterance part
 
-        token_type_ids_d = torch.zeros( [da_len ] , dtype=torch.long) + 1
+        token_type_ids_d = torch.zeros( [self.context_len['da'] ] , dtype=torch.long) + 1
         token_type_ids_r = torch.zeros( [self.context_len['rst']], dtype=torch.long) + 2
         token_type_ids_utt = torch.zeros( [self.context_len['utt']], dtype=torch.long ) + 3
         
@@ -1572,7 +1584,7 @@ class NLG_tokenizer():
             # 3:utterance part
 
         token_type_ids_r = torch.zeros( [self.context_len['rst']], dtype=torch.long) + 1
-        token_type_ids_utt = torch.zeros( [utt_len], dtype=torch.long ) + 2
+        token_type_ids_utt = torch.zeros( [self.context_len['utt']  ], dtype=torch.long ) + 2
         
         _ = torch.zeros( [self.context_len['topics'] ], dtype=torch.long)
         _[ ta_tokens_pos ] = 1
@@ -1701,8 +1713,8 @@ class NLG_tokenizer():
             
             # Find a way to get utterance length without tokeinzer
             tknzd_utt_no_pad_len = encoded['length'][0]
-            pad_count = (self.context_len['utt']) - len(tknzd_utt_no_pad_len)               
-            encoded['input_ids'] = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_diff).fill_(self.e2m_tokenizer.pad_token) ],axis=-1 )
+            pad_count = (self.context_len['utt']) - tknzd_utt_no_pad_len            
+            encoded['input_ids'] = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(self.e2m_tokenizer.eos_token_id) ],axis=-1 )
                                            
         
         elif pad == False:
@@ -1771,7 +1783,7 @@ class TrainingModule(pl.LightningModule):
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data', default="./dataset/reddit_small_mc", help="Relative directory path for datafiles")
+        parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=80, type=int)
         parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
@@ -1830,7 +1842,7 @@ class TrainingModule(pl.LightningModule):
             except KeyError:
                 pass
             del checkpoint
-            torch.cuda.empty_cache()
+            #torch.cuda.empty_cache()
             
             #Restore/update Training Module
             training_module = TrainingModule(**tparams, model_params=mparams)
@@ -1875,8 +1887,9 @@ class TrainingModule(pl.LightningModule):
                         check_val_every_n_epoch=1, logger=tb_logger,
                         log_every_n_steps=1,
                         precision=tparams['precision'], callbacks=callbacks,
-                        accelerator='ddp',
-                        limit_train_batches = 0.8,
+                        #accelerator='ddp2', amp_level='O2',# use_amp=True,
+                        accelerator='dp',
+                        #limit_train_batches = 0.8,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -1894,8 +1907,9 @@ class TrainingModule(pl.LightningModule):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     log_every_n_steps=1,   
                     precision=tparams['precision'],callbacks=callbacks,
-                    accelerator='ddp',
-                    limit_train_batches = 0.8,
+                    #accelerator='ddp2',  amp_level='O2', # use_amp=True,
+                    accelerator='dp',
+                    #limit_train_batches = 0.8,
                     #limit_val_batches = ,
                     #track_grad_norm = True,
                     #overfit_batches=5
@@ -1973,14 +1987,15 @@ class TrainingModule(pl.LightningModule):
     def step(self, batch, step_name):
         
         input_= batch
-        loss = self.forward(input_)
+        _, loss = self.forward(input_) #(lm_logits and loss)
         loss_key = f"{step_name}_loss"
         
         if step_name == 'train':
             str_loss_key = "loss"
         else:
             str_loss_key = loss_key       
-            self.log( str_loss_key, loss, sync_dist=True)
+            #self.log( str_loss_key, loss, sync_dist=True)
+            self.log( str_loss_key, loss)
         
         _dict = { str_loss_key: loss }   
 
@@ -2032,7 +2047,8 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
+            #self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
+            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
     def create_data_loaders(self, shuffle=False, **kwargs):
        
@@ -2071,8 +2087,10 @@ class TrainingModule(pl.LightningModule):
 
             #lr_schedule = get_constant_schedule_with_warmup( optimizer, warmup_steps )
 
+            last_epoch = self.current_epoch if self.current_epoch != 0 else -1
+
             lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
-                            warmup_steps, self.total_steps(), 3, last_epoch=self.current_epoch)
+                            warmup_steps, self.total_steps(), 3, last_epoch=last_epoch )
 
             return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step"}]
         
@@ -2238,12 +2256,11 @@ class SingleDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, index):
         
-        das, rst_rels, topics, topics_score,utterance = self.extract_datum(index)
+        das, rst_rels, topics, topics_score,utterance = self.getitem_extract_datum(index)
                     
-        encoded = self.tokenize(das, rst_rels, topics, 
+        encoded = self.getitem_tokenize(das, rst_rels, topics, 
                                     topics_score, utterance,
-                                    prev_das=None, prev_rst=None,
-                                    stem_context_utterance=self.stem_context_utterance )
+                                    pad_utterance=True )
 
             # encoded May include some of the following
             #( da_start_token, tnsr_das,    
@@ -2346,8 +2363,13 @@ if __name__ == '__main__':
 
     if tparams.gpus not in [0,1]:
         #mp.set_start_method('spawn')
+        #os.environ['NCCL_P2P_DISABLE']='1'
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
+        #os.environ['LOCAL_RANK'] = '1'
+        #os.environ['NCCL_SOCKET_IFNAME'] = "eth0"
+        pass
+
 
     main(vars(tparams), vars(mparams))
 
@@ -2355,4 +2377,4 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 3 
 
 # Training with no DA
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train_nlg.py -bs 28 -agb 3 --gpus 4 -fda 0 --workers 16
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train_nlg.py -bs 28 -agb 2 --gpus 2 -fda 0 --workers 16 --version 40
