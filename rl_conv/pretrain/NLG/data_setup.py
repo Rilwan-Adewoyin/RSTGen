@@ -22,7 +22,7 @@ from transformers import AutoTokenizer, AutoModel
 import docker
 import math
 import itertools
-
+import pandas as pd
 import nltk
 nltk.download('stopwords')
 import rake_nltk
@@ -354,7 +354,7 @@ def main(danet_vname,
         timer.start()
             # format = subreddit/convo_code
         li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
-        _save_data(li_utterances, batch_save_size, dir_save_dataset)
+        _save_data(li_utterances, batch_save_size, dir_save_dataset, batches_completed, batch_process_size )
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
@@ -391,13 +391,13 @@ def _load_data(reddit_dataset_version):
             # penpals 35372354
         
         #for idx, subreddit in enumerate( _list ):
-        subdir = f"subreddit-{subreddit}"
+        subdir = f"subreddit-{reddit_dataset_version}"
 
         full_path = os.path.join(_dir_path,subdir)
         use_local = os.path.exists(full_path)
         print(full_path)
 
-        corpus = Corpus(filename=download(f"subreddit-{subreddit}",
+        corpus = Corpus(filename=download(f"subreddit-{reddit_dataset_version}",
                             data_dir=full_path,use_local=use_local),
                             merge_lines=False)
             
@@ -779,7 +779,7 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
 
     return li_ranked_kws
         
-def _save_data(li_utterances, batch_save_size, dir_save_dataset):
+def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
     
     # Split list of utterances by the subreddit name
     # Then for each sublist
@@ -797,6 +797,7 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
         subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
         
         _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
+        
         #unlimited batch_size
         if batch_save_size < 0:
             files_ = os.listdir(subreddit_dir)
@@ -821,6 +822,18 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset):
                 dict_writer.writerows(_li_utterances)
             
             os.rename( old_fp, new_fp )
+
+        
+
+            # Updating record of last batch operated on for each subreddit
+            new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
+            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+            df_records = df_records.append(new_record, ignore_index=False)
+
+            for k,v in new_record.items():
+                df_records.loc[ subreddit, [k] ] =  k
+
+            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
 
         #limited batch save size - saving to existing file and any new files
         else:
@@ -946,6 +959,7 @@ if __name__ == '__main__':
 #-sb 1400 -eb 1410
 #-sb 1800 -eb 2100 
 
-#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 800 -eb 1400 --mp_count 4
-#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 1410 -eb 1600 --mp_count 2
-#python3 data_setup.py -bps 120 -ad 0 -rdv large -sb 2101 -eb 2137 --mp_count 2
+#python3 data_setup.py -bps 120 -ad 0 -rdv CasualConversation -sb  -eb 3000 --mp_count 2 
+#3675 #python3 data_setup.py -bps 120 -ad 0 -rdv relationship_advice -sb  0 -eb 1500 --mp_count 2
+#1604 #python3 data_setup.py -bps 120 -ad 0 -rdv interestingasfuck -sb 500 -eb 1500 --mp_count 2
+#python3 data_setup.py -bps 120 -ad 0 -rdv science -sb 2101 -eb 2137 --mp_count 2
