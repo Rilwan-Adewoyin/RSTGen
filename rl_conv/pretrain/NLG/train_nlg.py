@@ -1,9 +1,4 @@
 import os
-#os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-#os.environ["NCCL_DEBUG"]="INFO"
-#os.environ["TOKENIZERS_PARALLELISM"] = "false"
-#os.environ['NCCL_P2P_DISABLE'] = '1'
-#TODO: adding caching
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,8 +34,7 @@ import transformers
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
 from transformers import Adafactor, AdamW
-#import torch_optimizer as optim
-#from torch import optim
+
 from pytorch_lightning import loggers as pl_loggers
 from collections import OrderedDict
 import yaml
@@ -49,6 +43,8 @@ import types
 from functools import wraps
 from copy import deepcopy
 
+from itertools import permutations, combinations, combinations_with_replacement
+from typing import Optional, Callable, Union, Optional, List, Iterable
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
 def monkey_save_model(self, filepath: str, trainer, pl_module):
@@ -250,22 +246,6 @@ def forward(
 def get_output_embeddings(self):
     return self.lm_head
 
-#Monkey patching approx_sq_grad 
-#@staticmethod
-# def _approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col):
-#     r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_()
-#     c_factor = exp_avg_sq_col.rsqrt()
-     
-#     # r_factor = r_factor.unsqueeze(-1)
-#     # c_factor = c_factor.unsqueeze(0)
-#     #raise Exception(f"{r_factor.shape}\n\n{c_factor.shape}")
-#     #return torch.matmul(r_factor, c_factor)
-#     #return torch.mm(r_factor, c_factor)
-    
-#     #return torch.mm(r_factor.unsqueeze(-1), c_factor.unsqueeze(0))
-#     #return torch.matmul(r_factor.unsqueeze(-1), c_factor.unsqueeze(0))
-#     return torch.mm( r_factor.reshape([ -1,1]) , c_factor.reshape([1,-1] ) )
-
 
 class NLG(nn.Module):
     """NLG unit
@@ -285,8 +265,7 @@ class NLG(nn.Module):
         self.frst = frst
         self.ftopic = ftopic
 
-        
-
+    
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
         
@@ -326,47 +305,736 @@ class NLG(nn.Module):
         
         self.loss_type = loss_type 
         self.loss_fct = CrossEntropyLoss()
-        
-    def generate(self, encoded_input, generate_params):
-        ## generate_params :    max_length, min_length,
-            # do_sample: Optional[bool] = None,
-            # early_stopping: Optional[bool] = None,
-            # num_beams: Optional[int] = None,
-            # temperature: Optional[float] = None,
-            # top_k: Optional[int] = None,
-            # top_p: Optional[float] = None,
-            # repetition_penalty: Optional[float] = None,
-            # bad_words_ids: Optional[Iterable[int]] = None,
-            # bos_token_id: Optional[int] = None,
-            # pad_token_id: Optional[int] = None,
-            # eos_token_id: Optional[int] = None,
-            # length_penalty: Optional[float] = None,
-            # no_repeat_ngram_size: Optional[int] = None,
-            # num_return_sequences: Optional[int] = None,
 
-        #Embedded the inputs
-        input_ = self.forward_embedding(encoded_input)
-            
-        # Generating output
-            #Ensure that all inputs have a batch dimension
+    @torch.no_grad()
+    def generate(self, 
+        _input,
+        max_length: Optional[int] = None,
+        min_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        early_stopping: Optional[bool] = None,
+        num_beams: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        bad_words_ids: Optional[Iterable[int]] = None,
+        bos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        length_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None,
+        num_return_sequences: Optional[int] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_start_token_id: Optional[int] = None,
+        use_cache: Optional[bool] = None,
+        **model_specific_kwargs 
+        ) -> torch.LongTensor:
+
+        r""" Generates sequences for models with a LM head."""
+
+        #Half Embedded the inputs to get input_embed
+        input_ids = input_['tknzd_utt'] #need to make sure no padding is done here ??
+        input_ = self.forward_embedding(encoded_input) 
+        input_embeds = input_['input_embeds']
+        attention_mask = input_['attn_mask']
+        position_ids = input_['position_ids']
+        token_type_ids = None
+        # Need to get the input ids (tknzd_utterance)
         
+        #region - (original code) parameter init and checks
+        # We cannot generate if the model does not have a LM head
+        if self.get_output_embeddings() is None:
+            raise AttributeError(
+                "You tried to generate sequences with a model that does not have a LM Head."
+                "Please use another model class (e.g. `OpenAIGPTLMHeadModel`, `XLNetLMHeadModel`, `GPT2LMHeadModel`, `CTRLLMHeadModel`, `T5WithLMHeadModel`, `TransfoXLLMHeadModel`, `XLMWithLMHeadModel`, `BartForConditionalGeneration` )"
+            )
+
+        max_length = max_length if max_length is not None else self.config.max_length
+        min_length = min_length if min_length is not None else self.config.min_length
+        do_sample = do_sample if do_sample is not None else self.config.do_sample
+        early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        num_beams = num_beams if num_beams is not None else self.config.num_beams
+        temperature = temperature if temperature is not None else self.config.temperature
+        top_k = top_k if top_k is not None else self.config.top_k
+        top_p = top_p if top_p is not None else self.config.top_p
+        repetition_penalty = repetition_penalty if repetition_penalty is not None else self.config.repetition_penalty
+        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+        no_repeat_ngram_size = (
+            no_repeat_ngram_size if no_repeat_ngram_size is not None else self.config.no_repeat_ngram_size
+        )
+        bad_words_ids = bad_words_ids if bad_words_ids is not None else self.config.bad_words_ids
+        num_return_sequences = (
+            num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
+        )
+        decoder_start_token_id = (
+            decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
+        )
+
+        if input_ids is not None:
+            batch_size = inputs_embeds.shape[0]  #changed here : overriden by the input batch_size
+        else:
+            batch_size = 1
+        
+        assert batch_size == 1 #changed here
+
+        assert isinstance(max_length, int) and max_length > 0, "`max_length` should be a strictly positive integer."
+        assert isinstance(min_length, int) and min_length >= 0, "`min_length` should be a positive integer."
+        assert isinstance(do_sample, bool), "`do_sample` should be a boolean."
+        assert isinstance(early_stopping, bool), "`early_stopping` should be a boolean."
+        assert isinstance(use_cache, bool), "`use_cache` should be a boolean."
+        assert isinstance(num_beams, int) and num_beams > 0, "`num_beams` should be a strictly positive integer."
+        assert temperature > 0, "`temperature` should be strictly positive."
+        assert isinstance(top_k, int) and top_k >= 0, "`top_k` should be a positive integer."
+        assert 0 <= top_p <= 1, "`top_p` should be between 0 and 1."
+        assert repetition_penalty >= 1.0, "`repetition_penalty` should be >= 1."
+        assert input_ids is not None or (
+            isinstance(bos_token_id, int) and bos_token_id >= 0
+        ), "If input_ids is not defined, `bos_token_id` should be a positive integer."
+        assert pad_token_id is None or (
+            isinstance(pad_token_id, int) and (pad_token_id >= 0)
+        ), "`pad_token_id` should be a positive integer."
+        assert (eos_token_id is None) or (
+            isinstance(eos_token_id, int) and (eos_token_id >= 0)
+        ), "`eos_token_id` should be a positive integer."
+        assert length_penalty > 0, "`length_penalty` should be strictly positive."
+        assert (
+            isinstance(no_repeat_ngram_size, int) and no_repeat_ngram_size >= 0
+        ), "`no_repeat_ngram_size` should be a positive integer."
+        assert (
+            isinstance(num_return_sequences, int) and num_return_sequences > 0
+        ), "`num_return_sequences` should be a strictly positive integer."
+        assert (
+            bad_words_ids is None or isinstance(bad_words_ids, list) and isinstance(bad_words_ids[0], list)
+        ), "`bad_words_ids` is either `None` or a list of lists of tokens that should not be generated"
+
+        if input_ids is None:
+            assert isinstance(bos_token_id, int) and bos_token_id >= 0, (
+                "you should either supply a context to complete as `input_ids` input "
+                "or a `bos_token_id` (integer >= 0) as a first token to start the generation."
+            )
+            input_ids = torch.full(
+                (batch_size, 1), bos_token_id, dtype=torch.long, device=next(self.parameters()).device,
+            )
+        else:
+            assert input_ids.dim() == 2, "Input prompt should be of shape (batch_size, sequence length)."
+
+        # not allow to duplicate outputs when greedy decoding
+        if do_sample is False:
+            if num_beams == 1:
+                # no_beam_search greedy generation conditions
+                assert (
+                    num_return_sequences == 1
+                ), "Greedy decoding will always produce the same output for num_beams == 1 and num_return_sequences > 1. Please set num_return_sequences = 1"
+
+            else:
+                # beam_search greedy generation conditions
+                assert (
+                    num_beams >= num_return_sequences
+                ), "Greedy beam search decoding cannot return more sequences than it has beams. Please set num_beams >= num_return_sequences"
+        #endregion
+
+        #region - (original code) sort pad_token_id and handle case of encoder-decoder
+
+        # create attention mask if necessary
+        # # TODO (PVP): this should later be handled by the forward fn() in each model in the future see PR 3140
+        # if (attention_mask is None) and (pad_token_id is not None) and (pad_token_id in input_ids):
+        #     attention_mask = input_ids.ne(pad_token_id).long()
+        # elif attention_mask is None:
+        #     attention_mask = input_ids.new_ones(input_ids.shape)
+
+        # set pad_token_id to eos_token_id if not set. Important that this is done after
+        # attention_mask is created
+        if pad_token_id is None and eos_token_id is not None:
+            logger.warning(
+                "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
+            )
+            pad_token_id = eos_token_id
+
+        # current position and vocab size
+        if hasattr(self.config, "vocab_size"):
+            vocab_size = self.config.vocab_size
+        elif (
+            self.config.is_encoder_decoder
+            and hasattr(self.config, "decoder")
+            and hasattr(self.config.decoder, "vocab_size")
+        ):
+            vocab_size = self.config.decoder.vocab_size
+
+        # set effective batch size and effective batch multiplier according to do_sample
+        if do_sample:
+            effective_batch_size = batch_size * num_return_sequences
+            effective_batch_mult = num_return_sequences
+        else:
+            effective_batch_size = batch_size
+            effective_batch_mult = 1
+
+        # if self.config.is_encoder_decoder:
+        #     if decoder_start_token_id is None:
+        #         decoder_start_token_id = bos_token_id
+
+        #     assert (
+        #         decoder_start_token_id is not None
+        #     ), "decoder_start_token_id or bos_token_id has to be defined for encoder-decoder generation"
+        #     assert hasattr(self, "get_encoder"), "{} should have a 'get_encoder' function defined".format(self)
+        #     assert callable(self.get_encoder), "{} should be a method".format(self.get_encoder)
+
+        #     # get encoder and store encoder outputs
+        #     encoder = self.get_encoder()
+
+        #     encoder_outputs: tuple = encoder(input_ids, attention_mask=attention_mask)
+
+
+        #endregion
+        
+        #region  -(Reshaping tensors that need it and some more encoder-decoder logic)
+
+        # Expand input ids if num_beams > 1 or num_return_sequences > 1
+        if num_return_sequences > 1 or num_beams > 1:
+            input_ids_len = input_ids.shape[-1]
+            input_embeds_dim = input_embeds.shape[-1]
+
+            input_ids = input_ids.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len)
+            input_embeds = input_embeds.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len, input_embeds_dim) #Change
+            attention_mask = attention_mask.unsqueeze(1).expand(
+                batch_size, effective_batch_mult * num_beams, input_ids_len, input_ids_len
+            )
+
+            input_ids = input_ids.contiguous().view(
+                effective_batch_size * num_beams, input_ids_len
+            )  # shape: (batch_size * num_return_sequences * num_beams, cur_len)
+            input_embeds = input_embeds.contiguous().view(
+                effective_batch_size * num_beams, input_ids_len, input_embeds_dim
+            )  # shape: (batch_size * num_return_sequences * num_beams, cur_len, dim1)
+            attention_mask = attention_mask.contiguous().view(
+                effective_batch_size * num_beams, input_ids_len, input_ids_len
+            )  # shape: (batch_size * num_return_sequences * num_beams, cur_len, dim1)
+
+        if self.config.is_encoder_decoder:
+            # create empty decoder_input_ids
+            input_ids = torch.full(
+                (effective_batch_size * num_beams, 1),
+                decoder_start_token_id,
+                dtype=torch.long,
+                device=next(self.parameters()).device,
+            )
+            cur_len = 1
+
+            assert (
+                batch_size == encoder_outputs[0].shape[0]
+            ), f"expected encoder_outputs[0] to have 1st dimension bs={batch_size}, got {encoder_outputs[0].shape[0]} "
+
+            # expand batch_idx to assign correct encoder output for expanded input_ids (due to num_beams > 1 and num_return_sequences > 1)
+            expanded_batch_idxs = (
+                torch.arange(batch_size)
+                .view(-1, 1)
+                .repeat(1, num_beams * effective_batch_mult)
+                .view(-1)
+                .to(input_ids.device)
+            )
+            # expand encoder_outputs
+            encoder_outputs = (encoder_outputs[0].index_select(0, expanded_batch_idxs), *encoder_outputs[1:])
+
+        else:
+            encoder_outputs = None
+            cur_len = input_ids.shape[-1]
+
+        #endregion
+
+
+
         #TODO: batch size is calculated on line 280 uses first index of input_ids or set to 1
         # input_embeds should be two dimensionl
-        output = self.transformer.generate(  
-                        inputs_ids = input_['input_ids'],
+        if num_beams > 1:
+            output = self._generate_beam_search(  
+                inputs_ids = input_ids,
+                inputs_embeds = input_embeds,
+                position_ids=position_ids,
+                attention_mask = attention_mask,
+                token_type_ids = None,
 
-                        inputs_embeds = input_['input_embeds'],
-                         position_ids=input_['position_ids'],
-                        attention_mask = input_['attn_mask'],
-                        token_type_ids = None,
-                        **generate_params )
-                        #may need to add other special tokens to the mix here
+                    cur_len=cur_len,
+                    max_length=max_length,
+                    min_length=min_length,
+                    do_sample=do_sample,
+                    early_stopping=early_stopping,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    bad_words_ids=bad_words_ids,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=eos_token_id,
+                    batch_size=effective_batch_size,
+                    num_return_sequences=num_return_sequences,
+                    length_penalty=length_penalty,
+                    num_beams=num_beams,
+                    vocab_size=vocab_size,
+                    encoder_outputs=encoder_outputs,
+                    use_cache=use_cache,
+                    model_specific_kwargs=model_specific_kwargs,
+                **generate_params )
+                #may need to add other special tokens to the mix here
 
+        else:
+            output = self._generate_no_beam_search(
+                inputs_ids = input_ids,
+                inputs_embeds = input_embeds,
+                position_ids=position_ids,
+                attention_mask = attention_mask,
+                token_type_ids = None,
+
+                cur_len=cur_len,
+                max_length=max_length,
+                min_length=min_length,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                bad_words_ids=bad_words_ids,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                batch_size=effective_batch_size,
+                encoder_outputs=encoder_outputs,
+
+                use_cache=use_cache,
+                model_specific_kwargs=model_specific_kwargs,
+            )
+
+        return output
         
-        decoded = self.nlg_tokenizer.e2m_tokenizer.decode( output, skip_special_tokens=True ) 
-    
 
-        return decoded
+    def _generate_no_beam_search(
+        self,
+        
+        input_ids,
+        input_embeds,
+        position_ids,
+        token_type_ids,
+
+        cur_len,
+        max_length,
+        min_length,
+        do_sample,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        no_repeat_ngram_size,
+        bad_words_ids,
+        pad_token_id,
+        eos_token_id,
+        batch_size,
+        encoder_outputs,
+        attention_mask,
+        use_cache,
+
+        **model_specific_kwargs,
+     ):
+        """ Generate sequences for each example without beam search (num_beams == 1).
+            All returned sequence are generated independantly.
+        """
+        # length of generated sentences / unfinished sentences
+        unfinished_sents = input_ids.new(batch_size).fill_(1)
+        sent_lengths = input_ids.new(batch_size).fill_(max_length)
+
+        past = (encoder_outputs, None) if encoder_outputs is not None else None
+
+        while cur_len < max_length:
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids, past=past, attention_mask=attention_mask,
+                position_ids=position_ids ,use_cache=use_cache, 
+                token_type_ids = token_type_ids,
+                **model_specific_kwargs
+            )
+
+            lm_logits = self(model_inputs, True )
+            next_token_logits = lm_logits[:, -1, :]
+
+            scores = self.postprocess_next_token_scores(
+                scores=next_token_logits,
+                input_ids=input_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                bad_words_ids=bad_words_ids,
+                cur_len=cur_len,
+                min_length=min_length,
+                max_length=max_length,
+                eos_token_id=eos_token_id,
+                repetition_penalty=repetition_penalty,
+                batch_size=batch_size,
+                num_beams=1,
+            )
+
+            # if model has past, then set the past variable to speed up decoding
+            if self._use_cache(outputs, use_cache):
+                past = outputs[1]
+
+            if do_sample:
+                # Temperature (higher temperature => more likely to sample low probability tokens)
+                if temperature != 1.0:
+                    scores = scores / temperature
+                # Top-p/top-k filtering
+                next_token_logscores = top_k_top_p_filtering(scores, top_k=top_k, top_p=top_p)
+                # Sample
+                probs = F.softmax(next_token_logscores, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                # Greedy decoding
+                next_token = torch.argmax(next_token_logits, dim=-1)
+
+            # update generations and finished sentences
+            if eos_token_id is not None:
+                # pad finished sentences if eos_token_id exist
+                tokens_to_add = next_token * unfinished_sents + (pad_token_id) * (1 - unfinished_sents)
+            else:
+                tokens_to_add = next_token
+
+            # definining new inputs to append to old inputs
+            next_input_embed =  self.trasnformer.wte(tokens_to_add) # (batch, 1)
+
+            if self.fda and self.frst:
+                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(4) #Token type id of context utterance
+            elif self.fda==False and self.frst:
+                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(3) #Token type id of context utterance
+
+            #Joining new outputs to existing or redifining old inputs
+            input_ids = torch.cat([input_ids, tokens_to_add.unsqueeze(-1)], dim=-1) 
+            input_embeds = torch.cat( [input_embeds, next_input_embed ], axis=-2 ).contiguous()
+            
+            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device() )
+            position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
+
+            token_type_ids = torch.cat( [token_type_ids, next_token_type_ids[None, ...] ] )
+                
+                #The new utterance token will be able to attend to all prev values
+            old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
+            _ = old_attnm_shape.shape
+            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device() )
+            
+            new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
+            new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
+            new_attn_mask[:, -1:, : ] = new_mask_col.repeat([_[0],1,1])
+            new_attn_mask[:, :, -1: ] = new_mask_row.repeat([_[0],1,1])
+            attention_mask = new_attn_mask.contiguous()
+
+            
+            cur_len = cur_len + 1
+
+            if eos_token_id is not None:
+                eos_in_sents = tokens_to_add == eos_token_id
+                # if sentence is unfinished and the token to add is eos, sent_lengths is filled with current length
+                is_sents_unfinished_and_token_to_add_is_eos = unfinished_sents.mul(eos_in_sents.long()).bool()
+                sent_lengths.masked_fill_(is_sents_unfinished_and_token_to_add_is_eos, cur_len)
+                # unfinished_sents is set to zero if eos in sentence
+                unfinished_sents.mul_((~eos_in_sents).long())
+
+            # stop when there is a </s> in each sentence, or if we exceed the maximul length
+            if unfinished_sents.max() == 0:
+                break
+
+            # extend attention_mask for new generated input if only decoder
+            if self.config.is_encoder_decoder is False:
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+
+        return input_ids
+
+    def _generate_beam_search(
+        self,
+        input_ids,
+        cur_len,
+        max_length,
+        min_length,
+        do_sample,
+        early_stopping,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        no_repeat_ngram_size,
+        bad_words_ids,
+        pad_token_id,
+        eos_token_id,
+        batch_size,
+        num_return_sequences,
+        length_penalty,
+        num_beams,
+        vocab_size,
+        encoder_outputs,
+        attention_mask,
+        use_cache,
+        model_specific_kwargs,
+         ):
+        """ Generate sequences for each example with beam search.
+        """
+
+        # generated hypotheses
+        generated_hyps = [
+            BeamHypotheses(num_beams, max_length, length_penalty, early_stopping=early_stopping)
+            for _ in range(batch_size)
+        ]
+
+        # scores for each sentence in the beam
+        beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+
+        # for greedy decoding it is made sure that only tokens of the first beam are considered to avoid sampling the exact same tokens three times
+        if do_sample is False:
+            beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)  # shape (batch_size * num_beams,)
+
+        # cache compute states
+        past = (encoder_outputs, None) if encoder_outputs is not None else None
+
+        # done sentences
+        done = [False for _ in range(batch_size)]
+
+        while cur_len < max_length:
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids, past=past, attention_mask=attention_mask,
+                position_ids=position_ids , 
+                token_type_ids = token_type_ids, use_cache=use_cache, **model_specific_kwargs
+            )
+            lm_logits = self(model_inputs, True)  # (batch_size * num_beams, cur_len, vocab_size)
+            next_token_logits = lm_logits[:, -1, :]  # (batch_size * num_beams, vocab_size)
+
+            # if model has past, then set the past variable to speed up decoding
+            if self._use_cache(outputs, use_cache):
+                past = outputs[1]
+            if self.config.is_encoder_decoder and do_sample is False:
+                # TODO (PVP) still a bit hacky here - there might be a better solution
+                next_token_logits = self.adjust_logits_during_generation(
+                    next_token_logits, cur_len=cur_len, max_length=max_length
+                )
+
+            scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
+
+            scores = self.postprocess_next_token_scores(
+                scores=scores,
+                input_ids=input_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                bad_words_ids=bad_words_ids,
+                cur_len=cur_len,
+                min_length=min_length,
+                max_length=max_length,
+                eos_token_id=eos_token_id,
+                repetition_penalty=repetition_penalty,
+                batch_size=batch_size,
+                num_beams=num_beams,
+            )
+
+            assert scores.shape == (batch_size * num_beams, vocab_size), "Shapes of scores: {} != {}".format(
+                scores.shape, (batch_size * num_beams, vocab_size)
+            )
+
+            if do_sample:
+                _scores = scores + beam_scores[:, None].expand_as(scores)  # (batch_size * num_beams, vocab_size)
+                # Temperature
+                if temperature != 1.0:
+                    _scores = _scores / temperature
+                # Top-p/top-k filtering
+                _scores = top_k_top_p_filtering(
+                    _scores, top_k=top_k, top_p=top_p, min_tokens_to_keep=2
+                )  # (batch_size * num_beams, vocab_size)
+                # re-organize to group the beam together to sample from all beam_idxs
+                _scores = _scores.contiguous().view(
+                    batch_size, num_beams * vocab_size
+                )  # (batch_size, num_beams * vocab_size)
+
+                # Sample 2 next tokens for each beam (so we have some spare tokens and match output of greedy beam search)
+                probs = F.softmax(_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=2 * num_beams)  # (batch_size, num_beams * 2)
+                # Compute next scores
+                next_scores = torch.gather(_scores, -1, next_tokens)  # (batch_size, num_beams * 2)
+                # sort the sampled vector to make sure that the first num_beams samples are the best
+                next_scores, next_scores_indices = torch.sort(next_scores, descending=True, dim=1)
+                next_tokens = torch.gather(next_tokens, -1, next_scores_indices)  # (batch_size, num_beams * 2)
+
+            else:
+                next_scores = scores + beam_scores[:, None].expand_as(scores)  # (batch_size * num_beams, vocab_size)
+
+                # re-organize to group the beam together (we are keeping top hypothesis accross beams)
+                next_scores = next_scores.view(
+                    batch_size, num_beams * vocab_size
+                )  # (batch_size, num_beams * vocab_size)
+
+                next_scores, next_tokens = torch.topk(next_scores, 2 * num_beams, dim=1, largest=True, sorted=True)
+
+            assert next_scores.size() == next_tokens.size() == (batch_size, 2 * num_beams)
+
+            # next batch beam content
+            next_batch_beam = []
+
+            # for each sentence
+            for batch_idx in range(batch_size):
+
+                # if we are done with this sentence, add a pad token
+                if done[batch_idx]:
+                    assert (
+                        len(generated_hyps[batch_idx]) >= num_beams
+                    ), "Batch can only be done if at least {} beams have been generated".format(num_beams)
+                    assert (
+                        eos_token_id is not None and pad_token_id is not None
+                    ), "generated beams >= num_beams -> eos_token_id and pad_token have to be defined"
+                    next_batch_beam.extend([(0, pad_token_id, 0)] * num_beams)  # pad the batch
+                    continue
+
+                # next sentence beam content, this will get added to next_batch_beam
+                next_sent_beam = []
+
+                # next tokens for this sentence
+                for beam_token_rank, (beam_token_id, beam_token_score) in enumerate(
+                    zip(next_tokens[batch_idx], next_scores[batch_idx])
+                ):
+                    # get beam and token IDs
+                    beam_id = beam_token_id // vocab_size
+                    token_id = beam_token_id % vocab_size
+
+                    effective_beam_id = batch_idx * num_beams + beam_id
+                    # add to generated hypotheses if end of sentence
+                    if (eos_token_id is not None) and (token_id.item() == eos_token_id):
+                        # if beam_token does not belong to top num_beams tokens, it should not be added
+                        is_beam_token_worse_than_top_num_beams = beam_token_rank >= num_beams
+                        if is_beam_token_worse_than_top_num_beams:
+                            continue
+                        generated_hyps[batch_idx].add(
+                            input_ids[effective_beam_id].clone(), beam_token_score.item(),
+                        )
+                    else:
+                        # add next predicted token since it is not eos_token
+                        next_sent_beam.append((beam_token_score, token_id, effective_beam_id))
+
+                    # once the beam for next step is full, don't add more tokens to it.
+                    if len(next_sent_beam) == num_beams:
+                        break
+
+                # Check if we are done so that we can save a pad step if all(done)
+                done[batch_idx] = done[batch_idx] or generated_hyps[batch_idx].is_done(
+                    next_scores[batch_idx].max().item(), cur_len
+                )
+
+                # update next beam content
+                assert len(next_sent_beam) == num_beams, "Beam should always be full"
+                next_batch_beam.extend(next_sent_beam)
+                assert len(next_batch_beam) == num_beams * (batch_idx + 1), "We should have added num_beams each step"
+
+            # stop when we are done with each sentence
+            if all(done):
+                break
+
+            # sanity check / prepare next batchbeam_idx
+            assert len(next_batch_beam) == batch_size * num_beams
+            beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
+            beam_tokens = input_ids.new([x[1] for x in next_batch_beam])
+            beam_idx = input_ids.new([x[2] for x in next_batch_beam])
+
+            # re-order batch and update current length
+            input_ids = input_ids[beam_idx, :]
+            input_ids = torch.cat([input_ids, beam_tokens.unsqueeze(1)], dim=-1)
+            cur_len = cur_len + 1
+
+            #region changed : creating / adding to model inputs
+            input_embeds = input_embeds[beam_idx, :, :]
+            next_input_embed =  self.trasnformer.wte(beam_tokens.unsqueeze(1)) # (batch, 1)
+            input_embeds = torch.cat([input_embeds, next_input_embed ] , dim=-2 )
+
+            if self.fda and self.frst:
+                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(4) #Token type id of context utterance
+            elif self.fda==False and self.frst:
+                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(3) #Token type id of context utterance
+            token_type_ids = torch.cat( [token_type_ids, next_token_type_ids[None, ...] ] )
+
+            #Joining new outputs to existing or redifining old inputs                        
+            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device() )
+            position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
+                       
+                #The new utterance token will be able to attend to all prev values
+            old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
+            _ = old_attnm_shape.shape
+            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device() )
+            
+            new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
+            new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
+            new_attn_mask[:, -1:, : ] = new_mask_col.repeat([_[0],1,1])
+            new_attn_mask[:, :, -1: ] = new_mask_row.repeat([_[0],1,1])
+            attention_mask = new_attn_mask.contiguous()
+
+            #endregion
+            
+
+            # re-order internal states
+            if past is not None:
+                past = self._reorder_cache(past, beam_idx)
+
+            # extend attention_mask for new generated input if only decoder
+            if self.config.is_encoder_decoder is False:
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+
+        # finalize all open beam hypotheses and add to generated hypotheses
+        for batch_idx in range(batch_size):
+            if done[batch_idx]:
+                continue
+
+            # test that beam scores match previously calculated scores if not eos and batch_idx not done
+            if eos_token_id is not None and all(
+                (token_id % vocab_size).item() != eos_token_id for token_id in next_tokens[batch_idx]
+            ):
+                assert torch.all(
+                    next_scores[batch_idx, :num_beams] == beam_scores.view(batch_size, num_beams)[batch_idx]
+                ), "If batch_idx is not done, final next scores: {} have to equal to accumulated beam_scores: {}".format(
+                    next_scores[:, :num_beams][batch_idx], beam_scores.view(batch_size, num_beams)[batch_idx],
+                )
+
+            # need to add best num_beams hypotheses to generated hyps
+            for beam_id in range(num_beams):
+                effective_beam_id = batch_idx * num_beams + beam_id
+                final_score = beam_scores[effective_beam_id].item()
+                final_tokens = input_ids[effective_beam_id]
+                generated_hyps[batch_idx].add(final_tokens, final_score)
+
+        # depending on whether greedy generation is wanted or not define different output_batch_size and output_num_return_sequences_per_batch
+        output_batch_size = batch_size if do_sample else batch_size * num_return_sequences
+        output_num_return_sequences_per_batch = 1 if do_sample else num_return_sequences
+
+        # select the best hypotheses
+        sent_lengths = input_ids.new(output_batch_size)
+        best = []
+
+        # retrieve best hypotheses
+        for i, hypotheses in enumerate(generated_hyps):
+            sorted_hyps = sorted(hypotheses.beams, key=lambda x: x[0])
+            for j in range(output_num_return_sequences_per_batch):
+                effective_batch_idx = output_num_return_sequences_per_batch * i + j
+                best_hyp = sorted_hyps.pop()[1]
+                sent_lengths[effective_batch_idx] = len(best_hyp)
+                best.append(best_hyp)
+
+        # shorter batches are padded
+        if sent_lengths.min().item() != sent_lengths.max().item():
+            assert pad_token_id is not None, "`Pad_token_id` has to be defined"
+            sent_max_len = min(sent_lengths.max().item() + 1, max_length)
+            decoded = input_ids.new(output_batch_size, sent_max_len).fill_(pad_token_id)
+
+            # fill with hypothesis and eos_token_id if necessary
+            for i, hypo in enumerate(best):
+                decoded[i, : sent_lengths[i]] = hypo
+                if sent_lengths[i] < max_length:
+                    decoded[i, sent_lengths[i]] = eos_token_id
+        else:
+            # none of the hypotheses have an eos_token
+            assert (len(hypo) == max_length for hypo in best)
+            decoded = torch.stack(best).type(torch.long).to(next(self.parameters()).device)
+
+        return decoded    
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -392,6 +1060,17 @@ class NLG(nn.Module):
         mparams = parser.parse_known_args( )[0]
        
         return mparams
+
+    def __call__(self, input_, skip_embed1=False):
+
+        if skip_embed1 == False:
+            input_ = self.forward_embedding(input_)
+        
+        outputs = self.transformer(input_)
+        lm_logits = self.lm_head( outputs[0] )
+
+        return lm_logits # Only returns the logits from the output layer
+
 
     def forward_embedding(self, input_):
         #Partially does the emebddign for our new inputs to the transformer
@@ -424,7 +1103,7 @@ class NLG(nn.Module):
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                                             # Further we handle token_type embedding in forward_embedding layer
                                     return_dict=False)
-        
+
         if self.loss_type == "CrossEntropy":      
         
             hidden_states = outputs[0]
@@ -435,10 +1114,10 @@ class NLG(nn.Module):
             shift_labels = input_['labels'][..., 1:].contiguous() 
             
             loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
- 
+
         elif self.loss_type == "UtteranceSimilarity":
             raise NotImplementedError
-        
+    
         return loss #dictionary
     
     def layer_embedding(self, input_):
@@ -547,7 +1226,7 @@ class NLG(nn.Module):
 
         return None
 
-    def prepare_inputs_for_generation(self, input_ids, input_embeds, past=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, input_embeds, attention_mask, position_ids ,past=None, **kwargs):
         
         # only last token for inputs_ids if past is defined in kwargs
         if past:
@@ -558,8 +1237,8 @@ class NLG(nn.Module):
         return {
             "input_ids": input_ids,
             'input_embeds':input_embeds,
-            "attention_mask": kwargs.get("attention_mask"),
-            "position_ids": kwargs.get("position_ids"),
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
 
             "past_key_values": past,
 
@@ -621,8 +1300,7 @@ class NLG_tokenizer():
         
         self.context_len['utt'] = self.max_input_len - sum(self.context_len.values())
 
-        #print(self.context_len)
-
+        
         
         # Initalising tokenzier
 
@@ -660,10 +1338,61 @@ class NLG_tokenizer():
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
                 config.save_pretrained(dir_tokenizer)
 
+    def rst_vectors(version="combinations", relations="all", **kwargs):
+        """
+            Allows the user to select partiuclar rst_vectors in order to control their output
+
+            version: rule to decide how to compose relations
+            relations: A list of the relations to utilise
+         """
+        assert ( count>0 and count<7 )
+
+        if relations == "all":
+            relations = [[rel] for rel in self.rst_rel_li]
+        
+        assert type(relations)== list
+
+        if version=="combinations":
+            
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_comb = combinations( rst_rel_li, combination_count )
+            li_rst_comb =  list(iter_rst_comb)
+            li_rst_comb = random(li_rst_comb)
+
+            li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
+
+
+            rst_rel_encoded = self.rst_rel_binarizer.transform( li_rst_comb ) #list of list of each relation
+        
+        elif version=="permutations":
+            
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_perm = permutations( rst_rel_li, combination_count )
+            li_rst_perm =  list(iter_rst_perm)
+            li_rst_perm = random(li_rst_perm)
+
+            li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]           
+
+            rst_rel_encoded = self.rst_rel_binarizer.transform( li_rst_perm ) #list of list of each relation
+
+        elif version=="combinations_with_replacement":
+            
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_combwr = combinations_with_replacement( rst_rel_li, combination_count )
+            li_rst_combwr =  list(iter_rst_combwr)
+            li_rst_combwr = random(li_rst_combwr)
+
+            li_rst_combwr = li_rst_combwr[: kwargs.get("return_count",10) ]           
+
+
+            rst_rel_encoded = self.rst_rel_binarizer.transform( li_rst_perm ) #list of list of each relation
+
+        return rst_rel_encoded
+
 
     def __call__(self, das=None, rst_rels=None, topics=None, topics_score=None, 
                     utterance=None, prev_das=None, prev_rst=None,
-                    stem_context_utterance = -1):
+                    stem_context_utterance = -1, pad_utterance=True):
         
         #Stem context utterance decides whether or not to reduce the size of the context.
             #This is only helpful when evaluating how model produces output given a fixed small starting to the sentence
@@ -674,19 +1403,19 @@ class NLG_tokenizer():
         if self.fda and self.frst and self.ftopic:
 
             outp = self.encode_v2(das ,rst_rels,topics, topics_score, 
-                    utterance)
+                    utterance,pad_utterance)
         
         elif self.fda==False and self.frst and self.ftopic:
             
             outp = self.encode_v2_exda(rst_rels, topics, topics_score, 
-                    utterance)
+                    utterance,pad_utterance)
         else:
             NotImplementedError
             
         return outp
 
     def encode_v2( self, das ,rst_rels,topics, topics_score, 
-                    utterance, prev_das=None, prev_rst=None):
+                    utterance, pad_utterance):
 
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -705,34 +1434,20 @@ class NLG_tokenizer():
         rst_start_token = self.e2m_tokenizer.encode("<|rst|>")[0] 
         padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") 
 
-        #Defining max len for subsections
-        da_len = self.context_len['da']
-        rst_len = self.context_len['rst']
-        topics_len = self.context_len['topics'] # This means at least topics_len/2 topics included
-        utt_len = self.context_len['utt']
 
         #Getting Vectors
         tnsr_das = self.encode_da( das ) #dims (1, 20), 
-        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=rst_len - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=topics_len, padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, max_len=self.context_len['utt'], padding_token=padding_token)
+        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
                             
         # Building Attention Mask
 
             # calc the ending cumulative dim for da, rst, topics, utt, segments,
-        d_dim = da_len
-        dr_dim = da_len + rst_len       # d_dim + tnsr_rst_rels.shape[0]+ 1
-        drt_dim = dr_dim +topics_len    # dr_dim + tnsr_topics_phrase.shape[1]
-        utt_dim = drt_dim + utt_len  
-
-            # padding dimensions (after utterance end)
-        seq_len =  utt_dim 
-        padding_len = self.max_input_len - utt_dim 
-
-        if padding_len>0:
-            tknzd_utt = torch.cat( [tknzd_utt, torch.LongTensor(padding_token).repeat(padding_len)] )
-        else:
-            tknzd_utt  = tknzd_utt[:padding_len]
+        d_dim = self.context_len['da']
+        dr_dim = da_len + self.context_len['rst']       # d_dim + tnsr_rst_rels.shape[0]+ 1
+        drt_dim = dr_dim + self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
+        utt_dim = drt_dim + self.context_len['utt']  
 
             # creating mask
         attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
@@ -749,34 +1464,21 @@ class NLG_tokenizer():
                 
                 #correcting for padding in and after utterance section
         attn_mask[ utt_dim-utt_pad_count: , : ] = 0
-        #attn_mask[ : , utt_dim-utt_pad_count: ] = 0
 
         #Creating labels/targets for GPT Language Model Head
         labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
         
-        if padding_len>0:
-            labels[0][drt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
-        
-        elif padding_len == 0:
-            labels[0][drt_dim:utt_dim] = tknzd_utt[:utt_dim- drt_dim]
+        labels[0][drt_dim:utt_dim] = tknzd_utt[:utt_dim- drt_dim]
 
-        else:
-            labels[0][drt_dim:utt_dim] = tknzd_utt[ : utt_dim- drt_dim ]
 
         # Creating Positional Emebeddings
             # ALL words in drt get a positional encoding of 0 -> No positional meaning
             # utterance has normal positional encoding        
         position_ids_drt = torch.zeros([drt_dim], dtype=torch.long) 
         position_ids_utt =  torch.arange( 1, utt_dim-drt_dim + 1  , dtype=torch.long)
-        
+    
+        position_ids = torch.cat([position_ids_drt,position_ids_utt], axis=-1)
 
-        if padding_len>0:
-            position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
-            position_ids = torch.cat([position_ids_drt,position_ids_utt, position_ids_pad], axis=-1)
-        elif padding_len == 0:
-            position_ids = torch.cat([position_ids_drt,position_ids_utt], axis=-1)
-        else:
-            position_ids = torch.cat([position_ids_drt,position_ids_utt[:padding_len]], axis=-1)
 
         # Creating Token Type Ids
             # 1:da, 
@@ -785,25 +1487,14 @@ class NLG_tokenizer():
             # 3:utterance part
 
         token_type_ids_d = torch.zeros( [da_len ] , dtype=torch.long) + 1
-        token_type_ids_r = torch.zeros( [rst_len], dtype=torch.long) + 2
-        token_type_ids_utt = torch.zeros( [utt_len], dtype=torch.long ) + 3
+        token_type_ids_r = torch.zeros( [self.context_len['rst']], dtype=torch.long) + 2
+        token_type_ids_utt = torch.zeros( [self.context_len['utt']], dtype=torch.long ) + 3
         
-        _ = torch.zeros( [topics_len ], dtype=torch.long)
+        _ = torch.zeros( [self.context_len['topics'] ], dtype=torch.long)
         _[ ta_tokens_pos ] = 1
         token_type_ids_t =  _.cumsum(axis=0) + 3
-
-        if padding_len>0:
-            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
-            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
-                                token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
-        elif padding_len == 0:
-            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
+        token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
                     token_type_ids_t, token_type_ids_utt] ) 
-
-        else:
-            token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r,\
-                                token_type_ids_t, token_type_ids_utt[:padding_len] ] ) 
-
 
         return { 'da_start_token':da_start_token, 'tnsr_das':tnsr_das,
                  'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,
@@ -812,12 +1503,11 @@ class NLG_tokenizer():
                  'attn_mask':attn_mask,
                  'labels':labels,
                  'position_ids':position_ids,
-                 'token_type_ids':token_type_ids,
-                 'seq_len':torch.IntTensor( [seq_len] )
+                 'token_type_ids':token_type_ids
                  }
 
     def encode_v2_exda( self,rst_rels,topics, topics_score, 
-                    utterance, prev_das=None, prev_rst=None):
+                    utterance, pad_utterance):
 
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -834,35 +1524,20 @@ class NLG_tokenizer():
         rst_start_token = self.e2m_tokenizer.encode("<|rst|>")[0] 
         padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") 
 
-        #Defining max len for subsections
-        rst_len = self.context_len['rst']
-        topics_len = self.context_len['topics'] # This means at least topics_len/2 topics included
-        utt_len = self.context_len['utt']
 
         #Getting Vectors
-        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=rst_len - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=topics_len, padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, max_len=self.context_len['utt'],
-                                    padding_token=padding_token)
+        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
                             
         # Building Attention Mask
 
             # calc the ending cumulative dim for, rst, topics, utt, segments,
-        r_dim = rst_len       # tnsr_rst_rels.shape[0]
-        rt_dim = r_dim +topics_len    # dr_dim + tnsr_topics_phrase.shape[1]
-        utt_dim = rt_dim + utt_len  
+        r_dim = self.context_len['rst']       # tnsr_rst_rels.shape[0]
+        rt_dim = r_dim +self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
+        utt_dim = rt_dim + self.context_len['utt']  
 
-            # padding dimensions (after utterance end)
-        seq_len =  utt_dim 
-        padding_len = self.max_input_len - utt_dim 
-
-        if padding_len>0:
-            tknzd_utt = torch.cat( [tknzd_utt, torch.LongTensor(padding_token).repeat(padding_len)] )
-        elif padding_len == 0:
-            pass
-        else:
-            tknzd_utt  = tknzd_utt[:padding_len]
-
+                
             # creating mask
         attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
                     #pre_utterance general masking
@@ -881,57 +1556,30 @@ class NLG_tokenizer():
 
         #Creating labels/targets for GPT Language Model Head
         labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
-        
-        if padding_len>0:
-            labels[0][rt_dim:utt_dim-utt_pad_count] = tknzd_utt[:-(utt_pad_count+padding_len)]
-        
-        elif padding_len == 0:
-            labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
-        
-        else:
-            labels[0][rt_dim:utt_dim] = tknzd_utt[ : utt_dim- rt_dim ]
 
+        labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
+        
         # Creating Positional Emebeddings
             # ALL words in drt get a positional encoding of 0 -> No positional meaning
             # utterance has normal positional encoding        
         position_ids_rt = torch.zeros([rt_dim], dtype=torch.long) 
         position_ids_utt =  torch.arange( 1, utt_dim-rt_dim + 1  , dtype=torch.long)
-        
-
-        if padding_len>0:
-            position_ids_pad = torch.zeros( [padding_len], dtype=torch.long)
-            position_ids = torch.cat([position_ids_rt,position_ids_utt, position_ids_pad], axis=-1)
-        
-        elif padding_len==0:
-            position_ids = torch.cat([position_ids_rt,position_ids_utt], axis=-1)
-        
-        else:
-            position_ids = torch.cat([position_ids_rt,position_ids_utt[:padding_len]], axis=-1)
+        position_ids = torch.cat([position_ids_rt,position_ids_utt], axis=-1)
 
         # Creating Token Type Ids
-            # 1:da, 
-            # 2:rst, 
+            # 1:rst, 
             # n<m for each word in each topic phrase i of length m_i including leading <ta> where 4>=n>=4+topics_len//2
             # 3:utterance part
 
-        token_type_ids_r = torch.zeros( [rst_len], dtype=torch.long) + 1
+        token_type_ids_r = torch.zeros( [self.context_len['rst']], dtype=torch.long) + 1
         token_type_ids_utt = torch.zeros( [utt_len], dtype=torch.long ) + 2
         
-        _ = torch.zeros( [topics_len ], dtype=torch.long)
+        _ = torch.zeros( [self.context_len['topics'] ], dtype=torch.long)
         _[ ta_tokens_pos ] = 1
         token_type_ids_t =  _.cumsum(axis=0) + 2
 
-        if padding_len>0:
-            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
-            token_type_ids = torch.cat( [token_type_ids_r,\
-                                token_type_ids_t, token_type_ids_utt, token_type_ids_pad] ) 
-        elif padding_len==0:
-            token_type_ids_pad = torch.ones( [padding_len], dtype=torch.long)
-            token_type_ids = torch.cat( [token_type_ids_r,\
-                                token_type_ids_t, token_type_ids_utt] ) 
-        else:
-            token_type_ids = torch.cat( [token_type_ids_r,\
-                                token_type_ids_t, token_type_ids_utt[:padding_len] ] ) 
+        token_type_ids = torch.cat( [token_type_ids_r,\
+                            token_type_ids_t, token_type_ids_utt] ) 
 
 
         return { 'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,
@@ -940,8 +1588,7 @@ class NLG_tokenizer():
                  'attn_mask':attn_mask,
                  'labels':labels,
                  'position_ids':position_ids,
-                 'token_type_ids':token_type_ids,
-                 'seq_len':torch.IntTensor( [seq_len] )
+                 'token_type_ids':token_type_ids
                  }
 
     def encode_rst_v2(self,rst_rels, max_padding=8):
@@ -1031,35 +1678,49 @@ class NLG_tokenizer():
 
         return topic_phrases , tnsr_score, diff, ta_idxs
 
-    def encode_utterance_v2(self, utterance, max_len=208, padding_token='<|endoftext|>'):
-        #TODO: Generation: here the utterance/input_ids is padding to fit a certain length.
-            #   This may not fit our purpose for geeration
+    def encode_utterance_v2(self, utterance, pad=True):
+        #pad: 
+        #   set to True during training to ensure all batches have the same length
+        #   set to False in the case of Generation in order to work with huggingface .generate()
+        #TODO: change to be able to handle batches of data
+        #TODO: When you move to training on large seequences performing variable batch sizes to reduce time
 
         utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
-        encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
+        
+        if pad == True:
+            encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
+                                        
                                         padding='do_not_pad',
                                         truncation=True, 
+                                        max_length= self.context_len['utt'],
+                                                                                
                                         return_tensors='pt',
                                         return_length=True,
                                         return_token_type_ids=None)
+            
+            # Find a way to get utterance length without tokeinzer
+            tknzd_utt_no_pad_len = encoded['length'][0]
+            pad_count = (self.context_len['utt']) - len(tknzd_utt_no_pad_len)               
+            encoded['input_ids'] = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_diff).fill_(self.e2m_tokenizer.pad_token) ],axis=-1 )
+                                           
+        
+        elif pad == False:
+            encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
+                                        return_attention_mask = False, 
+                                        padding='do_not_pad',
+                                        truncation=True, 
+                                        max_length= self.context_len['utt'],
+                                        return_tensors='pt',
+                                        return_length=True,
+                                        return_token_type_ids=None)
+            tknzd_utt_no_pad_len = encoded['length'][0]
+            pad_count = 0
+
         
         tknzd_utt = encoded['input_ids'][0]
-        _len = encoded['length']
-        diff = (max_len - _len)[0]
         
-        if diff>0:
-            tknzd_utt = torch.cat( [ tknzd_utt, torch.ones([diff], dtype=torch.int64)*padding_token[0]] )
-        
-        elif diff == 0:
-            pass
-            
-
-        else:
-            tknzd_utt = tknzd_utt[:max_len]
-            diff = 0
-
-        return tknzd_utt, diff
+        return tknzd_utt, pad_count
 
 class TrainingModule(pl.LightningModule):
 
@@ -1570,6 +2231,24 @@ class SingleDataset(torch.utils.data.Dataset):
         return (self.line_end - self.line_start)
     
     def __getitem__(self, index):
+        
+        das, rst_rels, topics, topics_score,utterance = self.extract_datum(index)
+                    
+        encoded = self.tokenize(das, rst_rels, topics, 
+                                    topics_score, utterance,
+                                    prev_das=None, prev_rst=None,
+                                    stem_context_utterance=self.stem_context_utterance )
+
+            # encoded May include some of the following
+            #( da_start_token, tnsr_das,    
+             #rst_start_token, tnsr_rst_rels,
+             #tnsr_topics_phrase, tnsr_topics_score, 
+             # tknzd_utt,
+             # attn_mask
+             # labels)
+        return encoded
+
+    def getitem_extract_datum(self, index):
         datum = self.data[index:index+1]
 
         #Dialogue Act
@@ -1612,20 +2291,16 @@ class SingleDataset(torch.utils.data.Dataset):
         
         #Utterance
         utterance = datum['txt_preproc'].values[0].strip('\"')
-                    
+        
+        return das, rst_rels, topics, topics_score,utterance
+
+    def getitem_tokenize(self, das, rst_rels, topics, topics_score,utterance,pad_utterance=True):
         encoded = self.tokenizer(das, rst_rels, topics, 
                                     topics_score, utterance,
                                     prev_das=None, prev_rst=None,
-                                    stem_context_utterance=self.stem_context_utterance )      
-            # encoded May include some of the following
-            #( da_start_token, tnsr_das,    
-             #rst_start_token, tnsr_rst_rels,
-             #tnsr_topics_phrase, tnsr_topics_score, 
-             # tknzd_utt,
-             # attn_mask
-             # labels)
+                                    stem_context_utterance=self.stem_context_utterance, pad_utterance=pad_utterance)
         return encoded
- 
+
 def main(tparams={}, mparams={}):
     gc.collect()
     torch.cuda.empty_cache()

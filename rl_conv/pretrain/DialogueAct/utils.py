@@ -37,14 +37,12 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
     if exists == False:   
 
         if model_name == "tuner007/pegasus_paraphrase":
-            model_tokenizer = PegasusTokenizer.from_pretrained(model_name)
+            model_tokenizer = PegasusTokenizer.from_pretrained(model_name, use_fast=False)
             model = PegasusForConditionalGeneration.from_pretrained(model_name)
         else:
-            model_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model_tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
             model = AutoModel.from_pretrained(model_name)
 
-        
-        
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
 
