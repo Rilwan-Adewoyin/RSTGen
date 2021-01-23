@@ -31,7 +31,7 @@ import utils_nlg as utils
 import random 
 
 import transformers
-from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup
+from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
 from transformers import Adafactor, AdamW
 
@@ -1800,7 +1800,7 @@ class TrainingModule(pl.LightningModule):
         Args:
             tparams ([type]): [description]
         """
-        
+        pl.seed_everything(10)
         if tparams['mode'] in ["train_new"]:
             training_module = TrainingModule(**tparams, model_params=mparams  )
             
@@ -1861,10 +1861,11 @@ class TrainingModule(pl.LightningModule):
             min_delta=0.00,
             patience=30,
             verbose=False,
-            mode='auto'
+            mode='min'
         )
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
+
 
         if tparams['mode'] in ["train_new"]:
             
@@ -1875,7 +1876,7 @@ class TrainingModule(pl.LightningModule):
                         log_every_n_steps=1,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator='ddp',
-                        limit_train_batches = 0.6,
+                        limit_train_batches = 0.8,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -1894,7 +1895,8 @@ class TrainingModule(pl.LightningModule):
                     log_every_n_steps=1,   
                     precision=tparams['precision'],callbacks=callbacks,
                     accelerator='ddp',
-                    limit_train_batches = 0.6,
+                    limit_train_batches = 0.8,
+                    #limit_val_batches = ,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
@@ -1925,8 +1927,8 @@ class TrainingModule(pl.LightningModule):
             for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
                 scheduler['scheduler'].load_state_dict(lrs_state)
 
-            del checkpoint
-            torch.cuda.empty_cache()
+            #del checkpoint
+            #torch.cuda.empty_cache()
 
         return trainer
     
@@ -1939,10 +1941,11 @@ class TrainingModule(pl.LightningModule):
 
             if torch.cuda.is_available():
                 #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage) )
-                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))  
-                                
+                #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage.cuda())  
+                checkpoint = torch.load(best_ckpt_path, map_location='cpu' )  
+
             else:
-                checkpoint = torch.load(best_ckpt_path, map_location=torch.device('cpu'))            
+                checkpoint = torch.load(best_ckpt_path, map_location='cpu')            
         else:
             raise NotImplementedError
         
@@ -1977,7 +1980,7 @@ class TrainingModule(pl.LightningModule):
             str_loss_key = "loss"
         else:
             str_loss_key = loss_key       
-            self.log( str_loss_key, loss)
+            self.log( str_loss_key, loss, sync_dist=True)
         
         _dict = { str_loss_key: loss }   
 
@@ -2029,7 +2032,7 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
+            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
 
     def create_data_loaders(self, shuffle=False, **kwargs):
        
@@ -2066,24 +2069,27 @@ class TrainingModule(pl.LightningModule):
             
             warmup_steps = self.warmup_proportion*self.total_steps()
 
-            lr_schedule = transformers.get_constant_schedule_with_warmup( optimizer, warmup_steps )
+            #lr_schedule = get_constant_schedule_with_warmup( optimizer, warmup_steps )
+
+            lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
+                            warmup_steps, self.total_steps(), 3, last_epoch=self.current_epoch)
 
             return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step"}]
         
         elif self.optimizer_type == "Adafactor":
-                    # optimizer = Adafactor(
-        #     self.model.parameters(), lr=self.learning_rate,
-        #     eps=(1e-30, 1e-3),
-        #     clip_threshold=1.0,
-        #     decay_rate=-0.8,
-        #     beta1=None,
-        #     weight_decay=0.0,
-        #     relative_step=False,
-        #     scale_parameter=True,
-        #     warmup_init=False
-        # )
+            optimizer = Adafactor(
+                self.model.parameters(), lr=self.learning_rate,
+                eps=(1e-30, 1e-3),
+                clip_threshold=1.0,
+                decay_rate=-0.8,
+                beta1=None,
+                weight_decay=0.0,
+                relative_step=False,
+                scale_parameter=True,
+                warmup_init=False
+                )
 
-            # return [optimizer]
+            return [optimizer]
             raise NotImplementedError
 
     def return_params(self):
