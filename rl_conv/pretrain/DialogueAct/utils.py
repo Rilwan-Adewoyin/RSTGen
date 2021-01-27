@@ -59,19 +59,18 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
     
     return output
 
-def save_version_params(t_params, m_params, version_code="DaNet_v000"):
+def save_version_params(t_params=None, m_params=None, version_code="DaNet_v000"):
     dated_trained = date.today().strftime("%d-%m-%Y")
-    
-    t_params.date_trained = dated_trained
-    m_params.date_trained = dated_trained
-
     _dir_version = get_path(f"./models/{version_code}/",_dir=True)
-    
-    tp_fp = os.path.join(_dir_version,'tparam.json')
-    mp_fp = os.path.join(_dir_version,'mparam.json')
 
-    if t_params.mode == "train_new":
+    if t_params is not None:
+        t_params['date_trained'] = dated_trained
+        tp_fp = os.path.join(_dir_version,'tparam.json')
         json.dump( vars(t_params), open(tp_fp,"w") )
+    
+    if m_params is not None:
+        m_params['date_trained'] = dated_trained 
+        mp_fp = os.path.join(_dir_version,'mparam.json')
         json.dump( vars(m_params), open(mp_fp,"w") )
 
     return True    

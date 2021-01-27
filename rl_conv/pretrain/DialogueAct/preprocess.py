@@ -1,17 +1,10 @@
-# Workflow
-
-# Split Dataset into 12 new files
-# Then perform the following operations in parrallel
-    # preprocess
-    # add DA and RST annotations
-
-# Then reform dataset into one file and shuffle
-# Then set 75% as training set and 25% as test
-
+#This script preprocesses the text in the MIDAS, SWDBA and MRDA files
+#Creates one uniform dialogue act labelling
+#Uses pegasus to balance the dataset by replacing sentences
 
 import argparse
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
 import glob
@@ -38,14 +31,15 @@ from datetime import timedelta
 
 def main(argv=None):
     """Run the preprocessing pipeline."""
-    args = parse_args(argv)
+    params = parse_args(argv)
 
     #preprocessing train validation and test set
     
     sets = ['train','val','test']
-    #sets = ['val','test']
+    
     for _set in sets:
-        preprocess(args, _set )
+        print(f"Processing {_set} dataset")
+        preprocess(params, _set )
     
 
 def parse_args(argv=None):
@@ -59,7 +53,7 @@ def parse_args(argv=None):
                 "Value must be positive, {} was passed.".format(value))
         return value
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     
 
     parser.add_argument(
@@ -82,7 +76,12 @@ def parse_args(argv=None):
         default= utils.get_path("combined_data/"),
         help="Output directory to write the dataset.")
 
-    
+    parser.add_argument('-pp',
+        '--paraphrase',
+        default=1,
+        type=int, choices=[0,1]
+    )
+
     parser.add_argument(
         "--num_cores", default=psutil.cpu_count(logical = False),
         type=_positive_int,
@@ -92,22 +91,22 @@ def parse_args(argv=None):
     return parser.parse_known_args(argv)[0]
 
 
-def preprocess(args, str_subset):
+def preprocess(params, str_subset):
     """[summary]
 
-    Args:
-        args ([type]): [description]
+    params:
+        params ([type]): [description]
         subset ([str]): Decides which datasets to preprocess options:['train','val','test']
 
     Raises:
         # OSError: [description]
     """
     #Obtaining dirs for dataset
-    dir_mrda_dset = os.path.join(args.dir_mrda, str_subset)
-    dir_swda_dset = os.path.join(args.dir_swda, str_subset)
-    dir_midas_dset = os.path.join(args.dir_midas, str_subset)
+    dir_mrda_dset = os.path.join(params.dir_mrda, str_subset)
+    dir_swda_dset = os.path.join(params.dir_swda, str_subset)
+    dir_midas_dset = os.path.join(params.dir_midas, str_subset)
 
-    dir_dset = os.path.join(args.output_dir, str_subset)
+    dir_dset = os.path.join(params.output_dir, str_subset)
     os.makedirs(dir_dset,exist_ok=True)
     
     #list of files to process
@@ -145,35 +144,48 @@ def preprocess(args, str_subset):
     names = { 'MRDA':['speaker','utterance','da'] ,'SWDB-DAMSL':['speaker','utterance','da'], 'MIDAS': ["utterance","da"]    }
     seps = {'MRDA':'|', "SWDB-DAMSL":"|", "MIDAS":"##" }
 
-    paraphrase_counts1 = {
-                        'action-directive': 15,
-                        'reject': 12,
-                        'summarize': 18,
-                        'quotation': 18,
-                        'hedge': 18,
-                        'elaboration': 9,
-                        'other-forward-function':3}  
-                        #NOTE: have to be even numbers, half half split for summarization and paraphrasing
-    
-    paraphrase_counts2 = {
-                        'action-directive': 6,
-                        'reject': 3,
-                        'summarize': 9,
-                        'quotation': 9,
-                        'hedge': 6,
-                        'elaboration': 3,
-                        'other-forward-function':3}  
-    
-    # Getting paraphraser
-    model_name = 'tuner007/pegasus_paraphrase'
-    torch_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dict_transformer = utils.load_pretrained_transformer(model_name, transformer=True, tokenizer=True)
-    model = dict_transformer['transformer']
-    tokenizer = dict_transformer['tokenizer']
-    (model).to(torch_device)
+    if params.paraphrase == 1:
+        # FOR SWDB-DAMSL
+        paraphrase_counts1 = {
+                            'action-directive': 12,
+                            'reject': 4, #keep reject low ,since paraphrases may mess this up
+                            'summarize': 16,
+                            'quotation': 16,
+                            'hedge': 16,
+                            'elaboration': 8,
+                            "thanking":16,
+                            "apology":16,
+                            "appreciation":6,
+                            "closing":16,
+                            "opening":16,
+                            }  
+                            
+        
+        #For MIDAS
+        paraphrase_counts2 = {
+                            'action-directive': 6,
+                            'reject': 2,
+                            'summarize': 6,
+                            'quotation': 6,
+                            'hedge': 6,
+                            'elaboration': 4,
+                            "thanking":6,
+                            "apology":6,
+                            "appreciation":2,
+                            "closing":6,
+                            "opening":6} 
+                            
+        
+        # Getting paraphraser
+        model_name = 'tuner007/pegasus_paraphrase'
+        torch_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        dict_transformer = utils.load_pretrained_transformer(model_name, transformer=True, tokenizer=True)
+        model = dict_transformer['transformer']
+        tokenizer = dict_transformer['tokenizer']
+        (model).to(torch_device)
 
     for ds_name, li_fns in zip( dataset_names, li_li_fns):
-        print(f"Operating on {ds_name} files")
+        print(f"\tOperating on {ds_name} files")
         start_time = time.time()
         da_to_remove = dict_da_map[ds_name]['removed']
         
@@ -188,8 +200,9 @@ def preprocess(args, str_subset):
 
                 li_df_convs  = [df_conv]
             
-            # Paraphrasing (makes pphrases per file and saves them)
-                response = _mk_pphrase(li_df_convs, paraphrase_counts1, model, tokenizer, dir_dset, ds_name, fn )
+                # Paraphrasing (makes pphrases per file and saves them)
+                if params.paraphrase == 1:
+                    response = _mk_pphrase(li_df_convs, paraphrase_counts1, model, tokenizer, dir_dset, ds_name, fn )
 
             elif ds_name in ['MIDAS']:
                 li_df_convs = _annotate_dialog_act_v2(df_conv, ds_name, dict_da_map)
@@ -199,16 +212,12 @@ def preprocess(args, str_subset):
                     path = os.path.join(dir_dset, f"midas_{idx:05d}.txt")
                     df.to_csv( path, header=True, index=False, sep="|")
 
-            # Paraphrasing (makes pphrases per file and saves them)
-                response = _mk_pphrase(li_df_convs, paraphrase_counts2, model, tokenizer, dir_dset, ds_name, fn )
-            
-            
-            
-            if counter+1 % 10 == 0:
-                print(f"\t\t Finished {counter} of {len(li_fns)}")
-        
+                # Paraphrasing (makes pphrases per file and saves them)
+                if params.paraphrase == 1:
+                    response = _mk_pphrase(li_df_convs, paraphrase_counts2, model, tokenizer, dir_dset, ds_name, fn )
+                    
         time_elapsed =time.time() - start_time
-        print(f"Finished {ds_name} files:\t Time Elapsed {time_elapsed} \n\n")   
+        print(f"\tFinished {ds_name} files:\t Time Elapsed {time_elapsed}")   
     return True
 
 def _get_fns(pattern):
@@ -219,7 +228,7 @@ def _annotate_dialog_act(df_conv, ds_name, dict_da_map):
     """ Annotation method for MRDA and SWDB"""
 
     def __parse_list_or_string(da):
-        _li = sum( [ dict_da_map[ds_name]['MCONV'][word] for word in da.split() ], [])
+        _li = sum( [ dict_da_map[ds_name]['MCONV'].get(word,'') for word in da.split() ], [])
         _set = set(_li)
         _set = sorted(_set)            
         _str = " ".join(_set)
@@ -232,20 +241,34 @@ def _annotate_dialog_act(df_conv, ds_name, dict_da_map):
     df_conv['utterance'] = df_conv['utterance'].str.replace(r'\b([\S ]+)(\s+\1)+[\b\.\?\!]', r'\1')
 
     #remove da if in removed list given utterance less than 2 words and does not have a MCONV mapping
+        
     remove = '|'.join(dict_da_map[ds_name]['removed'])
     pattern = re.compile(r'\b('+remove+r')\b', flags=re.IGNORECASE)
+        
+        #Removing minimum word limitation since it is removing alot of the "opening" category
+    # df_conv['da'] = df_conv.apply( 
+    #     lambda row: pattern.sub("", row.da) 
+    #     if len(row.da.split())<=2  and (row.da not in list(dict_da_map[ds_name]['MCONV'].keys()))
+    #     else row.da, axis=1)
 
     df_conv['da'] = df_conv.apply( 
         lambda row: pattern.sub("", row.da) 
-        if len(row.da.split())<=2  and (row.da not in list(dict_da_map[ds_name]['MCONV'].keys()))
+        if  (row.da not in list(dict_da_map[ds_name]['MCONV'].keys()))
         else row.da, axis=1)
 
-    #compress lines together if same speaker
+    #compress lines together if same speaker. 
     df_conv['key'] = (df_conv.speaker!=df_conv.speaker.shift(1)).cumsum()
     df_conv = df_conv.groupby(  ['key','speaker'], sort=False ).agg( lambda x: ' '.join(x) ).reset_index().drop('key',axis=1)
+
+    # df_conv['key'] = (df_conv.speaker!=df_conv.speaker.shift(1)).cumsum()
+    # df_conv = df_conv.groupby(  ['key','speaker'], sort=False ).agg( lambda x: ' '.join(x) ).reset_index().drop('key',axis=1)
+
+    # df_conv['key'] = (df_conv.speaker!=df_conv.speaker.shift(1)).cumsum()
+    # df_conv = df_conv.groupby(  ['key','speaker'], sort=False ).agg( lambda x: ' '.join(x) ).reset_index().drop('key',axis=1)
+    
     
     # remove whole utterance if no other dialoge act left
-    df_conv = df_conv[ df_conv.da.replace(" ", "") != "" ].reset_index(drop=True)
+    #df_conv = df_conv[ df_conv.da.replace(" ", "") != "" ].reset_index(drop=True)
 
         #read in file as a pandas dataframe and filter out coloumns to keep
     # convert das to mconv full schemes and remove repeated consecutive dialogue acts
@@ -286,7 +309,7 @@ def _annotate_dialog_act_v2(df_conv, ds_name, dict_da_map):
 
     def __midas_utterance_punctuation(utt):
         """Determines whether utterance is a question or statement"""
-        li_question_starters = ['What',"Why","Where","How","Who","When","What","Which","Is","Did","Does","Are","Can",'Have',"Would"]
+        li_question_starters = ['What',"Why","Where","How","Who","When","What","Which","Is","Did","Does","Are","Can","Would"]
         if utt.split(' ')[0] in li_question_starters:
             utt = utt + "?"
         else:
@@ -330,7 +353,7 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
         fn is the acc filenmae
     """
 
-    # Check for the any row that contains they above das but does not contain "statement"
+    # Check for the any row that contains das but does not contain "statement"
         #get their indexes
 
     
@@ -345,17 +368,24 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
     # Then return the list of two sentence paraphrased sentences.
 
     li_da_labels_to_pp = list(paraphrase_counts.keys())
-    li_das_not_to_pp = [] #["backchannel","statement"]#,"understanding","question","agreement"]
+    #li_das_not_to_pp = [] #["backchannel","statement"]#,"understanding","question","agreement"]
+    li_das_not_to_pp = ["statement"]#,"understanding","question","agreement"]
     li_df_pphrased = []
 
     for df in li_df_conv:
 
-    # Check for the any row that contains the above das but does not contain "statement"
-    # the lambda statment: returns true if all labels in x are in the list of das_to_pp but not in the 
-    # list of das to ignore
-        #1)
-##########################################################################
-        idxs_to_pp = df[ df.apply(lambda row: all( (da != '') and ((da in li_da_labels_to_pp) and (da not in li_das_not_to_pp )) for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
+        # Check for the any row that contains the above das but does not contain "statement"
+            # the lambda statment: returns true if all labels in x are in the list of das_to_pp and all labels are not in the non included list 
+               
+        
+        #At least one da is in the list of ones to paraphrase
+        #version 1
+        idxs_to_pp = df[ df.apply(lambda row:      any( (da != '') and (da in li_da_labels_to_pp)  for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
+
+        #at least one da is in the list of ones to paraphrase but "statement never occurs"
+        #version 2
+        #idxs_to_pp = df[ df.apply(lambda row:      all( (da != '') and ((da in li_da_labels_to_pp) and (da not in li_das_not_to_pp ) ) for da in (row['da'] if type(row['da'])==str else '').split(' ')  )  , axis=1) ].index.tolist()
+
 
             #  removing index 0 from list if there since cant get response to 0th index 
         idxs_to_pp = [idx for idx in idxs_to_pp if idx != 0]
@@ -363,16 +393,16 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
             continue
         rows_to_pp = df.iloc[idxs_to_pp] #row idxs for the current utterance
         
-    # Gather the amount of copies to make for each da label in rows_to_pp
-        copies_to_make = [ max( paraphrase_counts[x] for x in da_label.split(' ') if x!='' )  for da_label in rows_to_pp['da'].values.tolist() ]
+        # Gather the amount of copies to make for each da label in rows_to_pp
+        copies_to_make = [ max( paraphrase_counts.get(x,0) for x in da_label.split(' ') if x!='' )  for da_label in rows_to_pp['da'].values.tolist() ]
 
-    # Getting paraphrase
+        # Getting paraphrase
         #current utterance
-        li_li_pp_text = __get_response(model, tokenizer, rows_to_pp['utterance'].values.tolist() , copies_to_make )
+        li_li_pp_text = __get_response(model, tokenizer, rows_to_pp['utterance'].values.tolist() , copies_to_make, mode="context" )
         #prev utterance
-        li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist(), copies_to_make )
+        li_li_pp_text_prev = __get_response(model, tokenizer, df.iloc[np.array(idxs_to_pp)-1]['utterance'].values.tolist(), copies_to_make, mode="current_utterance" )
 
-    # make a list of new dfs with the paraphrase
+        # make a list of new dfs with the paraphrase
         
         for idx, li_pp_txt, li_pp_txt_prev in zip(idxs_to_pp,  li_li_pp_text, li_li_pp_text_prev):
             if li_pp_txt==[] or li_pp_txt_prev==[]:
@@ -395,23 +425,31 @@ def _mk_pphrase(li_df_conv, paraphrase_counts, model, tokenizer, dir_dset, ds_na
 
     return True
 
-def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
+def __get_response(model, tokenizer, li_input_text, li_num_return_sequences, mode):
     
     li_tgt_text = []
     for txt, num_ret_seq in zip( li_input_text, li_num_return_sequences):
         txt_len = len(txt.split(' '))
 
         if txt_len > 0:
-            #max_len = int(txt_len*2)
             
-            batch = tokenizer.prepare_seq2seq_batch([txt], truncation=True, padding='longest', max_length=60, return_tensors="pt").to('cuda')
+            batch = tokenizer.prepare_seq2seq_batch([txt], padding='longest', return_tensors="pt").to('cuda')
 
-            translated_pp = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=False, early_stopping=True,top_k=75, repetition_penalty=1.0,  ) #no_repeat_ngram_size=2
-   
-            translated_smrzd = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, temperature=2.2, do_sample=True, early_stopping=True, top_p=0.999, top_k=100,repetition_penalty=1.0, length_penalty=20.0 )
+            if mode == "context":
+                
 
-            translated_long = model.generate(**batch, max_length=60, num_beams=20, num_return_sequences=num_ret_seq//3, do_sample=True, temperature=2.1, early_stopping=True, top_k=150, top_p=0.999, length_penalty=0.01, repetition_penalty=1.0 )
+                translated_pp = model.generate(**batch, num_beams=int(num_ret_seq*3/4), num_return_sequences=int(num_ret_seq*3/4), do_sample=False, early_stopping=True,) 
+    
+                translated_smrzd = model.generate(**batch, num_beams=max( num_ret_seq//4, 1), num_return_sequences=max( num_ret_seq//4, 1) , temperature=1.7, do_sample=True )
+
+                translated_long = model.generate(**batch, num_beams=max( num_ret_seq//4, 1), num_return_sequences=max( num_ret_seq//4, 1), do_sample=True, temperature=1.9, early_stopping=True,  length_penalty=10.0, repetition_penalty=0.8 )
             
+            elif mode == "current_utterance":
+                translated_pp = model.generate(**batch, num_beams=max(num_ret_seq//3,1), num_return_sequences=max(num_ret_seq//3,1), do_sample=False)
+    
+                translated_smrzd = model.generate(**batch, num_beams=max(num_ret_seq//3,1), num_return_sequences=max(num_ret_seq//3,1), temperature=1.7, do_sample=True)
+
+                translated_long = model.generate(**batch, num_beams=max(num_ret_seq//3,1), num_return_sequences=max(num_ret_seq//3,1), do_sample=True, temperature=1.9, early_stopping=True,  length_penalty=10.0, repetition_penalty=0.8 )
             
             tgt_text_pp = tokenizer.batch_decode( translated_pp, skip_special_tokens=True )
             tgt_text_smrzd = tokenizer.batch_decode( translated_smrzd, skip_special_tokens=True )
@@ -422,7 +460,7 @@ def __get_response(model, tokenizer, li_input_text, li_num_return_sequences):
             #Adding question mark on the end if it was removed.
             ends_in_qmark = txt[-1] == "?"
             if ends_in_qmark:
-                tgt_text = [ txt2.rstrip('.')+"?" if txt2[-1]!="?" else txt2 for txt2 in  tgt_text ]
+                tgt_text = [ txt2.rstrip('.')+"?" if txt2[-1]!="?" else txt2 for txt2 in tgt_text if len(txt2)>0 ]
 
             li_tgt_text.append( tgt_text )
         else:
@@ -443,6 +481,14 @@ if __name__ == "__main__":
             print(e) 
             print("\n")
             print(traceback.print_exc())
-            print("\n\nRestarting Script\n\n")
+            print("\nRestarting Script\n\n")
             pass
 
+
+# Preprocess w/ paraphrasing
+# CUDA_VISIBLE_DEVICES=0 python3 preprocess.py 
+
+# Preprocess w/o paraphrasing
+# CUDA_VISIBLE_DEVICES=0 python3 preprocess.py --output_dir "combined_data_nopp/" -pp 0
+# CUDA_VISIBLE_DEVICES=0 python3 preprocess.py --output_dir "combined_data_v1/" -pp 1
+# CUDA_VISIBLE_DEVICES=1 python3 preprocess.py --output_dir "combined_data_v2/" -pp 1
