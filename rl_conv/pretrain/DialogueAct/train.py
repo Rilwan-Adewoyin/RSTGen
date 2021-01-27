@@ -61,12 +61,14 @@ class DaNet(nn.Module):
     """
 
     def __init__(self, freeze_transformer=False, dropout=0.1, 
-        base_model_name='bert-base-cased', model_name="DaNet", **kwargs):
+        base_model_name='bert-base-cased', model_name="DaNet", 
+        bert_output =  "PooledOutput", 
+        **kwargs):
 
         super(DaNet, self).__init__()
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
         #D_in, H, D_out = 768, 50, 12 #transformer frozer
-        D_in, H, D_out = 768, 56, 12
+        
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
@@ -75,7 +77,7 @@ class DaNet(nn.Module):
         self.tokenizer = dict_transformertokenizer['tokenizer']
         self.freeze_transformer = freeze_transformer
         self.dropout = dropout
-        self.bert_output = "pooled_output"
+        self.bert_output =bert_output
 
         # Create Entity masker
         self.nem = NamedEntityMasker()
@@ -87,20 +89,37 @@ class DaNet(nn.Module):
         
         # Create classifier Layer
         if self.bert_output == "PooledOutput":
-            self.classifier = nn.Sequential(
+            D_in,  D_out = 768, 17
+            self.lm_head = nn.Sequential(
                 nn.Dropout(self.dropout),
                 nn.Linear(D_in, D_out, bias=False ),
             )
             
-            for layer in self.classifier:
+            for layer in self.lm_head:
                 if isinstance(layer, nn.Linear):
                     layer.weight.data.normal_(mean=0.0, std=0.02)
                     if layer.bias is not None:
                         layer.bias.data.zero_()
-        
-        elif self.bert_output == "AllHiddenRepresentation":
+    
         
         elif self.bert_output == "CLSRepresentation":
+            D_in, H , D_out = 768, 96, 17
+
+            self.lm_head = nn.Sequential(
+                nn.Dropout(self.dropout),
+                nn.Linear(D_in, H, bias=False ),
+                Mish(),
+                nn.Dropout(self.dropout)
+                nn.Linear(H, D_out, bias=False )
+
+            )
+            
+            for layer in self.lm_head:
+                if isinstance(layer, nn.Linear):
+                    layer.weight.data.normal_(mean=0.0, std=0.02)
+                    if layer.bias is not None:
+                        layer.bias.data.zero_()
+
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -114,7 +133,7 @@ class DaNet(nn.Module):
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         parser.add_argument('--bert_output', default='PooledOutput', required=False,
-                choices=['PooledOutput','AllHiddenRepresentations','CLSRepresentation'] )
+                choices=['PooledOutput','SpecialTokens','CLSRepresentation'] )
         
         mparams = parser.parse_known_args( )[0]
 
@@ -163,17 +182,16 @@ class DaNet(nn.Module):
             # Using Pooled Output 
             pooled_output = outputs[1]
             lm_output = pooled_output
-        
-        elif self.bert_output == "AllHiddenRepresentation":
-            all_hidden_states = outputs[0][:, :, :]
 
 
         elif self.bert_output == "CLSRepresentation":
             # Extract the last hidden state of the token `[CLS]` for classification task
             last_hidden_state_cls = outputs[0][:, 0, :]
+            lm_output = pooled_output 
+
 
         # Feed input to classifier to compute logits
-        logits = self.classifier(hidden_state)
+        logits = self.lm_head(hidden_state)
 
         return logits
 
@@ -215,7 +233,7 @@ class TrainingModule(pl.LightningModule):
     def __init__(self, model=DaNet(), batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
-                    max_epochs=100,
+                    max_epochs=80,
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=8e-4,
@@ -223,19 +241,8 @@ class TrainingModule(pl.LightningModule):
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
-                    loss_weight = [0.3088291648106703,
-                            1.024000615817113,
-                            0.6991441820732512,
-                            0.3796431004385018,
-                            0.74682843474964,
-                            0.6538210826002997,
-                            0.48526149422196,
-                            0.8302135385261447,
-                            2.7958586868836464,
-                            1.387324107182697,
-                            0.5685039211966343,
-                            2.1205716714994423],
-                    loss_pos_weight = [12,12,12,12,12,12,12,12,12,12,12,12],
+                    loss_weight = [0.08357422207100744, 0.18385707428187334, 0.32489418776359946, 0.28270948437883026, 0.29028076340137576, 0.4732623391826486, 0.35614498126635913, 0.4461250027511672, 1.8474137400874857, 0.3309135146499394, 0.38481047800771817, 2.1815475734200995, 3.423830830287625, 3.5166546883532006, 0.2784219377456878, 0.14890703368264488, 2.446652148668739],
+                    loss_pos_weight = [17]*17,
                     max_length = 512,
                     *args,
                     **kwargs):
@@ -314,11 +321,16 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--version_name', default='', required=False)
         parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['LROnPlateau','cosine_warmup'])
         parser.add_argument('--loss_type',default="BCE", required=False, type=str)
-        parser.add_argument('-lcw','--loss_class_weight',default=[], required=False, type=int, nargs='+')
-        parser.add_argument('-lpw','--loss_pos_weight',default=[], required=False, type=int, nargs='+')
+        parser.add_argument('-lcw','--loss_class_weight',default=[], required=True, type=str)
+        parser.add_argument('-lpw','--loss_pos_weight',default=[], required=True, type=str)
         parser.add_argument('--gradient_clip_val',default=2.0, required=False, type=float)
         parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
         parser.add_argument('ml','--max_length', default=512, type=int)
+
+        tparams.loss_class_weight = json.loads( tparams.loss_class_weight )
+        tparams.loss_pos_weight = json.loads( tparams.loss_pos_weight )
+        #Since we are more concerned with false negatives than false positives, the lpw is increased by 1 for all classes
+        tparams.loss_pos_weight = [ val+2 for val in tparams.loss_pos_weight ]
 
         tparams = parser.parse_known_args()[0]
         if tparams.config_file_t != None:
@@ -624,13 +636,14 @@ class SingleDataset(torch.utils.data.Dataset):
         masked_utterances = list(self.nem(utterances))
         encoded_input = self.encode_tokenize( masked_utterances )
         #try:
-        # with warnings.catch_warnings():
-        #     warnings.simplefilter("ignore")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
         pre_bnrzd = das.split(" ") if ( type(das) == str ) else " "
         binarized_target = self.target_binarizer.transform( [  pre_bnrzd ] )
         
-        # except AttributeError as e:
-        #    binarized_target = np.zeros((1,12))
+        except AttributeError as e:
+           binarized_target = np.zeros((1,17))
 
 
         map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
@@ -789,8 +802,11 @@ if __name__ == '__main__':
     # The class weighting used is linear
 
 # CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 64 -agb {1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 } --gpus 3 --max_epochs 80
-# --mode train_new --version_name DaNet_v02 --bert_output AllHiddenRepresentations
+# --mode train_new --version_name DaNet_v02 --bert_output SpecialTokens
 # --dir_data ""./combined_data_v2" -lr 1e-4 -ml 512
+# -lcw '[0.08357422207100744, 0.18385707428187334, 0.32489418776359946, 0.28270948437883026, 0.29028076340137576, 0.4732623391826486, 0.35614498126635913, 0.4461250027511672, 1.8474137400874857, 0.3309135146499394, 0.38481047800771817, 2.1815475734200995, 3.423830830287625, 3.5166546883532006, 0.2784219377456878, 0.14890703368264488, 2.446652148668739]'
+# -lpw '[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]'
 
 
-#TODO sort out how the messages will be sliced if they are too long
+
+
