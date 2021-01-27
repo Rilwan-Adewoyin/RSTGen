@@ -6,8 +6,6 @@ import sklearn
 
 from pathlib import Path
 
-#import torchdata as td
-#from torchdata import datasets,Dataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +25,7 @@ from itertools import cycle, islice
 from torch.utils.data._utils.collate import default_convert, default_collate
 
 from transformers import BertTokenizer, BertModel
-from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 import transformers
 
 import pytorch_lightning as pl
@@ -63,12 +61,14 @@ class DaNet(nn.Module):
     """
 
     def __init__(self, freeze_transformer=False, dropout=0.1, 
-        base_model_name='bert-base-cased', model_name="DaNet", **kwargs):
+        base_model_name='bert-base-cased', model_name="DaNet", 
+        bert_output =  "PooledOutput", 
+        **kwargs):
 
         super(DaNet, self).__init__()
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
         #D_in, H, D_out = 768, 50, 12 #transformer frozer
-        D_in, H, D_out = 768, 56, 12
+        
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
@@ -77,6 +77,7 @@ class DaNet(nn.Module):
         self.tokenizer = dict_transformertokenizer['tokenizer']
         self.freeze_transformer = freeze_transformer
         self.dropout = dropout
+        self.bert_output =bert_output
 
         # Create Entity masker
         self.nem = NamedEntityMasker()
@@ -85,34 +86,60 @@ class DaNet(nn.Module):
         if self.freeze_transformer:
             for param in self.transformer.parameters():
                 param.requires_grad = False
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(self.dropout),
-            nn.Linear(D_in, D_out ),
-        )
         
-        for layer in self.classifier:
-            if isinstance(layer, nn.Linear):
-                layer.weight.data.normal_(mean=0.0, std=0.02)
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
+        # Create classifier Layer
+        if self.bert_output == "PooledOutput":
+            D_in,  D_out = 768, 17
+            self.lm_head = nn.Sequential(
+                nn.Dropout(self.dropout),
+                nn.Linear(D_in, D_out, bias=False ),
+            )
+            
+            for layer in self.lm_head:
+                if isinstance(layer, nn.Linear):
+                    layer.weight.data.normal_(mean=0.0, std=0.02)
+                    if layer.bias is not None:
+                        layer.bias.data.zero_()
+    
+        
+        elif self.bert_output == "CLSRepresentation":
+            D_in, H , D_out = 768, 96, 17
+
+            self.lm_head = nn.Sequential(
+                nn.Dropout(self.dropout),
+                nn.Linear(D_in, H, bias=False ),
+                Mish(),
+                nn.Dropout(self.dropout)
+                nn.Linear(H, D_out, bias=False )
+
+            )
+            
+            for layer in self.lm_head:
+                if isinstance(layer, nn.Linear):
+                    layer.weight.data.normal_(mean=0.0, std=0.02)
+                    if layer.bias is not None:
+                        layer.bias.data.zero_()
+
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
-        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
+        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
         
-        parser.add_argument('--config_file', default=None, help="Path to the \
+        parser.add_argument('--config_file_m', default=None, help="Path to the \
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
         parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
-
+        parser.add_argument('--bert_output', default='PooledOutput', required=False,
+                choices=['PooledOutput','SpecialTokens','CLSRepresentation'] )
         
         mparams = parser.parse_known_args( )[0]
-        if mparams.config_file != None:
-            mparams = json.load(open(utils.get_path(mparams.config_file)),"r" )
+
+
+        if mparams.config_file_m != None:
+            mparams = json.load(open(utils.get_path(mparams.config_file_m)),"r" )
         
         return mparams
 
@@ -147,21 +174,31 @@ class DaNet(nn.Module):
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids)
         
-        # Extract the last hidden state of the token `[CLS]` for classification task
-        # last_hidden_state_cls = outputs[0][:, 0, :]
+        
         # hidden_state = last_hidden_state_cls
-        # Using Pooled Output 
-        pooled_output = outputs[1]
-        hidden_state = pooled_output
-        #cls_for_nsp = outputs[1][:, 0, :]
+        
+        # Experimenting with which output to use
+        if self.bert_output == "PooledOutput":
+            # Using Pooled Output 
+            pooled_output = outputs[1]
+            lm_output = pooled_output
+
+
+        elif self.bert_output == "CLSRepresentation":
+            # Extract the last hidden state of the token `[CLS]` for classification task
+            last_hidden_state_cls = outputs[0][:, 0, :]
+            lm_output = pooled_output 
+
 
         # Feed input to classifier to compute logits
-        logits = self.classifier(hidden_state)
+        logits = self.lm_head(hidden_state)
 
         return logits
 
     def return_params(self):
         params = {}
+        param_names = ['base_model_name','freeze_transformer','model_name','dropout','bert_output' ]
+
         params['base_model_name'] = self.base_model_name
         params['freeze_transformer'] = self.freeze_transformer
         params['model_name'] = self.base_model_name
@@ -196,7 +233,7 @@ class TrainingModule(pl.LightningModule):
     def __init__(self, model=DaNet(), batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
-                    max_epochs=100,
+                    max_epochs=80,
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=8e-4,
@@ -204,8 +241,9 @@ class TrainingModule(pl.LightningModule):
                     workers=1,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
-                    cache = 'ram',
-                    loss_type = 'BCE',
+                    loss_weight = [0.08357422207100744, 0.18385707428187334, 0.32489418776359946, 0.28270948437883026, 0.29028076340137576, 0.4732623391826486, 0.35614498126635913, 0.4461250027511672, 1.8474137400874857, 0.3309135146499394, 0.38481047800771817, 2.1815475734200995, 3.423830830287625, 3.5166546883532006, 0.2784219377456878, 0.14890703368264488, 2.446652148668739],
+                    loss_pos_weight = [17]*17,
+                    max_length = 512,
                     *args,
                     **kwargs):
         super(TrainingModule, self).__init__()
@@ -213,48 +251,29 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.context_history_len = context_history_len
+        self.max_length = max_length
         
-        self.loss_type = loss_type
-        self.save_hyperparameters('batch_size', 'accumulate_grad_batches', 
-            'max_epochs', 'context_history_len', 'learning_rate',
-            'warmup_proportion')
+        self.loss_weight =  loss_weight
+        self.loss_pos_weight = loss_pos_weight
         
         self.model = model
         self.mode = mode
         self.workers = workers
-        self.cache = cache
-
-        
-        self.ordered_label_list = json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']    
-        
-        if self.loss_type == "BCE":
-            self.loss = nn.BCEWithLogitsLoss( weight=torch.FloatTensor( 
-                            [0.3088291648106703,
-                            1.024000615817113,
-                            0.6991441820732512,
-                            0.3796431004385018,
-                            0.74682843474964,
-                            0.6538210826002997,
-                            0.48526149422196,
-                            0.8302135385261447,
-                            2.7958586868836464,
-                            1.387324107182697,
-                            0.5685039211966343,
-                            2.1205716714994423]
-                            ), 
-                     pos_weight= torch.FloatTensor(  [12,12,12,12,12,12,12,12,12,12,12,12] ) )
-        
-        elif self.loss_type == "MSE":
-            pass
 
 
+        self.ordered_label_list = kwargs.get('ordered_label_list', json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']  )
+        
+
+        self.loss = nn.BCEWithLogitsLoss( weight=torch.FloatTensor( self.loss_weight ), 
+                     pos_weight= torch.FloatTensor(self.loss_pos_weight), 
+                      )
+        
+        
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-  
-            self.save_hyperparameters(model.return_params())
             self.create_data_loaders(self.workers)
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
@@ -262,7 +281,6 @@ class TrainingModule(pl.LightningModule):
             self.step_names = ["train_label",
                     "val_label","test_label"] 
                         
-            #_ = { k:pl.metrics.classification.Accuracy() for k in self.step_names }
 
             self.dict_acc_micro =  torch.nn.ModuleDict( {
                 "train_label":pl.metrics.classification.Accuracy(),
@@ -275,32 +293,53 @@ class TrainingModule(pl.LightningModule):
 
             self.dict_recall =  torch.nn.ModuleDict({
                 k:pl.metrics.classification.Recall( multilabel=True, num_classes=12 ) for k in self.step_names } )
-                    
+
+        # Saving training params and model params
+        if self.mode in ['train_new']:
+            mparams = model.return_params()
+            tparams = self.return_params()
+
+            utils.save_version_params(tparams, mparams)
+
+            
+
     @staticmethod
     def parse_train_specific_args(parent_parser):
-        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
-        parser.add_argument('--config_file', default=None, help="Path to the \
+        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True,allow_abbrev=False)
+        parser.add_argument('--config_file_t', default=None, help="Path to the \
             model hyperameters used in this model")        
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         parser.add_argument('--max_epochs', default=80, type=int)
-        parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=int)
+        parser.add_argument('-agb','--accumulate_grad_batches', default=2, type=str)
         parser.add_argument('--context_history_len', default=1, type=int)
-        parser.add_argument('-bs','--batch_size', default=20, type=int)
-        parser.add_argument('--learning_rate', default=1e-3, type=float)
-        parser.add_argument('-wp','--warmup_proportion', default=0.05, type=float)
-        parser.add_argument('--workers', default=6, type=int)
-        parser.add_argument('--gpus', default=1, type=int)
+        parser.add_argument('-bs','--batch_size', default=32, type=int)
+        parser.add_argument('-lr','--learning_rate', default=1e-3, type=float)
+        parser.add_argument('-wp','--warmup_proportion', default=0.1, type=float)
+        parser.add_argument('--workers', default=8, type=int)
+        parser.add_argument('--gpus', default=4, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
         parser.add_argument('--version_name', default='', required=False)
-        parser.add_argument('--lr_schedule', default='hard_restarts', required=False, choices =['LROnPlateau','hard_restarts'])
-        parser.add_argument('--cache',default="ram",required=False, type=str ,choices = ['local','ram',"none"])
+        parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['LROnPlateau','cosine_warmup'])
         parser.add_argument('--loss_type',default="BCE", required=False, type=str)
+        parser.add_argument('-lcw','--loss_class_weight',default=[], required=True, type=str)
+        parser.add_argument('-lpw','--loss_pos_weight',default=[], required=True, type=str)
         parser.add_argument('--gradient_clip_val',default=2.0, required=False, type=float)
         parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
+        parser.add_argument('ml','--max_length', default=512, type=int)
+
+        tparams.loss_class_weight = json.loads( tparams.loss_class_weight )
+        tparams.loss_pos_weight = json.loads( tparams.loss_pos_weight )
+        #Since we are more concerned with false negatives than false positives, the lpw is increased by 1 for all classes
+        tparams.loss_pos_weight = [ val+2 for val in tparams.loss_pos_weight ]
 
         tparams = parser.parse_known_args()[0]
-        if tparams.config_file != None:
-            tparams = json.load(open(utils.get_path(tparams.config_file)),"r" )
+        if tparams.config_file_t != None:
+            tparams = json.load(open(utils.get_path(tparams.config_file_t)),"r" )
+
+        try:
+            tparams.agb = int(tparams.agb)
+        except Exception as e:
+            tparams.agb = json.load(tparams.agb)
 
         return tparams
 
@@ -322,7 +361,7 @@ class TrainingModule(pl.LightningModule):
 
         if self.loss_type == "BCE":
             loss = self.loss( output, target )
-        if self.loss_type == "MSE":
+        elif self.loss_type == "MSE":
             loss = self.loss(output, target)
 
         _dict = { str_loss_key: loss,
@@ -436,7 +475,7 @@ class TrainingModule(pl.LightningModule):
         
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
             dir_test_set, self.batch_size, self.model.tokenizer, self.model.nem,
-            workers=self.workers, mode=self.mode, cache=self.cache
+            workers=self.workers, mode=self.mode, max_length=self.max_length
             )
         
         self.train_dl, self.val_dl, self.test_dl = dg()
@@ -458,30 +497,44 @@ class TrainingModule(pl.LightningModule):
         return steps
 
     def configure_optimizers(self):
-        #optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        #optimizer = transformers.Adafactor(self.model.parameters(), lr=self.learning_rate, scale_parameter=False, relative_step=False)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
         
         total_steps = self.total_steps()
-        warmup_steps = int( self.total_steps() * self.warmup_proportion )
+        warmup_steps = int( total_steps * self.warmup_proportion )
 
-        if self.lr_schedule == "hard_restarts" :
-            lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+        if self.lr_schedule == "cosine_warmup" :
+            lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_steps,
-                num_cycles = 3
+                num_cycles = 4
                 )
+            interval = "step"
         
         elif self.lr_schedule == "LROnPlateau":
-            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4,)
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3,)
+            interval = "epoch"
 
-        return [optimizer], [{"scheduler": lr_scheduler, "interval": "epoch", "monitor":"val_loss"}]
+        return [optimizer], [{"scheduler": lr_scheduler, "interval": interval, "monitor":"val_loss"}]
 
     def get_progress_bar_dict(self):
         # don't show the version number
         items = super().get_progress_bar_dict()
         items.pop("v_num", None)
         return items
+
+    def ordered_label_list(self):
+        #Important params for training
+        list_of_params = ['batch_size', 'accumulate_grad_batches', 'learning_rate'
+                'max_epochs', 'context_history_len', 'learning_rate','lr_schedule',
+                'warmup_proportion','loss_weight','loss_pos_weight','ordered_label_list',
+                'max_length']
+        
+        params = { k:v in self.__dict__.items() if k in list_of_params}
+
+        return params
+        
+
 
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
@@ -491,7 +544,7 @@ class DataLoaderGenerator():
                     tokenizer, nem,
                     context_history_len=1,
                     workers=0, mode='train_new',
-                    cache="ram",
+                    max_length = 512,
                     **kwargs):
 
         self.dir_train_set = dir_train_set
@@ -509,7 +562,7 @@ class DataLoaderGenerator():
         self.context_history_len = context_history_len
         self.workers  = workers
         self.mode = mode
-        self.cache = cache
+        self.max_length = max_length
 
     def prepare_datasets(self):
         """prepares a train, validation and test set
@@ -534,18 +587,8 @@ class DataLoaderGenerator():
         files = glob.glob( os.path.join(dir_dset,"*") )
         random.shuffle(files)
         li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
-            self.context_history_len) for _f in files ]
-        
-        # if self.cache == "local":
-        #     _dir = f"./cache"
-        #     concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
-        #     os.makedirs(os.path.abspath(_dir),exist_ok=True)
-        #     concat_dset = concat_dset.cache(td.cachers.Pickle( Path(os.path.join(_dir,name))) )
-        # elif self.cache == "ram":
-        #     concat_dset = td.datasets.WrapDataset( torch.utils.data.ConcatDataset(li_dsets) )
-        #     concat_dset = concat_dset.cache()
-        
-        # elif self.cache == "none":
+            self.context_history_len, self.max_length) for _f in files ]
+                
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
@@ -563,12 +606,13 @@ class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
-    def __init__(self, file_path, tokenizer, named_entity_masker ,target_binarizer, context_history_len  ):
+    def __init__(self, file_path, tokenizer, named_entity_masker ,target_binarizer, context_history_len, max_length=512  ):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.nem = named_entity_masker
         self.target_binarizer = target_binarizer
         self.context_history_len = context_history_len
+        self.max_length = max_length
 
     #def parse_file(self, file_path):
         with open(self.fp, 'r') as f:
@@ -582,21 +626,24 @@ class SingleDataset(torch.utils.data.Dataset):
         return self.lines - self.context_history_len
     
     def __getitem__(self, index):
-        #datum = self.data[index:index+1+self.context_history_len]
-        
-        #speaker, utterances, da = self.data[ index:index+1+self.context_history_len, : ]
+
         
         utterances = self.li_utterances[ index:index+1+self.context_history_len ]
+        utterances = [ utt if ( type(das) == str ) else " " for utt in utterances ]
+
         das = self.li_das[ index+self.context_history_len ]
 
         masked_utterances = list(self.nem(utterances))
         encoded_input = self.encode_tokenize( masked_utterances )
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                binarized_target = self.target_binarizer.transform( [ das.split(" ") ] )
+        #try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+        pre_bnrzd = das.split(" ") if ( type(das) == str ) else " "
+        binarized_target = self.target_binarizer.transform( [  pre_bnrzd ] )
+        
         except AttributeError as e:
-           binarized_target = np.zeros((1,12))
+           binarized_target = np.zeros((1,17))
 
 
         map_datum = {**encoded_input, 'da':torch.squeeze(torch.from_numpy(binarized_target.astype(np.float))) }
@@ -606,22 +653,25 @@ class SingleDataset(torch.utils.data.Dataset):
         #_str_tknized = self.tokenizer.tokenize(_str)
         
         encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
-            truncation=True, max_length=512, return_tensors='pt', return_token_type_ids=True )
+            truncation=True, max_length=self.max_length, return_tensors='pt', return_token_type_ids=True )
                 
         return encoded_input
 
 def main(tparams, mparams):
 
     tparams.version_name =  tparams.version_name if tparams.version_name!= '' else utils.get_version_name(mparams.model_name)
-    utils.save_version_params(tparams, mparams, tparams.version_name )
+    
     model_dir = utils.get_path(f'./models/{tparams.version_name}')
     checkpoint_dir = f'{model_dir}/logs'
-    # Setting up model, training_module and Trainer
-
+    
+        
+    # Restoring model settings for continued training and testing
     if tparams.mode in ['train_cont','test']:
         checkpoint_path = utils.get_best_ckpt_path(checkpoint_dir)
         mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
-        
+    
+    # Restoring training settings for continued training
+    if tparams.mode == "train_cont"
         # Restoring old tparams and combining with some params in new tparams
         old_tparams_dict = json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) )
         curr_tparams_dict = vars(tparams)
@@ -643,9 +693,10 @@ def main(tparams, mparams):
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
         min_delta=0.00,
-        patience=10,
+        patience=20,
         verbose=False,
         mode='auto')
+
     callbacks.append(checkpoint_callback)
     callbacks.append(early_stop_callback)
     
@@ -660,7 +711,7 @@ def main(tparams, mparams):
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                         precision=16, callbacks=callbacks,
-                        limit_train_batches = 0.4,
+                        val_check_interval = 0.5,
                         accelerator='ddp'
                         #track_grad_norm = True,
                         #overfit_batches=5
@@ -670,7 +721,13 @@ def main(tparams, mparams):
         
     # Making training module
     elif tparams.mode in ["test","train_cont"]:
+<<<<<<< HEAD
         checkpoint = torch.load(checkpoint_path,map_location=torch.device('cpu'))  
+=======
+        accelerator = "ddp" if tparams.mode=="train_cont" else None
+
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+>>>>>>> 1512a2259643d3db38d90f17337f35e70d319780
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -680,8 +737,8 @@ def main(tparams, mparams):
                     check_val_every_n_epoch=1, logger=tb_logger,
                     default_root_dir=utils.get_path(f"./models/{tparams.version_name}"),
                     precision=16, callbacks=callbacks ,
-                        limit_train_batches = 0.4,
-                    accelerator='ddp'
+                    val_check_interval = 0.5,
+                    accelerator=accelerator
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
@@ -690,30 +747,33 @@ def main(tparams, mparams):
                 
         # load callback states
         trainer.on_load_checkpoint(checkpoint)
-        trainer.global_step = checkpoint['global_step']
-        trainer.current_epoch = checkpoint['epoch']
+
+        # Only train_continued mode needs to load optimizer/scheduler settings
+        if tparams.mode == "train_cont":
+            trainer.global_step = checkpoint['global_step']
+            trainer.current_epoch = checkpoint['epoch']
+
+            
+            # restore the optimizers
+            optimizer_states = checkpoint['optimizer_states']
+            
+            for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
+                optimizer.load_state_dict(opt_state)
+
+                # move optimizer to GPU 1 weight at a time
+                # avoids OOM
+                if trainer.root_gpu is not None:
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda(trainer.root_gpu)
 
         
-        # restore the optimizers
-        optimizer_states = checkpoint['optimizer_states']
-        
-        for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
-            optimizer.load_state_dict(opt_state)
 
-            # move optimizer to GPU 1 weight at a time
-            # avoids OOM
-            if trainer.root_gpu is not None:
-                for state in optimizer.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.cuda(trainer.root_gpu)
-        
-        
-
-        # restore the lr schedulers
-        lr_schedulers = checkpoint['lr_schedulers']
-        for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
-            scheduler['scheduler'].load_state_dict(lrs_state)
+            # restore the lr schedulers
+            lr_schedulers = checkpoint['lr_schedulers']
+            for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
+                scheduler['scheduler'].load_state_dict(lrs_state)
 
         del checkpoint
         torch.cuda.empty_cache()
@@ -721,14 +781,12 @@ def main(tparams, mparams):
 
     if tparams.mode in ["train_new","train_cont"]:    
         trainer.fit(training_module)
-        trainer.test(test_dataloaders=training_module.test_dl )
+        
 
-    elif tparams.mode in ["test","inference"]:
+    elif tparams.mode in ["test"]:
         training_module.eval() 
         training_module.freeze() 
-        #trainer.ckpt_path = checkpoint_path
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
-        #trainer.test(test_dataloaders=training_module.train_dl, model=training_module,ckpt_path=checkpoint_path)
         
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
@@ -741,10 +799,24 @@ if __name__ == '__main__':
 
     main(tparams, mparams)
 
-#    CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 560 --workers 8 --gpus 1 --cache ram --max_epochs 50  --learning_rate 1e-3 --warmup_proportion 0.1
+#    CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 560 --workers 8 --gpus 1 --max_epochs 50  --learning_rate 1e-3 --warmup_proportion 0.1
 
-#   CUDA_VISIBLE_DEVICES=0,1,2 python3 train.py -bs 8 -agb 20 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 1e-4 
-  
-# CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 20 --workers 8 --gpus 1 --cache ram --max_epochs 70  --learning_rate 1e-3 --mode train_cont --version_name DaNet_v027
+#   CUDA_VISIBLE_DEVICES=0,1,2 python3 train.py -bs 8 -agb 20 --workers 8 --gpus 1  --max_epochs 70  --learning_rate 1e-4 
 
-#   CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.launch --nproc_per_node=1  --master_port 29501  main.py
+# Training model on version 1 dataset - #At least one da is in the list of ones to paraphrase
+# CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 20 --workers 8 --gpus 1 --max_epochs 70  --learning_rate 1e-3 --mode train_cont --version_name DaNet_v027
+
+
+#------------
+# Training model on version 2 dataset - #at least one da is in the list of ones to paraphrase but "statement" never occurs
+    # The class weighting used is linear
+
+# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 64 -agb {1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 } --gpus 3 --max_epochs 80
+# --mode train_new --version_name DaNet_v02 --bert_output SpecialTokens
+# --dir_data ""./combined_data_v2" -lr 1e-4 -ml 512
+# -lcw '[0.08357422207100744, 0.18385707428187334, 0.32489418776359946, 0.28270948437883026, 0.29028076340137576, 0.4732623391826486, 0.35614498126635913, 0.4461250027511672, 1.8474137400874857, 0.3309135146499394, 0.38481047800771817, 2.1815475734200995, 3.423830830287625, 3.5166546883532006, 0.2784219377456878, 0.14890703368264488, 2.446652148668739]'
+# -lpw '[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]'
+
+
+
+

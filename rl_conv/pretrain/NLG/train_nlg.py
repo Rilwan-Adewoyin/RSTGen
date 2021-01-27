@@ -1389,26 +1389,6 @@ class NLG_tokenizer():
             return rst_rel_encoded
 
 
-        # def __call__(self, das=None, rst_rels=None, topics=None, topics_score=None, 
-        #                 utterance=None, prev_das=None, prev_rst=None,, pad_utterance=True):
-            
-        #     #Stem context utterance decides whether or not to reduce the size of the context.
-        #         #This is only helpful when evaluating how model produces output given a fixed small starting to the sentence
-
-        #     if self.fda and self.frst and self.ftopic:
-
-        #         outp = self.encode_v2(das ,rst_rels,topics, topics_score, 
-        #                 utterance,pad_utterance)
-            
-        #     elif self.fda==False and self.frst and self.ftopic:
-                
-        #         outp = self.encode_v2_exda(rst_rels, topics, topics_score, 
-        #                 utterance,pad_utterance)
-        #     else:
-        #         NotImplementedError
-                
-        #     return outp
-
     def encode_v2( self, das ,rst_rels,topics, topics_score, utterance, pad_utterance):
 
         """
@@ -1431,8 +1411,8 @@ class NLG_tokenizer():
 
         #Getting Vectors
         tnsr_das = self.encode_da( das ) #dims (1, 20), 
-        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
+        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
         tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
                             
         # Building Attention Mask
@@ -1520,8 +1500,8 @@ class NLG_tokenizer():
 
 
         #Getting Vectors
-        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_padding=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_padding=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
+        tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
         tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
                             
         # Building Attention Mask
@@ -1585,7 +1565,7 @@ class NLG_tokenizer():
                  'token_type_ids':token_type_ids
                  }
 
-    def encode_rst_v2(self,rst_rels, max_padding=8):
+    def encode_rst_v2(self,rst_rels, max_len=8):
         """Converts rst_rels in a series of vectors
 
             Args:
@@ -1596,13 +1576,13 @@ class NLG_tokenizer():
         rst_rel_encoded = self.rst_rel_binarizer.transform(rst_rels).reshape( [ -1, 1] )
         tnsr_rels = torch.FloatTensor( rst_rel_encoded )
         
-        #Padding out to max_padding length
+        #Padding out to max_len length
         _len = tnsr_rels.shape[-1]
-        diff = (max_padding - _len)
+        diff = (max_len - _len)
         if diff > 0:
             tnsr_rels = torch.cat([tnsr_rels, torch.zeros( [len(self.rst_rel_binarizer.classes_), diff], dtype=torch.float32)] , axis=-1 ) #backwards due to convolution embedding
         else:
-            tnsr_rels = tnsr_rels[:, :max_padding]
+            tnsr_rels = tnsr_rels[:, :max_len]
             diff = 0
 
         return tnsr_rels, diff
@@ -1618,7 +1598,7 @@ class NLG_tokenizer():
         
         return tnsr_das
 
-    def encode_topic_v2(self, topics, topics_score, max_padding=16, padding_token="<|endoftext|>"):
+    def encode_topic_v2(self, topics, topics_score, max_len=16, padding_token="<|endoftext|>"):
         """[summary]
 
             Args:
@@ -1649,7 +1629,7 @@ class NLG_tokenizer():
         ta_idxs = np.where( topic_phrases==self.e2m_tokenizer('<|ta|>',return_attention_mask=False)['input_ids'] )[0]
             
         #filtering out idxs if index is larger than padding value
-        ta_idxs = ta_idxs[ta_idxs<max_padding]
+        ta_idxs = ta_idxs[ta_idxs<max_len]
 
         #get difference in index position between <|ta|> tag n and <|ta|> tag n+1 ( for final tag use difference between tag and end of list)
         ta_phrase_lens = np.diff( ta_idxs, append=dict_encoding['length'] ) 
@@ -1660,15 +1640,15 @@ class NLG_tokenizer():
         tnsr_score = torch.unsqueeze( torch.FloatTensor( topics_score ) , dim=0 ) # shape (1, topic_count) #pytorch has convolution dims opposite to tf
         topic_phrases = torch.LongTensor(topic_phrases)
         
-        #Padding out to max_padding
+        #Padding out to max_len
         _len = dict_encoding['length']
-        diff = (max_padding - _len)[0]
+        diff = (max_len - _len)[0]
         if diff>0:
             topic_phrases = torch.cat( [ topic_phrases, torch.ones([diff], dtype=torch.int64 )*padding_token[0]] , axis=-1 )
             tnsr_score = torch.cat( [tnsr_score, torch.zeros( [1, diff] ) ], axis=-1 )
         else:
-            topic_phrases = topic_phrases[:max_padding]
-            tnsr_score = tnsr_score[:, :max_padding ]
+            topic_phrases = topic_phrases[:max_len]
+            tnsr_score = tnsr_score[:, :max_len ]
             diff = 0
 
         return topic_phrases , tnsr_score, diff, ta_idxs
@@ -1769,15 +1749,15 @@ class TrainingModule(pl.LightningModule):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=80, type=int)
+        parser.add_argument('-me','--max_epochs', default=80, type=int)
         parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=5, type=int)
-        parser.add_argument('--learning_rate', default=5e-4, type=float)
+        parser.add_argument('-lr','--learning_rate', default=5e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.15)
         parser.add_argument('--workers', default=16, type=int) #TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
-        parser.add_argument('--lr_schedule', default='constant', required=False, choices =['LROnPlateau','hard_restarts','constant'])
+        parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['cosine_warmup','LROnPlateau','hard_restarts','constant'])
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
@@ -1801,7 +1781,7 @@ class TrainingModule(pl.LightningModule):
         if tparams['mode'] in ["train_new"]:
             training_module = TrainingModule(**tparams, model_params=mparams  )
             
-        elif tparams['mode'] in ["test", "train_cont", "inference"]:
+        elif tparams['mode'] in ["train_cont", "inference"]:
             
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
@@ -1813,9 +1793,25 @@ class TrainingModule(pl.LightningModule):
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len']} )
             except KeyError:
+                print("param files not found utilsing default or user entered params\n")
+                
+            #Restore/update Training Module
+            training_module = TrainingModule(**tparams, model_params=mparams)
+            training_module.load_state_dict(checkpoint['state_dict'])
+
+        elif tparams['mode'] in ["test"]:
+            
+            checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
+
+            #restore/update param files from the checkpoint
+            try:
+                tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                    'lr_schedule', 'learning_rate','precision','splits','optimizer_type']} )
+
+                mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+                    'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len']} )
+            except KeyError:
                 pass
-            del checkpoint
-            torch.cuda.empty_cache()
             
             #Restore/update Training Module
             training_module = TrainingModule(**tparams, model_params=mparams)
@@ -1823,6 +1819,7 @@ class TrainingModule(pl.LightningModule):
 
         else:
             raise ValueError("tparams['mode'] must be in range [train_new, train_cont, test, inference]")
+
         return training_module
 
     @staticmethod
@@ -1845,7 +1842,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=5,
+            patience=20,
             verbose=False,
             mode='min'
         )
@@ -1864,14 +1861,14 @@ class TrainingModule(pl.LightningModule):
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator='ddp',
                         #limit_train_batches = 0.4,
-                        val_check_interval=0.4,
+                        val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
                         )
 
-        if tparams['mode'] in ["train_cont","test","inference"]:
+        elif tparams['mode'] in ["train_cont","inference"]:
             #restoring checkpoint             
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
@@ -1885,7 +1882,7 @@ class TrainingModule(pl.LightningModule):
                     #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator='ddp',
                     #limit_train_batches = 0.4,
-                    val_check_interval=0.4,
+                    val_check_interval=0.5,
                     #limit_val_batches = ,
                     #track_grad_norm = True,
                     #overfit_batches=5
@@ -1916,9 +1913,28 @@ class TrainingModule(pl.LightningModule):
 
             for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
                 scheduler['scheduler'].load_state_dict(lrs_state)
-
+            
             del checkpoint
             torch.cuda.empty_cache()
+
+        elif tparams['mode'] in ["test"]:
+            #restoring checkpoint             
+            checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
+
+            training_module.load_state_dict(checkpoint['state_dict'])
+
+            trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
+                    progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
+                    check_val_every_n_epoch=1,
+                    checkpoint_callback=False,
+                    logger=False,
+                    log_every_n_steps=1,   
+                    precision=tparams['precision'],
+                    )
+
+            # load callback states
+            trainer.on_load_checkpoint(checkpoint)
+           
 
         return trainer , training_module
     
@@ -1942,18 +1958,38 @@ class TrainingModule(pl.LightningModule):
         return checkpoint
         
     @staticmethod
-    def start(trainer, tparams, training_module ):
+    def start(trainer, tparams,training_module, mparams ):
+        
+        if tparams['mode'] in ['train_new','train_cont']:    
+            trainer.fit(training_module )
         
         if tparams['mode'] in ["test"]:
+            
+            checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
+            training_module.load_state_dict(checkpoint['state_dict'])
+
+            #trainer.on_load_checkpoint(checkpoint)
             training_module.eval() 
             training_module.freeze() 
-            trainer.test(test_dataloaders=training_module.test_dl, model=training_module, ckpt_path='best')
-              
-        elif tparams['mode'] in ['train_new','train_cont']:    
-            trainer.fit(training_module )
-            #trainer.checkpoint_callback.to_yaml()
-            trainer.test(test_dataloaders=training_module.test_dl, ckpt_path='best')
-        
+            
+            dict_results = trainer.test(test_dataloaders=training_module.test_dl, model = training_module)
+
+            #Saving test results for model to file
+            _dir = os.path.join(tparams['model_dir'], mparams['model_name'])
+            fn = os.path.join(_dir,"results.json")
+
+            if os.path.isfile(fn) == False:
+                existing_results = {}
+            else:
+                with open( fn, 'r' ) as outfile:
+                    existing_results = json.load( outfile)
+
+            existing_results[ mparams['model_name'] ] = dict_results[0]['test_loss']
+            
+            with open( fn, 'w' ) as outfile:
+                json.dump(existing_results, outfile)
+            
+                    
         elif tparams['mode'] in ['infernece']: 
             training_module.eval() 
             training_module.freeze() 
@@ -2023,7 +2059,6 @@ class TrainingModule(pl.LightningModule):
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-            #self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
     def create_data_loaders(self, shuffle=False, **kwargs):
@@ -2330,7 +2365,7 @@ def main(tparams={}, mparams={}):
     # initiating training loop
     training_module = TrainingModule.instatiate_training_module( tparams, mparams)
     trainer, training_module = TrainingModule.instatiate_trainer( tparams,  tb_logger, training_module)
-    TrainingModule.start(trainer, tparams, training_module)
+    TrainingModule.start(trainer, tparams, training_module, mparams)
                 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False) 
@@ -2340,6 +2375,9 @@ if __name__ == '__main__':
 
     # add the trainer specific args
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
+
+    if tparams.mode == "test":
+        assert tparams.gpus in [0,1]
 
     if tparams.gpus not in [0,1]:
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
@@ -2353,3 +2391,11 @@ if __name__ == '__main__':
 # Training with no DA
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train_nlg.py -bs 28 -agb 2 --gpus 2 -fda 0 --workers 16 --version 40
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode train_new
+
+# dullduks server version 41
+# python3 train_nlg.py -bs 56 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode train_new
+# python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
+
+# dullduks server version 42 - Extends 41 with larger lookback range
+# python3 train_nlg.py -bs 20 -agb 2 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode train_cont -lr 1e-4 -me 30 -mil 512
+# python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
