@@ -57,17 +57,17 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
     
     return output
 
-def save_version_params(t_params=None, m_params=None, version_code="DaNet_v000"):
+def save_version_params(t_params=None, m_params=None, version="DaNet_v000",subversion="0"):
     dated_trained = date.today().strftime("%d-%m-%Y")
-    _dir_version = get_path(f"./models/{version_code}/",_dir=True)
+    _dir_version = get_path(f"./models/{version}/version_{subversion}",_dir=True)
 
     if t_params is not None:
-        t_params['date_trained'] = dated_trained
         tp_fp = os.path.join(_dir_version,'tparam.json')
+        
         json.dump( vars(t_params), open(tp_fp,"w") )
     
     if m_params is not None:
-        m_params['date_trained'] = dated_trained 
+        m_params.date_trained = dated_trained 
         mp_fp = os.path.join(_dir_version,'mparam.json')
         json.dump( vars(m_params), open(mp_fp,"w") )
 
@@ -75,6 +75,7 @@ def save_version_params(t_params=None, m_params=None, version_code="DaNet_v000")
 
 def get_version_name(model_name):
     _dir_models = get_path("./models")
+
     li_modelversions = glob.glob( os.path.join(_dir_models,model_name+"_v*") )
 
     li_versioncodes = [ int(modelversion[-3:]) for modelversion in li_modelversions ]
