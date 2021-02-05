@@ -1,13 +1,16 @@
 import os
-os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+import warnings
+warnings.filterwarnings('ignore')  # "error", "ignore", "always", "default", "module" or "once"
+#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
 import io
 import matplotlib.pyplot as plt
 import numpy as np
-import warnings
+
 import sklearn
+from sklearn.metrics import multilabel_confusion_matrix, precision_recall_fscore_support 
 
 from pathlib import Path
-
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +36,7 @@ import transformers
 import pytorch_lightning as pl
 
 from sklearn import preprocessing as sklp
+import seaborn as sns
 
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -47,9 +51,141 @@ from pytorch_lightning import loggers as pl_loggers
 from collections import OrderedDict
 import spacy
 import ast
+from pytorch_lightning.metrics import Metric
+from multiprocessing import Pool
 
+from typing import Optional, Any, Callable
 
-#from pytorch_lightning.loggers import TensorBoardLogger
+import shutil
+import tempfile
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.utilities.cloud_io import load as pl_load
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
+from ray.tune.integration.pytorch_lightning import TuneReportCallback, \
+    TuneReportCheckpointCallback
+
+from ray.tune.integration.pytorch_lightning import TuneReportCallback
+
+#Monkey Patch for logging class
+def monkey_log_dir(self):
+    """
+        The directory for this run's tensorboard checkpoint. By default, it is named
+        ``'version_${self.version}/logs'`` but it can be overridden by passing a string value
+        for the constructor's version parameter instead of ``None`` or an int.
+    """
+    # create a pseudo standard path ala test-tube
+    version = self.version if isinstance(self.version, str) else f"version_{self.version}"
+    log_dir = os.path.join(self.root_dir, version,"logs")
+    return log_dir
+
+pl_loggers.TensorBoardLogger.log_dir = property( monkey_log_dir )
+
+#suggest this change to pytorch lightning
+class bAccuracy_macro(Metric):
+    r"""
+        Computes `balanced Accuracy <https://en.wikipedia.org/wiki/Precision_and_recall>`_:
+
+        .. math:: \text{Accuracy} = \frac{1}{N}\sum_i^N 1(y_i = \hat{y_i})
+
+        Where :math:`y` is a tensor of target values, and :math:`\hat{y}` is a
+        tensor of predictions.  Works with binary, multiclass, and multilabel
+        data.  Accepts logits from a model output or integer class values in
+        prediction.  Works with multi-dimensional preds and target.
+
+        Forward accepts
+
+        - ``preds`` (float or long tensor): ``(N, ...)`` or ``(N, C, ...)`` where C is the number of classes
+        - ``target`` (long tensor): ``(N, ...)``
+
+        If preds and target are the same shape and preds is a float tensor, we use the ``self.threshold`` argument.
+        This is the case for binary and multi-label logits.
+
+        If preds has an extra dimension as in the case of multi-class scores we perform an argmax on ``dim=1``.
+
+        Args:
+            threshold:
+                Threshold value for binary or multi-label logits. default: 0.5
+            compute_on_step:
+                Forward only calls ``update()`` and return None if this is set to False. default: True
+            dist_sync_on_step:
+                Synchronize metric state across processes at each ``forward()``
+                before returning the value at the step. default: False
+            process_group:
+                Specify the process group on which synchronization is called. default: None (which selects the entire world)
+            dist_sync_fn:
+                Callback that performs the allgather operation on the metric state. When `None`, DDP
+                will be used to perform the allgather. default: None
+
+        Example:
+        TODO: change
+
+            >>> from pytorch_lightning.metrics import Accuracy
+            >>> target = torch.tensor([0, 1, 2, 3])
+            >>> preds = torch.tensor([0, 2, 1, 3])
+            >>> accuracy = Accuracy()
+            >>> accuracy(preds, target)
+            tensor(0.5000)
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        threshold: float = 0.5,
+        compute_on_step: bool = True,
+        dist_sync_on_step: bool = False,
+        process_group: Optional[Any] = None,
+        dist_sync_fn: Callable = None):
+
+        super().__init__(
+            compute_on_step=compute_on_step,
+            dist_sync_on_step=dist_sync_on_step,
+            process_group=process_group,
+            dist_sync_fn=dist_sync_fn,
+        )
+
+        self.add_state("correct_positive", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("correct_negative", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+
+        self.add_state("positive_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("negative_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+
+        self.threshold = threshold
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor):
+        """
+        Update state with predictions and targets.
+
+        Args:
+            preds: Predictions from model
+            target: Ground truth values
+        """
+        
+        preds, target = pl.metrics.utils._input_format_classification(preds, target, self.threshold)
+        assert preds.shape == target.shape
+
+        correct = preds == target #(n, c)
+        pos_mask= target.eq(1.0) # mask for positive samples
+
+        self.correct_positive += torch.sum( torch.logical_and( correct, pos_mask), dim=[0] )
+        self.correct_negative += torch.sum( torch.logical_and( correct, ~pos_mask), dim=[0] )
+
+        self.positive_samples += torch.sum( pos_mask, dim=[0])
+        self.negative_samples += torch.sum( ~pos_mask, dim=[0])
+        
+    def compute(self):
+        """
+        Computes macro Baccuracy over state.
+        """
+
+        pos_avg = self.correct_positive.float() / self.positive_samples
+        neg_avg = self.correct_negative.float() / self.negative_samples
+
+        vals = (pos_avg + neg_avg )/2
+        
+        vals = torch.masked_select( vals, ~torch.isnan(vals) )
+        
+        return torch.mean(vals)
 
 class Mish(nn.Module):
     def __init__(self):
@@ -75,6 +211,7 @@ class DaNet(nn.Module):
 
         # Instantiate BERT model
         self.base_model_name = base_model_name       
+        self.model_name = model_name
         dict_transformertokenizer = utils.load_pretrained_transformer(self.base_model_name , transformer=True, tokenizer=True)
         self.transformer = dict_transformertokenizer['transformer']
         self.tokenizer = dict_transformertokenizer['tokenizer']
@@ -135,7 +272,7 @@ class DaNet(nn.Module):
         parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
-        parser.add_argument('--bert_output', default='PooledOutput', required=False,
+        parser.add_argument('--bert_output', default='CLSRepresentation', required=False,
                 choices=['PooledOutput','CLSRepresentation'] )
         
         mparams = parser.parse_known_args( )[0]
@@ -209,10 +346,12 @@ class DaNet(nn.Module):
         params = {}
         param_names = ['base_model_name','freeze_transformer','model_name','dropout','bert_output' ]
 
-        params['base_model_name'] = self.base_model_name
-        params['freeze_transformer'] = self.freeze_transformer
-        params['model_name'] = self.base_model_name
-        params['dropout'] = self.dropout
+        # params['base_model_name'] = self.base_model_name
+        # params['freeze_transformer'] = self.freeze_transformer
+        # params['model_name'] = self.model_name
+        # params['dropout'] = self.dropout
+
+        params = {k:self.__dict__[k] for k in param_names}
         return params
 
 class NamedEntityMasker():
@@ -237,10 +376,9 @@ class NamedEntityMasker():
         text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in document])
         
         return text
-
 class TrainingModule(pl.LightningModule):
 
-    def __init__(self, model=DaNet(), batch_size=20, 
+    def __init__(self, batch_size=30, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
                     max_epochs=80,
@@ -255,9 +393,11 @@ class TrainingModule(pl.LightningModule):
                     loss_pos_weight = [17]*17,
                     max_length = 512,
                     tag='',
+                    model=None,
                     subversion=0,
                     *args,
                     **kwargs):
+        
         super(TrainingModule, self).__init__()
 
         self.batch_size = batch_size
@@ -268,22 +408,21 @@ class TrainingModule(pl.LightningModule):
         self.loss_class_weight =  loss_class_weight
         self.loss_pos_weight = loss_pos_weight
         
-        self.model = model
+        if model == None:
+            self.model = DaNet(**kwargs.get('mparams'))
+
         self.mode = mode
         self.workers = workers
 
         self.tag = tag
         self.subversion = subversion
 
-
         self.ordered_label_list = kwargs.get('ordered_label_list', json.load(open(utils.get_path("./label_mapping.json"),"r"))['MCONV']['labels_list']  )
         
-
         self.loss = nn.BCEWithLogitsLoss( weight=torch.FloatTensor( self.loss_class_weight ), 
-                     pos_weight= torch.FloatTensor(self.loss_pos_weight), 
-                      )
-        
-        if self.mode in ['train_new','train_cont','test']:
+                     pos_weight= torch.FloatTensor(self.loss_pos_weight))
+
+        if self.mode in ['train_new','train_cont','test','hypertune']:
             self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
@@ -295,11 +434,10 @@ class TrainingModule(pl.LightningModule):
             self.step_names = ["train_label",
                     "val_label","test_label"] 
                         
-
-            self.dict_acc_micro =  torch.nn.ModuleDict( {
-                "train_label":pl.metrics.classification.Accuracy(),
-                "val_label" :pl.metrics.classification.Accuracy(compute_on_step=False),
-                "test_label":pl.metrics.classification.Accuracy(compute_on_step=False)
+            self.dict_bacc_macro =  torch.nn.ModuleDict( {
+                "train_label":bAccuracy_macro(compute_on_step=True, num_classes = 17),
+                "val_label" :bAccuracy_macro(compute_on_step=False,num_classes = 17),
+                "test_label":bAccuracy_macro(compute_on_step=False,num_classes = 17)
             })
 
             self.dict_prec = torch.nn.ModuleDict( {
@@ -310,7 +448,6 @@ class TrainingModule(pl.LightningModule):
             self.dict_recall =  torch.nn.ModuleDict({
                 k:pl.metrics.classification.Recall( multilabel=True, num_classes=17,
                     threshold=0.5, average='macro'
-
                     ) for k in self.step_names } )
 
         # Saving training params and model params
@@ -320,8 +457,6 @@ class TrainingModule(pl.LightningModule):
 
             utils.save_version_params(tparams, mparams, kwargs.get('version_name'), self.subversion ) 
 
-            
-
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True,allow_abbrev=False)
@@ -329,31 +464,27 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./combined_data", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models")
         parser.add_argument('--max_epochs', default=80, type=int)
-        parser.add_argument('-agb','--accumulate_grad_batches', default=[], type=str)
+        parser.add_argument('-agb','--accumulate_grad_batches', default="{}", type=str)
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=32, type=int)
         parser.add_argument('-lr','--learning_rate', default=1e-3, type=float)
         parser.add_argument('-wp','--warmup_proportion', default=0.1, type=float)
         parser.add_argument('--workers', default=8, type=int)
-        parser.add_argument('--gpus', default=4, type=int)
-        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont'])
+        parser.add_argument('--gpus', default=1, type=int)
+        parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont','hypertune'])
         parser.add_argument('--version_name', default='DANet_V000', required=True)
         parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['LROnPlateau','cosine_warmup'])
         parser.add_argument('--loss_type',default="BCE", required=False, type=str)
-        parser.add_argument('-lcw','--loss_class_weight',default=[], required=True, type=str)
-        parser.add_argument('-lpw','--loss_pos_weight',default=[], required=True, type=str)
+        parser.add_argument('-lcw','--loss_class_weight',default="[]", required=False, type=str)
+        parser.add_argument('-lpw','--loss_pos_weight',default="[]", required=False, type=str)
         parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
         parser.add_argument('-ml','--max_length', default=512, type=int)
         parser.add_argument('-sv','--subversion', default=None,required=False, type=int, help="The Experimental sub Versioning for this run" )
         parser.add_argument('--tag', default='', type=str)
-
-
         tparams = parser.parse_known_args()[0]
 
         tparams.loss_class_weight = json.loads( tparams.loss_class_weight )
         tparams.loss_pos_weight = json.loads( tparams.loss_pos_weight )
-        #Since we are more concerned with false negatives than false positives, the lpw is increased by 1 for all classes
-        #tparams.loss_pos_weight = [ val+2 for val in tparams.loss_pos_weight ]
 
         try:
             tparams.accumulate_grad_batches = int(tparams.accumulate_grad_batches)
@@ -379,12 +510,10 @@ class TrainingModule(pl.LightningModule):
         else:
             str_loss_key = step_name +"_loss"
 
-
         loss = self.loss( output, target )
 
-
         _dict = { str_loss_key: loss,
-            'output':output,
+            'output':torch.sigmoid(output),
             'target':target }
 
         return  _dict
@@ -399,7 +528,6 @@ class TrainingModule(pl.LightningModule):
             each dict contains the DA names and probabilities 
 
             #done not operateon batches of predictions
-
 
         Args:
             preds ([type]): [pass in logit scores]
@@ -444,33 +572,32 @@ class TrainingModule(pl.LightningModule):
 
         output =  outputs['output'] 
         target  = outputs['target']
-        output_bnrzd = torch.where( output<0.5,0.0,1.0)
-
-        correct_micro = output_bnrzd.eq(target).min(dim=1)[0]
-
-        ones =  torch.ones_like(correct_micro).type_as(correct_micro)
-
-        self.dict_acc_micro[step_name+"_label"]( correct_micro, ones )
-
-        self.dict_recall[step_name+"_label"](output, target)
-        self.dict_prec[step_name+"_label"](output, target)   
       
         if step_name == 'train':
             on_step = True
             on_epoch = False
             prog_bar = True
             logger = False
+        
+            # Logging train values with correct naming system
+            train_loss = outputs['loss']
+            train_bacc= self.dict_bacc_macro[step_name+"_label"]( output, target )
+            train_prec = self.dict_recall[step_name+"_label"](output, target)
+            train_rec = self.dict_prec[step_name+"_label"](output, target)   
+            
+            scalar_dict = {'train/loss':train_loss,
+                        'train/bacc_macro':train_bacc,
+                        'train/prec_macro':train_prec,
+                        'train/rec_macro':train_rec}
+            
+            self.logger.log_metrics( scalar_dict, step=self.global_step)
+            
 
         else:
-            on_step = False
-            on_epoch = True
-            prog_bar = False
-            logger = True        
-        
-        self.log(f'{step_name}_acc_micro', self.dict_acc_micro[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)
-        self.log(f'{step_name}_rec', self.dict_recall[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger )
-        self.log(f'{step_name}_prec', self.dict_prec[step_name+"_label"].compute(), on_step=on_step, on_epoch=on_epoch, prog_bar=prog_bar, logger=logger)             
-
+            self.dict_bacc_macro[step_name+"_label"]( output, target )
+            self.dict_recall[step_name+"_label"](output, target)
+            self.dict_prec[step_name+"_label"](output, target)   
+            
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs,"train")
 
@@ -484,95 +611,84 @@ class TrainingModule(pl.LightningModule):
 
         if step_name == "train":
             pass
+            
         else:
             #Loggin the loss
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
-            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
+            self.log(f"{step_name}/loss", loss, logger=True, prog_bar=True)
 
-            #Logging extra analysis
-            class_preds = torch.stack([x[f"{step_name}_class_preds"] for x in outputs])     # (n,17)
-            class_obsrvd = torch.stack([x[f"{step_name}_class_obsrvd"] for x in outputs])   # (n, 17)
+            #Logging Aggregated Class Performance
+            val_bacc = self.dict_bacc_macro[step_name+"_label"].compute()
+            val_rec = self.dict_recall[step_name+"_label"].compute()
+            val_prec = self.dict_prec[step_name+"_label"].compute()
 
-            # Building confusion matrix
-            cm = sklearn.metrics.confusion_matrix(test_labels, test_pred)
-            cm_figure = plot_confusion_matrix(cm, class_names=class_names)
-            self.tb_logger.experiment.add_figure("Confusion Matrix",cm_figure, 
-                    global_step=self.current_epoch)
+            scalar_dict = {
+                        'val/bacc_macro':val_bacc,
+                        'val/prec_macro':val_prec,
+                        'val/rec_macro':val_rec,
+                        'val/f1_macro': 2*(val_prec*val_rec)/(val_prec+val_rec)  }  
 
-            # Getting class specific accuracy results 
-            class_accuracies = pl.metrics.functional.classification.accuracy(class_preds, class_obsrvd,
-                            num_classes=17, class_reduction='none' ) #( 17)
-
-            tag_scalar_dict = {k:v for k,v in zip( self.ordered_label_list, class_accuracies )  }
-            self.tb_logger.experiment.add_scalars( 'class_accuracy', tag_scalar_dict, 
-                global_step = self.current_epoch)
-
-            # Getting class specific recall and precision and f1 
-            class_f1 = pl.metrics.functional.classification.f1(class_preds, class_obsrvd,
-                            num_classes=17, class_reduction='none', multilabel=True ) #( 17)
-
-
-
-
-
-    def plot_confusion_matrix(self, cm):
-        """
-        Returns a matplotlib figure containing the plotted confusion matrix.
-        
-        Args:
-           cm (array, shape = [n, n]): a confusion matrix of integer classes
-           class_names (array, shape = [n]): String names of the integer classes
-        """
-        class_names = self.ordered_label_list
-        figure = plt.figure(figsize=(8, 8))
-        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-        plt.title("Confusion matrix")
-        plt.colorbar()
-        tick_marks = np.arange(len(class_names))
-        plt.xticks(tick_marks, class_names, rotation=45)
-        plt.yticks(tick_marks, class_names)
-        
-        # Normalize the confusion matrix.
-        cm = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
-        
-        # Use white text if squares are dark; otherwise black.
-        threshold = cm.max() / 2.
-        
-        for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-            color = "white" if cm[i, j] > threshold else "black"
-            plt.text(j, i, cm[i, j], horizontalalignment="center", color=color)
+            self.logger.log_metrics( scalar_dict, step=self.current_epoch)
             
-        plt.tight_layout()
-        plt.ylabel('True label')
-        plt.xlabel('Predicted label')
-        
-        return figure
+            # Logging Dis-aggregated Class Performance
+            class_preds = torch.cat([x["output"] for x in outputs], axis=0)     # (n,17)
+            class_obsrvd = torch.cat([x["target"] for x in outputs], axis=0)   # (n, 17)
+            
+            class_preds = torch.where( class_preds>=0.5, 1.0 , 0.0 )
+            class_preds = class_preds.detach().to('cpu').numpy().astype(np.int32)
+            class_obsrvd = class_obsrvd.detach().to('cpu').numpy().astype(np.int32)
 
-    def plot_to_image(figure):
-        """
-        Converts the matplotlib plot specified by 'figure' to a PNG image and
-        returns it. The supplied figure is closed and inaccessible after this call.
-        """
-    
-        buf = io.BytesIO()
-        
-        # Use plt.savefig to save the plot to a PNG in memory.
-        plt.savefig(buf, format='png')
-        
-        # Closing the figure prevents it from being displayed directly inside
-        # the notebook.
-        plt.close(figure)
-        buf.seek(0)
-        
-        # Use tf.image.decode_png to convert the PNG buffer
-        # to a TF image. Make sure you use 4 channels.
-        image = tf.image.decode_png(buf.getvalue(), channels=4)
-        
-        # Use tf.expand_dims to add the batch dimension
-        image = tf.expand_dims(image, 0)
-    
-    return image
+                # Creating multi-label confusion matrix image
+            mcm = multilabel_confusion_matrix(class_obsrvd, class_preds, labels=np.arange(17) )
+            li_cm = np.split(mcm, mcm.shape[0], axis=0)
+            mcm_figure = self.ml_confusion_matrix( li_cm, labels=self.ordered_label_list)
+            self.logger.experiment.add_figure(f"{step_name}/Confusion Matrix", mcm_figure, 
+                global_step=self.current_epoch)
+            
+                # Logging Precision, recall, fscore, support
+            precision, recall, fscore, support = precision_recall_fscore_support(class_obsrvd, class_preds,
+                labels=np.arange(17), average=None )
 
+            tag_scalar_dict_prec2 = {f"{step_name}_precision/{k}":v for k,v in zip( self.ordered_label_list, precision )  }
+            tag_scalar_dict_rec2 = {f"{step_name}_recall/{k}":v for k,v in zip( self.ordered_label_list, recall )  }
+            tag_scalar_dict_f12 = {f"{step_name}_f1/{k}":v for k,v in zip( self.ordered_label_list, fscore )  }
+                        
+            self.logger.log_metrics( tag_scalar_dict_prec2, step = self.current_epoch )
+            self.logger.log_metrics( tag_scalar_dict_rec2, step = self.current_epoch )
+            self.logger.log_metrics( tag_scalar_dict_f12, step = self.current_epoch )
+
+    def ml_confusion_matrix(self, li_cfs_matrices, labels):
+
+        fig, ax = plt.subplots(4, 5, figsize=(12, 9))
+         
+        for axes, cfs_matrix, label in zip(ax.flatten(), li_cfs_matrices, labels):
+            self.print_confusion_matrix(cfs_matrix, axes, label, ["Y", "N"])
+
+        fig.suptitle('Multi-Label Confusion Matrix for Dialogue Acts')    
+        fig.tight_layout()
+        #plt.show()   
+
+        return fig   
+
+    def print_confusion_matrix(self, confusion_matrix, axes, class_label, class_names, fontsize=14):
+        if confusion_matrix.ndim ==3:
+            confusion_matrix = confusion_matrix[0]
+
+        df_cm = pd.DataFrame(
+            confusion_matrix, index=class_names, columns=class_names,
+        )
+
+        try:
+            heatmap = sns.heatmap(df_cm, annot=True, fmt="d", cbar=False, ax=axes)
+        except ValueError:
+            raise ValueError("Confusion matrix values must be integers.")
+        
+        heatmap.yaxis.set_ticklabels(heatmap.yaxis.get_ticklabels(), rotation=0, ha='right', fontsize=fontsize)
+        heatmap.xaxis.set_ticklabels(heatmap.xaxis.get_ticklabels(), rotation=45, ha='right', fontsize=fontsize)
+        axes.set_xlabel('True label')
+        axes.set_ylabel('Predicted label')
+        axes.set_title(class_label)
+        
     def create_data_loaders(self, **kwargs):
         dir_train_set = os.path.join(self.dir_data,"train") #"./combined_data/train/"
         dir_val_set = os.path.join(self.dir_data,"val")
@@ -594,7 +710,7 @@ class TrainingModule(pl.LightningModule):
     def test_dataloader(self):
         return self.test_dl
 
-    @lru_cache()
+    #@lru_cache()
     def total_steps(self):
          
         train_batches = len( self.train_dl ) //self.gpus 
@@ -620,7 +736,7 @@ class TrainingModule(pl.LightningModule):
         elif type(self.accumulate_grad_batches) == int:
             
             agb = self.accumulate_grad_batches
-            steps = (self.max_epochs * train_batches) //  abg
+            steps = self.max_epochs * (train_batches //  agb)
 
         return steps
 
@@ -643,12 +759,12 @@ class TrainingModule(pl.LightningModule):
             lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3,)
             interval = "epoch"
 
-        return [optimizer], [{"scheduler": lr_scheduler, "interval": interval, "monitor":"val_loss"}]
+        return [optimizer], [{"scheduler": lr_scheduler, "interval": interval, "monitor":"val/loss"}]
 
     def get_progress_bar_dict(self):
         # don't show the version number
         items = super().get_progress_bar_dict()
-        items.pop("v_num", None)
+        #items.pop("v_num", None)
         return items
 
     def return_params(self):
@@ -661,7 +777,6 @@ class TrainingModule(pl.LightningModule):
         params = { k:v for k,v in self.__dict__.items() if k in list_of_params }
 
         return params
-    
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
     """
@@ -669,7 +784,7 @@ class DataLoaderGenerator():
                     dir_test_set, batch_size,
                     tokenizer, nem,
                     context_history_len=1,
-                    workers=0, mode='train_new',
+                    workers=6, mode='train_new',
                     max_length = 512,
                     **kwargs):
 
@@ -700,7 +815,6 @@ class DataLoaderGenerator():
         set_names = ["train","val","test"]
         li_shuffle = [True, False, False]
         dataloaders = []
-        
         dataloaders = [self.prepare_dataset(_dir, shuffle,name) for _dir,shuffle,name in zip(dir_sets,li_shuffle, set_names)]
         return dataloaders
 
@@ -712,9 +826,19 @@ class DataLoaderGenerator():
         """
         files = glob.glob( os.path.join(dir_dset,"*") )
         random.shuffle(files)
-        li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
-            self.context_history_len, self.max_length) for _f in files ]
-                
+
+        if self.mode == "hypertune":
+            li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
+                self.context_history_len, self.max_length) for _f in files ]
+        
+        elif self.mode in ['train_new','train_cont',"test"]:
+            with Pool(self.workers) as pool:
+                res = pool.starmap( SingleDataset, [ (_f, self.tokenizer, self.nem, 
+                        self.target_binarizer, self.context_history_len, 
+                        self.max_length) for _f in files ] )
+
+            li_dsets = res
+
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
@@ -727,7 +851,7 @@ class DataLoaderGenerator():
         
         train_dl, val_dl, test_dl = self.prepare_datasets()
         return train_dl, val_dl, test_dl
-    
+
 class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
@@ -765,12 +889,11 @@ class SingleDataset(torch.utils.data.Dataset):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-
                 pre_bnrzd = das.split(" ") if ( type(das) == str ) else " "
                 binarized_target = self.target_binarizer.transform( [  pre_bnrzd ] )
 
-                #This mask highlights that the loss on this element of a batch does not have to be amaksed
-                loss_mask = torch.ones((1)) 
+            #This mask highlights that the loss on this element of a batch does not have to be amaksed
+            loss_mask = torch.ones((1)) 
             
         except AttributeError as e:
             binarized_target = np.zeros((1,17))
@@ -793,37 +916,36 @@ class SingleDataset(torch.utils.data.Dataset):
 def main(tparams, mparams):
 
     # This is the main version of the model
-    #model_dir = tparams.model_dir
-    
     # Defining callbacks
     callbacks = []
 
     tb_logger = pl_loggers.TensorBoardLogger(
         save_dir = utils.get_path(f'./models/'),
         name = tparams.version_name,
-        version = tparams.subversion
-        )
+        version = tparams.subversion)
+    
+    #tb_logger.log_dir = types.MethodType( monkey_log_dir, tb_logger)    
     tparams.subversion =  tb_logger.version
 
-    
-    dir_model_version = os.path.join(tparams.model_dir, tparams.version_name, f"version_{tparams.subversion:02d}")
+    dir_model_version = os.path.join(tparams.model_dir, tparams.version_name, f"version_{tparams.subversion}")
+    dir_model_version = os.path.join(tparams.model_dir, tparams.version_name, f"version_{tparams.subversion}")
     tparams.dir_checkpoints = os.path.join( dir_model_version, 'checkpoints' )
         
-    checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
+    checkpoint_callback = ModelCheckpoint(monitor='val/loss', save_top_k=3, 
         mode='min', dirpath=tparams.dir_checkpoints , 
-        filename='{epoch:03d}-{val_loss:.3f}-{val_acc_micro:.3f}')
+        filename='{epoch:03d}-{step}')
+        #filename='{epoch:03d}-{step}-{val_bAcc:03f}'
     
     early_stop_callback = EarlyStopping(
-        monitor='val_loss',
+        monitor='val/loss',
         min_delta=0.00,
-        patience=20,
+        patience=20 ,
         verbose=False,
-        mode='auto')
+        mode='min')
 
     callbacks.append(checkpoint_callback)
     callbacks.append(early_stop_callback)    
 
-        
     # Restoring model settings for continued training and testing
     if tparams.mode in ['train_cont','test']:
         checkpoint_path = utils.get_best_ckpt_path(tparams.dir_checkpoints)
@@ -836,47 +958,46 @@ def main(tparams, mparams):
     if tparams.mode == "train_cont":
         # Restoring old tparams and combining with some params in new tparams
         old_tparams_dict = json.load( open( os.path.join(dir_model_version,"tparam.json"),"r" ) )
-        curr_tparams_dict = vars(tparams)
+        curr_tparams_dict = va
+        
+        rs(tparams)
         old_tparams_dict.update({key: curr_tparams_dict[key] for key in ['accumulate_grad_batches','batch_size','workers','gpus','mode','loss_pos_weight','loss_class_weight']  })
         tparams = argparse.Namespace(** old_tparams_dict )
 
     danet = DaNet(**vars(mparams))
     
-
-    # Defining Trainer
+   
     if tparams.gpus not in [0,1]:
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
-
+    
+    # Defining Training Module and Trainer
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
-        
+
+        training_module.logger.log_hyperparams( { **training_module.return_params(),
+                                            **training_module.model.return_params() } )
+
         trainer = pl.Trainer.from_argparse_args(tparams, 
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir= tparams.dir_checkpoints,
                         precision=16, callbacks=callbacks,
-                        overfit_batches = 0.1,
+                        overfit_batches = 0.001,
                         #limit_train_batches = 0.2,
                         #val_check_interval = 0.5,
-                        accelerator='ddp'
+                        accelerator='ddp',
                         #track_grad_norm = True,
                         #overfit_batches=5
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
                         ) 
         
-    # Making training module
     elif tparams.mode in ["test","train_cont"]:
 
-
         accelerator = "ddp" if tparams.mode=="train_cont" else None
-
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
         training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
         training_module.load_state_dict(checkpoint['state_dict'])
-
-        #training_module.to(device)
 
         trainer = pl.Trainer.from_argparse_args(tparams,
                             check_val_every_n_epoch=1, logger=tb_logger,
@@ -898,7 +1019,6 @@ def main(tparams, mparams):
             trainer.global_step = checkpoint['global_step']
             trainer.current_epoch = checkpoint['epoch']
 
-            
             # restore the optimizers
             optimizer_states = checkpoint['optimizer_states']
             
@@ -913,8 +1033,6 @@ def main(tparams, mparams):
                             if isinstance(v, torch.Tensor):
                                 state[k] = v.cuda(trainer.root_gpu)
 
-        
-
             # restore the lr schedulers
             lr_schedulers = checkpoint['lr_schedulers']
             for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
@@ -922,17 +1040,112 @@ def main(tparams, mparams):
 
         del checkpoint
         torch.cuda.empty_cache()
-        
 
     if tparams.mode in ["train_new","train_cont"]:    
         trainer.fit(training_module)
         
-
     elif tparams.mode in ["test"]:
         training_module.eval() 
         training_module.freeze() 
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
         
+def main_tune(tparams, mparams, num_samples=10, num_epochs=10):
+
+    agb_choices = [ 80, 160, 320, 480]
+    lcw_choices = [
+            round_dp([0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44],2),
+            round_dp([0.1509, 0.2836, 0.4472, 0.4001, 0.4087, 0.6043, 0.4813, 0.5764, 1.7964, 0.4539, 0.5121, 2.0519, 2.9428, 3.0064, 0.3953, 0.2396, 2.2491],2),
+    ]
+    lpw_choices = [
+        round_dp([ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0],1),
+        round_dp([ 6.09, 6.5, 7.0, 7.5 ,5.9, 5.5,  6.5, 6.0, 7.5, 5.0, 6.25, 8.5, 8.5, 8.5 , 8.5, 8.5 , 8.5],1),
+        round_dp([ 3.04, 3.25, 3.5, 3.75 , 2.95, 2.75,  3.25, 3.0, 3.75, 2.5, 3.125, 4.25, 4.25, 4.25 , 4.25, 4.25 , 4.25],1),
+        round_dp([ 3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522],1)            
+    ]
+
+    config = {
+    "learning_rate": tune.loguniform(1e-4, 1e-1),
+    "loss_class_weight":tune.choice( lcw_choices),
+    "loss_pos_weight":tune.choice( lpw_choices),
+    "accumulate_grad_batches":tune.choice( agb_choices),
+    "bert_output":tune.choice(["CLSRepresentation","PooledOutput"]),
+    'dir_data':tune.choice(['./combined_data_v1','./combined_data_v2'])
+    }
+
+    scheduler = ASHAScheduler(
+        max_t=tparams.get('max_epochs',10),
+        grace_period=3,
+        reduction_factor=2)
+
+    reporter = CLIReporter(
+        parameter_columns=list(config.keys()),
+        metric_columns=["loss", "val/bacc_macro", "val/f1_macro","training_iteration"]) #"val/rec_macro","val/prec_macro"])
+
+    #removing params to hypertune from tparams and mparams
+    li_hypertune_params = list(config.keys())
+    for k in li_hypertune_params:
+        tparams.pop(k,None)
+        mparams.pop(k,None)
+
+    non_tune_params = {**tparams  }
+
+    analysis = tune.run(
+        tune.with_parameters(
+            tune_danet, 
+                tparams=tparams,
+                mparams=mparams),
+
+        resources_per_trial={
+            "cpu": tparams.get('workers'),
+            "gpu": 1
+        },
+        metric="val/bacc_macro",
+        mode="max",
+        config=config,
+        num_samples=num_samples,
+        scheduler=scheduler,
+        progress_reporter=reporter,
+        name="tune_danet")
+
+    print("Best hyperparameters found were: ", analysis.best_config)
+
+
+def tune_danet(config, tparams, mparams):
+    
+    if 'bert_output' not in mparams:
+        mparams['bert_output'] = config['bert_output']
+
+    module = TrainingModule( **tparams, **config , mparams=mparams)
+    tblogger = TensorBoardLogger(
+                save_dir=tune.get_trial_dir(), name="", version=".")
+
+    callback_tunerreport =             TuneReportCallback(
+                {
+                    "loss": "val/loss",
+                    "bacc": "val/f1_macro", #val/bacc_macro
+                },
+                on="validation_end")
+
+    # callback_tunerreport_checkpoint = TuneReportCheckpointCallback(
+    #         metrics={"loss": "val/loss","bacc": "val/bacc"}
+    #         filename="checkpoint",
+    #         on="validation_end")
+
+    trainer = pl.Trainer(
+        gpus=tparams.get('gpus',1),
+        logger=tblogger,
+        progress_bar_refresh_rate=0,
+        callbacks=[
+            callback_tunerreport
+        ],
+        overfit_batches=0.1
+        )
+    
+    trainer.fit(module)
+
+def round_dp(values, dp):
+    li = [ round(x,dp) for x in values]
+    return li
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     
@@ -942,27 +1155,27 @@ if __name__ == '__main__':
     # add the trainer specific args
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
 
-    main(tparams, mparams)
+    if tparams.mode in ['train_new','train_cont','test','inference']:
+        main(tparams, mparams)
 
-#    CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 560 --workers 8 --gpus 1 --max_epochs 50  --learning_rate 1e-3 --warmup_proportion 0.1
+    elif tparams.mode in ['hypertune']:
+        main_tune(vars(tparams), vars(mparams))
 
-#   CUDA_VISIBLE_DEVICES=0,1,2 python3 train.py -bs 8 -agb 20 --workers 8 --gpus 1  --max_epochs 70  --learning_rate 1e-4 
-
-# Training model on version 1 dataset - #At least one da is in the list of ones to paraphrase
-# CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 32 -agb 20 --workers 8 --gpus 1 --max_epochs 70  --learning_rate 1e-3 --mode train_cont --version_name DaNet_v027
 
 
 #------------
-# Training model on version 2 dataset - #at least one da is in the list of ones to paraphrase but "statement" never occurs
+# Training model on version 2 dataset - #ReplicationPolicy: at least one da is in the list of ones to paraphrase but "statement" never occurs
     # The class weighting used is linear
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 56 -agb 10 --gpus 2 --max_epochs 80 --mode train_new --version_name DaNet_v002 --bert_output CLSRepresentation --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44]" -lpw "[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]" --tag "removed the +2 added to the positive wieght since it caused a collpase in training" -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }" -sv 01
+# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 8 --gpus 1 --max_epochs 80 --mode train_new --version_name DaNet_v002 --bert_output CLSRepresentation -sv 03 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.0836, 0.1839, 0.3249, 0.2827, 0.2903, 0.4733, 0.3561, 0.4461, 1.8474, 0.3309, 0.3848, 2.1815, 3.4238, 3.5167, 0.2784, 0.1489, 2.4467]" -lpw "[3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522]" --tag "removed the +2 added to the positive wieght since it caused a collpase in training" -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }"
 
 
 #------------
-# Training model on version 1 dataset - #at least one da is in the list of ones to paraphrase 
+# Training model on version 1 dataset - #ReplicationPolicy at least one da is in the list of ones to paraphrase 
 # The class weighting used is linear
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 40 -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }" --gpus 2 --max_epochs 80 --mode train_new --version_name DaNet_v002 --bert_output CLSRepresentation --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44]" -lpw "[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]"
+# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 40 -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }" --gpus 2 --max_epochs 80 --mode train_new --version_name DaNet_v001 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44]" -lpw "[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]"
+
+# ---- Testing comparsion of models
 
 
