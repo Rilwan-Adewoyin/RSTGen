@@ -1,7 +1,8 @@
 import os
 import warnings
 warnings.filterwarnings('ignore')  # "error", "ignore", "always", "default", "module" or "once"
-#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+
 import io
 import matplotlib.pyplot as plt
 import numpy as np
@@ -67,6 +68,8 @@ from ray.tune.integration.pytorch_lightning import TuneReportCallback, \
     TuneReportCheckpointCallback
 
 from ray.tune.integration.pytorch_lightning import TuneReportCallback
+
+import torchdata as td
 
 #Monkey Patch for logging class
 def monkey_log_dir(self):
@@ -303,7 +306,6 @@ class DaNet(nn.Module):
         # removing datums where the target da had no value
         input_['loss_mask'] = input_['loss_mask']>0 #creating boolean tensor
 
-
         input_['input_ids'] = input_['input_ids'][input_['loss_mask'] ]
         input_['attention_mask'] =  input_['attention_mask'][input_['loss_mask']]
         input_['token_type_ids'] = input_['token_type_ids'][input_['loss_mask']]
@@ -427,7 +429,7 @@ class TrainingModule(pl.LightningModule):
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
             self.lr_schedule = lr_schedule
-            self.create_data_loaders()
+            self.create_data_loaders(**kwargs)
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
 
@@ -481,6 +483,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-ml','--max_length', default=512, type=int)
         parser.add_argument('-sv','--subversion', default=None,required=False, type=int, help="The Experimental sub Versioning for this run" )
         parser.add_argument('--tag', default='', type=str)
+        parser.add_argument('--cache', default=False, type=bool)
         tparams = parser.parse_known_args()[0]
 
         tparams.loss_class_weight = json.loads( tparams.loss_class_weight )
@@ -696,7 +699,7 @@ class TrainingModule(pl.LightningModule):
         
         dg = DataLoaderGenerator(dir_train_set, dir_val_set,
             dir_test_set, self.batch_size, self.model.tokenizer, self.model.nem,
-            workers=self.workers, mode=self.mode, max_length=self.max_length
+            workers=self.workers, mode=self.mode, max_length=self.max_length, cache=kwargs.get('cache',False)
             )
         
         self.train_dl, self.val_dl, self.test_dl = dg()
@@ -785,7 +788,7 @@ class DataLoaderGenerator():
                     tokenizer, nem,
                     context_history_len=1,
                     workers=6, mode='train_new',
-                    max_length = 512,
+                    max_length = 512, cache=False,
                     **kwargs):
 
         self.dir_train_set = dir_train_set
@@ -804,6 +807,7 @@ class DataLoaderGenerator():
         self.workers  = workers
         self.mode = mode
         self.max_length = max_length
+        self.cache = cache
 
     def prepare_datasets(self):
         """prepares a train, validation and test set
@@ -840,6 +844,9 @@ class DataLoaderGenerator():
             li_dsets = res
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+
+        if self.cache == True:
+            concat_dset = td.datasets.WrapDataset(concat_dset).cache(td.cachers.Pickle(f"./cachedata/{name}_{dir_dset}"))
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
@@ -1087,7 +1094,7 @@ def main_tune(tparams, mparams, num_samples=10, num_epochs=10):
         tparams.pop(k,None)
         mparams.pop(k,None)
 
-    non_tune_params = {**tparams  }
+    non_tune_params = {**tparams }
 
     analysis = tune.run(
         tune.with_parameters(
@@ -1119,7 +1126,7 @@ def tune_danet(config, tparams, mparams):
     tblogger = TensorBoardLogger(
                 save_dir=tune.get_trial_dir(), name="", version=".")
 
-    callback_tunerreport =             TuneReportCallback(
+    callback_tunerreport = TuneReportCallback(
                 {
                     "loss": "val/loss",
                     "bacc": "val/f1_macro", #val/bacc_macro
@@ -1176,6 +1183,8 @@ if __name__ == '__main__':
 
 # CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 40 -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }" --gpus 2 --max_epochs 80 --mode train_new --version_name DaNet_v001 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44]" -lpw "[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]"
 
-# ---- Testing comparsion of models
+# ---- hypertuniimng
+
+# CUDA_VISIBLE_DEVICES=0,1 python3 train.py --workers 6 --gpus 1 --batch_size 5 --version_name DaNet_v010 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 512 --max_epochs 15 --cache True
 
 
