@@ -1,10 +1,22 @@
+
+# import matplotlib
+# matplotlib.use('Agg')
+
+import torchdata as td
+
+#from torchdata.dataset import WrapDataset
+#from torchdata.cachers import Pickle
+
 import os
 import warnings
 warnings.filterwarnings('ignore')  # "error", "ignore", "always", "default", "module" or "once"
-os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
 
 import io
+
 import matplotlib.pyplot as plt
+plt.switch_backend('agg')
+
 import numpy as np
 
 import sklearn
@@ -67,9 +79,10 @@ from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
 from ray.tune.integration.pytorch_lightning import TuneReportCallback, \
     TuneReportCheckpointCallback
 
-from ray.tune.integration.pytorch_lightning import TuneReportCallback
+#import en_core_web_sm
+#from spacy.language import Language
 
-import torchdata as td
+from pathlib import Path
 
 #Monkey Patch for logging class
 def monkey_log_dir(self):
@@ -366,7 +379,9 @@ class NamedEntityMasker():
         self.batch_size = batch_size
         self.n_proc = n_proc
         self.nlp = spacy.load('en_core_web_sm',disable=["parser"])
+        #self.nlp = en_core_web_sm.load()
         self.nlp.add_pipe(self.mask_pipe, name="Entity_mask", last=True)
+        #self.nlp.add_pipe("Entity_mask", name="Entity_mask", last=True)
         
     def __call__(self,li_txt):
         return self.pipeline(li_txt)
@@ -374,10 +389,19 @@ class NamedEntityMasker():
     def pipeline(self,li_txt):
         return self.nlp.pipe(li_txt, as_tuples=False, batch_size = self.batch_size)
 
-    def mask_pipe(self, document):
-        text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in document])
-        
+    #@Language.component('Entity_mask')
+    def mask_pipe(self, doc):
+        text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in doc])
         return text
+
+# @Language.component('Entity_mask')
+# def mask_pipe(doc):
+#     text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in doc])
+
+#     return text
+
+
+
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, batch_size=30, 
@@ -412,7 +436,8 @@ class TrainingModule(pl.LightningModule):
         
         if model == None:
             self.model = DaNet(**kwargs.get('mparams'))
-
+        else:
+            self.model = model
         self.mode = mode
         self.workers = workers
 
@@ -632,6 +657,8 @@ class TrainingModule(pl.LightningModule):
                         'val/f1_macro': 2*(val_prec*val_rec)/(val_prec+val_rec)  }  
 
             self.logger.log_metrics( scalar_dict, step=self.current_epoch)
+            self.log(f"{step_name}/f1_macro",  2*(val_prec*val_rec)/(val_prec+val_rec), logger=False, prog_bar=True)
+            self.log(f"{step_name}/bacc_macro",  val_bacc, logger=False, prog_bar=True)
             
             # Logging Dis-aggregated Class Performance
             class_preds = torch.cat([x["output"] for x in outputs], axis=0)     # (n,17)
@@ -642,11 +669,12 @@ class TrainingModule(pl.LightningModule):
             class_obsrvd = class_obsrvd.detach().to('cpu').numpy().astype(np.int32)
 
                 # Creating multi-label confusion matrix image
-            mcm = multilabel_confusion_matrix(class_obsrvd, class_preds, labels=np.arange(17) )
-            li_cm = np.split(mcm, mcm.shape[0], axis=0)
-            mcm_figure = self.ml_confusion_matrix( li_cm, labels=self.ordered_label_list)
-            self.logger.experiment.add_figure(f"{step_name}/Confusion Matrix", mcm_figure, 
-                global_step=self.current_epoch)
+            if self.mode != "hypertune":
+                mcm = multilabel_confusion_matrix(class_obsrvd, class_preds, labels=np.arange(17) )
+                li_cm = np.split(mcm, mcm.shape[0], axis=0)
+                mcm_figure = self.ml_confusion_matrix( li_cm, labels=self.ordered_label_list)
+                self.logger.experiment.add_figure(f"{step_name}/Confusion Matrix", mcm_figure, 
+                    global_step=self.current_epoch)
             
                 # Logging Precision, recall, fscore, support
             precision, recall, fscore, support = precision_recall_fscore_support(class_obsrvd, class_preds,
@@ -662,7 +690,7 @@ class TrainingModule(pl.LightningModule):
 
     def ml_confusion_matrix(self, li_cfs_matrices, labels):
 
-        fig, ax = plt.subplots(4, 5, figsize=(12, 9))
+        fig, ax = plt.subplots(4, 5, figsize=(12, 9), frameon=False)
          
         for axes, cfs_matrix, label in zip(ax.flatten(), li_cfs_matrices, labels):
             self.print_confusion_matrix(cfs_matrix, axes, label, ["Y", "N"])
@@ -716,7 +744,9 @@ class TrainingModule(pl.LightningModule):
     #@lru_cache()
     def total_steps(self):
          
-        train_batches = len( self.train_dl ) //self.gpus 
+        print(len(self.train_dl))
+
+        train_batches = len( self.train_dl ) // self.gpus 
         
         if type(self.accumulate_grad_batches) == dict:
 
@@ -843,10 +873,14 @@ class DataLoaderGenerator():
 
             li_dsets = res
 
-        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+        #concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         if self.cache == True:
-            concat_dset = td.datasets.WrapDataset(concat_dset).cache(td.cachers.Pickle(f"./cachedata/{name}_{dir_dset}"))
+
+            concat_dset = td.datasets.ChainDataset(li_dsets).cache(td.cachers.Pickle(Path(f"./cachedata/{dir_dset.split('/')[-2]}_{dir_dset.split('/')[-1] }")))
+            #concat_dset = WrapDataset(concat_dset).cache(Pickle(f"./cachedata/{name}_{dir_dset}"))
+        else:
+            concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=self.bs,
             shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate,
@@ -971,8 +1005,7 @@ def main(tparams, mparams):
         old_tparams_dict.update({key: curr_tparams_dict[key] for key in ['accumulate_grad_batches','batch_size','workers','gpus','mode','loss_pos_weight','loss_class_weight']  })
         tparams = argparse.Namespace(** old_tparams_dict )
 
-    danet = DaNet(**vars(mparams))
-    
+    danet = DaNet(**vars(mparams))    
    
     if tparams.gpus not in [0,1]:
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
@@ -982,23 +1015,23 @@ def main(tparams, mparams):
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
 
-        training_module.logger.log_hyperparams( { **training_module.return_params(),
-                                            **training_module.model.return_params() } )
-
         trainer = pl.Trainer.from_argparse_args(tparams, 
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir= tparams.dir_checkpoints,
                         precision=16, callbacks=callbacks,
-                        overfit_batches = 0.001,
+                        overfit_batches = 0.1,
                         #limit_train_batches = 0.2,
                         #val_check_interval = 0.5,
+                        #limit_val_batches = 1,
                         accelerator='ddp',
                         #track_grad_norm = True,
-                        #overfit_batches=5
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
                         ) 
-        
+
+        # training_module.logger.log_hyperparams( { **training_module.return_params(),
+        #                                     **training_module.model.return_params() } )
+
     elif tparams.mode in ["test","train_cont"]:
 
         accelerator = "ddp" if tparams.mode=="train_cont" else None
@@ -1056,37 +1089,41 @@ def main(tparams, mparams):
         training_module.freeze() 
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
         
-def main_tune(tparams, mparams, num_samples=10, num_epochs=10):
+def main_tune(tparams, mparams, num_samples=int(17*8), num_epochs=5):
 
-    agb_choices = [ 80, 160, 320, 480]
+    agb_choices = [ 80, 320]
     lcw_choices = [
-            round_dp([0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44],2),
-            round_dp([0.1509, 0.2836, 0.4472, 0.4001, 0.4087, 0.6043, 0.4813, 0.5764, 1.7964, 0.4539, 0.5121, 2.0519, 2.9428, 3.0064, 0.3953, 0.2396, 2.2491],2),
+            round_dp([0.008876470588235295, 0.01668235294117647, 0.026305882352941175, 0.02353529411764706, 0.024041176470588236, 0.03554705882352941, 0.028311764705882352, 0.033905882352941175, 0.10567058823529411, 0.0267, 0.030123529411764705, 0.12069999999999999, 0.1731058823529412, 0.1768470588235294, 0.023252941176470587, 0.014094117647058825, 0.1323],4), #best performing from round 1 normalised   
     ]
-    lpw_choices = [
+
+    lpw_choices_round_1 = [
         round_dp([ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0],1),
         round_dp([ 6.09, 6.5, 7.0, 7.5 ,5.9, 5.5,  6.5, 6.0, 7.5, 5.0, 6.25, 8.5, 8.5, 8.5 , 8.5, 8.5 , 8.5],1),
-        round_dp([ 3.04, 3.25, 3.5, 3.75 , 2.95, 2.75,  3.25, 3.0, 3.75, 2.5, 3.125, 4.25, 4.25, 4.25 , 4.25, 4.25 , 4.25],1),
-        round_dp([ 3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522],1)            
+        round_dp([ 3.04, 3.25, 3.5, 3.75 , 2.95, 2.75,  3.25, 3.0, 3.75, 2.5, 3.125, 4.25, 4.25, 4.25 , 4.25, 4.25 , 4.25],1), #best performing from round 1
+        round_dp([ 3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522],1)               
     ]
+    lpw_choices = sample_vector( mu=lpw_choices_round_1[2], spread= [val/2 for val in lpw_choices_round_1[2]] , count=num_samples   )
+    lpw_choices = [ round_dp(li, 2) for li in lpw_choices]
+
+    lr_choices = [ 1e-4 ]
 
     config = {
-    "learning_rate": tune.loguniform(1e-4, 1e-1),
+    #"learning_rate": lr_choices,
+    "accumulate_grad_batches":tune.choice( agb_choices),
+    #"bert_output":tune.choice(["PooledOutput"]), #tune.choice(["CLSRepresentation","PooledOutput"]),
+    #'dir_data':tune.choice(['./combined_data_v2'])
     "loss_class_weight":tune.choice( lcw_choices),
     "loss_pos_weight":tune.choice( lpw_choices),
-    "accumulate_grad_batches":tune.choice( agb_choices),
-    "bert_output":tune.choice(["CLSRepresentation","PooledOutput"]),
-    'dir_data':tune.choice(['./combined_data_v1','./combined_data_v2'])
     }
 
     scheduler = ASHAScheduler(
-        max_t=tparams.get('max_epochs',10),
+        max_t=tparams.get('max_epochs',7),
         grace_period=3,
         reduction_factor=2)
 
     reporter = CLIReporter(
         parameter_columns=list(config.keys()),
-        metric_columns=["loss", "val/bacc_macro", "val/f1_macro","training_iteration"]) #"val/rec_macro","val/prec_macro"])
+        metric_columns=["loss", "bacc", "f1","training_iteration"]) #"val/rec_macro","val/prec_macro"])
 
     #removing params to hypertune from tparams and mparams
     li_hypertune_params = list(config.keys())
@@ -1106,16 +1143,33 @@ def main_tune(tparams, mparams, num_samples=10, num_epochs=10):
             "cpu": tparams.get('workers'),
             "gpu": 1
         },
-        metric="val/bacc_macro",
+        metric="f1",
         mode="max",
         config=config,
         num_samples=num_samples,
         scheduler=scheduler,
         progress_reporter=reporter,
-        name="tune_danet")
+        name="tune_danet2")
 
     print("Best hyperparameters found were: ", analysis.best_config)
 
+    # Saving DataFrame of results 
+    results_df = analysis.results_df()
+    fp = os.join( analysis._experiment_dir, "results.csv") 
+    results_df.to_csv( fp, index=False)
+
+
+def sample_vector(mu, spread, count=1):
+    #pass in mean and spread
+    #spread is calculated as a percentage of mean
+    mu = np.array(mu)
+    spread = np.array(spread)
+
+    values = np.random.uniform( mu-spread, mu+spread, size=(count, len(mu) ) )
+
+    li = values.tolist()
+
+    return li
 
 def tune_danet(config, tparams, mparams):
     
@@ -1129,7 +1183,8 @@ def tune_danet(config, tparams, mparams):
     callback_tunerreport = TuneReportCallback(
                 {
                     "loss": "val/loss",
-                    "bacc": "val/f1_macro", #val/bacc_macro
+                    "f1": "val/f1_macro",
+                    "bacc":"val/bacc_macro"
                 },
                 on="validation_end")
 
@@ -1145,7 +1200,8 @@ def tune_danet(config, tparams, mparams):
         callbacks=[
             callback_tunerreport
         ],
-        overfit_batches=0.1
+        overfit_batches=0.05,
+        checkpoint_callback=False
         )
     
     trainer.fit(module)
@@ -1153,6 +1209,7 @@ def tune_danet(config, tparams, mparams):
 def round_dp(values, dp):
     li = [ round(x,dp) for x in values]
     return li
+
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     
@@ -1185,6 +1242,5 @@ if __name__ == '__main__':
 
 # ---- hypertuniimng
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train.py --workers 6 --gpus 1 --batch_size 5 --version_name DaNet_v010 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 512 --max_epochs 15 --cache True
-
-
+#  CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py --gpus 1 --batch_size 30 --version_name DaNet_v99 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 206 --max_epochs 5 --cache True --bert_output PooledOutput
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py --gpus 1 --batch_size 30 --version_name DaNet_v99 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 206 --max_epochs 8 --cache True --bert_output PooledOutput -lr 1e-4
