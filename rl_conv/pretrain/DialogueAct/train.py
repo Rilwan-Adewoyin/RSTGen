@@ -411,7 +411,7 @@ class TrainingModule(pl.LightningModule):
                     gpus=1, 
                     context_history_len=1,
                     learning_rate=8e-4,
-                    warmup_proportion=0.10,
+                    warmup_proportion=0.15,
                     workers=8,
                     lr_schedule='LROnPlateau',
                     mode = 'train_new',
@@ -495,7 +495,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--context_history_len', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=32, type=int)
         parser.add_argument('-lr','--learning_rate', default=1e-3, type=float)
-        parser.add_argument('-wp','--warmup_proportion', default=0.1, type=float)
+        parser.add_argument('-wp','--warmup_proportion', default=0.15, type=float)
         parser.add_argument('--workers', default=8, type=int)
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont','hypertune'])
@@ -1089,12 +1089,20 @@ def main(tparams, mparams):
         training_module.freeze() 
         trainer.test(test_dataloaders=training_module.test_dl, model=training_module,ckpt_path=checkpoint_path)
         
-def main_tune(tparams, mparams, num_samples=int(17*8), num_epochs=5):
+def main_tune(tparams, mparams, num_samples=int(50), num_epochs=5):
 
-    agb_choices = [ 80, 320]
-    lcw_choices = [
+    agb_choices = [ 320]
+    lcw_choices_round1 = [
             round_dp([0.008876470588235295, 0.01668235294117647, 0.026305882352941175, 0.02353529411764706, 0.024041176470588236, 0.03554705882352941, 0.028311764705882352, 0.033905882352941175, 0.10567058823529411, 0.0267, 0.030123529411764705, 0.12069999999999999, 0.1731058823529412, 0.1768470588235294, 0.023252941176470587, 0.014094117647058825, 0.1323],4), #best performing from round 1 normalised   
     ]
+
+    lcw_choices = sample_vector( mu=lcw_choices_round1[0], spread= [val/1.5 for val in lcw_choices_round1[0]] , count=num_samples   )
+    lcw_choices = [ round_dp(li, 4) for li in lcw_choices]
+
+    lcw_choices_round_3 = [0.00836334, 0.02389985, 0.03551647, 0.03141137, 0.02931976,
+       0.03632556, 0.04459335, 0.04091643, 0.11811329, 0.02451236,
+       0.03749376, 0.15480891, 0.14807479, 0.12209298, 0.03121748,
+       0.015374  , 0.0979663 ] #Average of the top 4 from round3
 
     lpw_choices_round_1 = [
         round_dp([ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0],1),
@@ -1102,23 +1110,29 @@ def main_tune(tparams, mparams, num_samples=int(17*8), num_epochs=5):
         round_dp([ 3.04, 3.25, 3.5, 3.75 , 2.95, 2.75,  3.25, 3.0, 3.75, 2.5, 3.125, 4.25, 4.25, 4.25 , 4.25, 4.25 , 4.25],1), #best performing from round 1
         round_dp([ 3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522],1)               
     ]
-    lpw_choices = sample_vector( mu=lpw_choices_round_1[2], spread= [val/2 for val in lpw_choices_round_1[2]] , count=num_samples   )
-    lpw_choices = [ round_dp(li, 2) for li in lpw_choices]
 
+    lpw_choices_2 = sample_vector( mu=lpw_choices_round_1[2], spread= [val/2 for val in lpw_choices_round_1[2]] , count=num_samples   )
+    lpw_choices_2 = [ round_dp(li, 2) for li in lpw_choices_2]
+    
+    lpw_choices_round_2_best = [
+        [3.13, 2.95, 4.38, 4.61, 4.31, 4.02, 3.66, 4.47, 2.76, 3.15, 4.43, 4.4, 5.22, 3.99, 4.88, 4.19, 4.82]
+    ]
+    
+    
     lr_choices = [ 1e-4 ]
 
     config = {
     #"learning_rate": lr_choices,
-    "accumulate_grad_batches":tune.choice( agb_choices),
+    #"accumulate_grad_batches":tune.choice( agb_choices),
     #"bert_output":tune.choice(["PooledOutput"]), #tune.choice(["CLSRepresentation","PooledOutput"]),
     #'dir_data':tune.choice(['./combined_data_v2'])
     "loss_class_weight":tune.choice( lcw_choices),
-    "loss_pos_weight":tune.choice( lpw_choices),
+    #"loss_pos_weight":tune.choice( lpw_choices),
     }
 
     scheduler = ASHAScheduler(
-        max_t=tparams.get('max_epochs',7),
-        grace_period=3,
+        max_t=tparams.get('max_epochs',5),
+        grace_period=2,
         reduction_factor=2)
 
     reporter = CLIReporter(
@@ -1149,13 +1163,13 @@ def main_tune(tparams, mparams, num_samples=int(17*8), num_epochs=5):
         num_samples=num_samples,
         scheduler=scheduler,
         progress_reporter=reporter,
-        name="tune_danet2")
+        name="tune_danet3")
 
     print("Best hyperparameters found were: ", analysis.best_config)
 
     # Saving DataFrame of results 
-    results_df = analysis.results_df()
-    fp = os.join( analysis._experiment_dir, "results.csv") 
+    results_df = analysis.results_df
+    fp = os.path.join( analysis._experiment_dir, "results.csv") 
     results_df.to_csv( fp, index=False)
 
 
@@ -1231,16 +1245,10 @@ if __name__ == '__main__':
 # Training model on version 2 dataset - #ReplicationPolicy: at least one da is in the list of ones to paraphrase but "statement" never occurs
     # The class weighting used is linear
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 8 --gpus 1 --max_epochs 80 --mode train_new --version_name DaNet_v002 --bert_output CLSRepresentation -sv 03 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.0836, 0.1839, 0.3249, 0.2827, 0.2903, 0.4733, 0.3561, 0.4461, 1.8474, 0.3309, 0.3848, 2.1815, 3.4238, 3.5167, 0.2784, 0.1489, 2.4467]" -lpw "[3.502, 7.7042, 13.614, 11.8464, 12.1636, 19.8311, 14.9235, 18.694, 77.4121, 13.8663, 16.1247, 91.4133, 143.4686, 147.3582, 11.6667, 6.2396, 102.522]" --tag "removed the +2 added to the positive wieght since it caused a collpase in training" -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }"
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py -bs 32 -agb 320 --gpus 4 --max_epochs 28 --mode train_new --version_name DaNet_v002--bert_output PooledOutput -sv 1 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.00836334, 0.02389985, 0.03551647, 0.03141137, 0.02931976, 0.03632556, 0.04459335, 0.04091643, 0.11811329, 0.02451236, 0.03749376, 0.15480891, 0.14807479, 0.12209298, 0.03121748, 0.015374  , 0.0979663]" -lpw "[3.13, 2.95, 4.38, 4.61, 4.31, 4.02, 3.66, 4.47, 2.76, 3.15, 4.43, 4.4, 5.22, 3.99, 4.88, 4.19, 4.82]" --tag "fine-tuned lpw and lcw weights"
 
-
-#------------
-# Training model on version 1 dataset - #ReplicationPolicy at least one da is in the list of ones to paraphrase 
-# The class weighting used is linear
-
-# CUDA_VISIBLE_DEVICES=0,1 python3 train.py -bs 40 -agb "{1:400, 3:200, 7:100, 11:75, 15:50, 19:40, 25:12, 29:10 }" --gpus 2 --max_epochs 80 --mode train_new --version_name DaNet_v001 --dir_data "./combined_data_v2" -lr 1e-4 -ml 512 -lcw "[0.08357, 0.183, 0.3248, 0.2827, 0.290, 0.4732, 0.356, 0.44, 1.847, 0.33, 0.38, 2.18, 3.42, 3.51, 0.27, 0.148, 2.44]" -lpw "[ 12.29, 13.04, 14.0, 15.0 ,10.7, 11.0,  13.0, 12.0, 15.0, 10.0, 12.5, 17.0, 17.0, 17.0 , 17.0, 17.0 , 17.0]"
 
 # ---- hypertuniimng
 
 #  CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py --gpus 1 --batch_size 30 --version_name DaNet_v99 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 206 --max_epochs 5 --cache True --bert_output PooledOutput
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py --gpus 1 --batch_size 30 --version_name DaNet_v99 --mode hypertune --workers 4 --dir_data ./combined_data_v2 -ml 206 --max_epochs 8 --cache True --bert_output PooledOutput -lr 1e-4
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py --gpus 1 --agb 30 --batch_size 34 --version_name DaNet_v99 --mode hypertune --workers 3 --dir_data ./combined_data_v2 -ml 206 --max_epochs 8 --cache True --bert_output PooledOutput -lr 1e-4
