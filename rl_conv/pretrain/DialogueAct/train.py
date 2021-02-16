@@ -3,14 +3,13 @@ import matplotlib
 matplotlib.use('Agg')
 
 import torchdata as td
-
 #from torchdata.dataset import WrapDataset
 #from torchdata.cachers import Pickle
 
 import os
 import warnings
 warnings.filterwarnings('ignore')  # "error", "ignore", "always", "default", "module" or "once"
-#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
 
 import io
 
@@ -225,6 +224,111 @@ class bAccuracy_macro(Metric):
         vals = torch.masked_select( vals, ~torch.isnan(vals) )
         
         return torch.mean(vals)
+class csi_macro(Metric):
+    r"""Critical sucess index
+        Computes `balanced Accuracy <https://en.wikipedia.org/wiki/Precision_and_recall>`_:
+
+        .. math:: \text{Accuracy} = \frac{1}{N}\sum_i^N 1(y_i = \hat{y_i})
+
+        Where :math:`y` is a tensor of target values, and :math:`\hat{y}` is a
+        tensor of predictions.  Works with binary, multiclass, and multilabel
+        data.  Accepts logits from a model output or integer class values in
+        prediction.  Works with multi-dimensional preds and target.
+
+        Forward accepts
+
+        - ``preds`` (float or long tensor): ``(N, ...)`` or ``(N, C, ...)`` where C is the number of classes
+        - ``target`` (long tensor): ``(N, ...)``
+
+        If preds and target are the same shape and preds is a float tensor, we use the ``self.threshold`` argument.
+        This is the case for binary and multi-label logits.
+
+        If preds has an extra dimension as in the case of multi-class scores we perform an argmax on ``dim=1``.
+
+        Args:
+            threshold:
+                Threshold value for binary or multi-label logits. default: 0.5
+            compute_on_step:
+                Forward only calls ``update()`` and return None if this is set to False. default: True
+            dist_sync_on_step:
+                Synchronize metric state across processes at each ``forward()``
+                before returning the value at the step. default: False
+            process_group:
+                Specify the process group on which synchronization is called. default: None (which selects the entire world)
+            dist_sync_fn:
+                Callback that performs the allgather operation on the metric state. When `None`, DDP
+                will be used to perform the allgather. default: None
+
+        Example:
+        TODO: change
+
+            >>> from pytorch_lightning.metrics import Accuracy
+            >>> target = torch.tensor([0, 1, 2, 3])
+            >>> preds = torch.tensor([0, 2, 1, 3])
+            >>> accuracy = Accuracy()
+            >>> accuracy(preds, target)
+            tensor(0.5000)
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        threshold: float = 0.5,
+        compute_on_step: bool = True,
+        dist_sync_on_step: bool = False,
+        process_group: Optional[Any] = None,
+        dist_sync_fn: Callable = None):
+
+        super().__init__(
+            compute_on_step=compute_on_step,
+            dist_sync_on_step=dist_sync_on_step,
+            process_group=process_group,
+            dist_sync_fn=dist_sync_fn,
+        )
+
+        self.add_state("correct_positive", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("correct_negative", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+
+        self.add_state("positive_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("negative_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+
+        self.threshold = threshold
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor):
+        """
+        Update state with predictions and targets.
+
+        Args:
+            preds: Predictions from model
+            target: Ground truth values
+        """
+        
+        preds, target = pl.metrics.utils._input_format_classification(preds, target, self.threshold)
+        assert preds.shape == target.shape
+
+        correct = preds == target #(n, c)
+        pos_mask= target.eq(1.0) # mask for positive samples
+
+        self.tp += torch.sum( torch.logical_and( correct, pos_mask), dim=[0] )
+        self.fn += torch.sum( torch.logical_and( ~correct, pos_mask), dim=[0] )
+        self.fp +=torch.sum( torch.logical_and( ~correct, ~pos_mask), dim=[0] )
+
+
+        self.positive_samples += torch.sum( pos_mask, dim=[0])
+        self.negative_samples += torch.sum( ~pos_mask, dim=[0])
+        
+    def compute(self):
+        """
+        Computes csi over state.
+        """
+        tp = self.tp.float()
+        fn = self.fn.float()
+        fp = self.fp.float()
+
+        vals = tp/(tp+fn+fp)
+        
+        vals = torch.masked_select( vals, ~torch.isnan(vals) )
+        
+        return torch.mean(vals)
 
 #alpha default = 0.25, gamma= 2
 class FocalLoss(nn.modules.loss._Loss):
@@ -320,6 +424,59 @@ class RichardLoss(torch.nn.modules.loss._Loss):
 
         return r_loss
 
+# Implement Dice loss below, experiment with Fbeta scores then seperately also with varying the contribution from predictions that are correct for the negative class
+class SoftFbetaLoss(torch.nn.modules.loss._Loss):
+    #Focal Loss Adapte
+    def __init__(self, class_weight: Optional[Tensor] = None, size_average=None,
+                    reduction: str = 'mean', reduce=None,
+
+                    alpha: Optional[Tensor] = None,
+                    
+                    beta: Optional[Tensor] = None ) -> None:
+                    
+
+        super(SoftFbetaLoss, self).__init__(size_average, reduce, reduction)
+        
+        self.register_buffer('class_weight', class_weight) #should use theoretical class weights
+            
+            # alpha is now the weighting for the negative values assuming
+        self.register_buffer('beta', beta) # relative importance of recall compared to precision, #set above one to make recall more importance
+
+        self.register_buffer('epsilon', 1e-7)
+
+
+    def forward(self, input_: Tensor, target: Tensor) -> Tensor:
+
+        #TODO: adapt for 0,1 target and 0,1 input
+
+        tp = (target * input_)
+
+        #tn = ((1 - target) * (1 - input_)) 
+
+        fp = ((1 - target) * input_)
+
+        fn = (target * (1 - input_))
+        
+        
+        precision = tp / (tp + fp + self.epsilon)
+        recall = tp / (tp + fn + self.epsilon)
+        
+        f1 = (self.beta**2 + 1)* (precision*recall) / ( (self.beta**2)*precision + recall + self.epsilon)
+        
+        #applying class weightings
+        f1_loss = torch.where(torch.is_nan(f1_loss), 0.0, f1_loss )
+        f1_loss = f1_loss * self.class_weight
+        f1_loss = f1.clamp(min=self.epsilon, max=1-self.epsilon)
+                        
+        if self.reduction == "mean":
+            f1_loss = 1 - f1_loss.mean()
+
+        elif self.reduction == "sum":
+            f1_loss = 1 - f1_loss.sum()
+
+        return f1_loss
+
+    
 
 
 class Mish(nn.Module):
@@ -346,11 +503,17 @@ class DaNet(nn.Module):
         # Instantiate BERT model
         self.base_model_name = base_model_name       
         self.model_name = model_name
-        dict_transformertokenizer = utils.load_pretrained_transformer(self.base_model_name , transformer=True, tokenizer=True)
+        self.dropout = dropout
+        dict_transformertokenizer = utils.load_pretrained_transformer(self.base_model_name , transformer=True, tokenizer=True,
+                                        attention_probs_dropout_prob=self.dropout,
+                                        hidden_dropout_prob=self.dropout )
+
         self.transformer = dict_transformertokenizer['transformer']
+        
+
         self.tokenizer = dict_transformertokenizer['tokenizer']
         self.freeze_transformer = freeze_transformer
-        self.dropout = dropout
+        
         self.bert_output =bert_output
 
         # Create Entity masker
@@ -403,7 +566,7 @@ class DaNet(nn.Module):
             training hyperameters for this model ")
         
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
-        parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
+        parser.add_argument('--dropout', default=0.1, required=False, help="dropout", type=float)
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
         parser.add_argument('--model_name', default='DaNet', required=False)
         parser.add_argument('--bert_output', default='CLSRepresentation', required=False,
@@ -534,6 +697,11 @@ class TrainingModule(pl.LightningModule):
                     rl_alpha = None,
                     rl_beta = None,
                     rl_shift = None,
+                    sfb_alpha = None,
+                    sfb_beta = None,
+
+
+                    accelerator='ddp',
 
 
                     max_length = 512,
@@ -558,6 +726,8 @@ class TrainingModule(pl.LightningModule):
         self.rl_alpha = rl_alpha
         self.rl_beta = rl_beta
         self.rl_shift = rl_shift
+        self.sfbl_beta = sfbl_beta
+        self.accelerator = accelerator
         
         if model == None:
             self.model = DaNet(**kwargs.get('mparams'))
@@ -590,6 +760,13 @@ class TrainingModule(pl.LightningModule):
                 shift = torch.FloatTensor([self.rl_shift] )
             )
 
+        elif self.loss_type == "SFBL":
+            self.loss = SoftFbetaLoss(
+                class_weight = torch.FloatTensor( self.loss_class_weight),
+                beta = torch.FloatTensor( [self.sfbl_beta ] ),
+                )
+
+
         if self.mode in ['train_new','train_cont','test','hypertune']:
             self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
@@ -608,6 +785,13 @@ class TrainingModule(pl.LightningModule):
                 "test_label":bAccuracy_macro(compute_on_step=False,num_classes = 17)
             })
 
+
+            self.dict_csi_macro = torch.nn.ModuleDict({
+                "train_label":csi_macro(compute_on_step=True, num_classes = 17),
+                "val_label" :csi_macro(compute_on_step=False,num_classes = 17),
+                "test_label":csi_macro(compute_on_step=False,num_classes = 17)
+                })
+
             self.dict_prec = torch.nn.ModuleDict( {
                 k:pl.metrics.classification.Precision( multilabel=True, num_classes=17,
                     threshold=0.5,  average='macro'
@@ -624,6 +808,8 @@ class TrainingModule(pl.LightningModule):
             tparams = argparse.Namespace(**self.return_params())
 
             utils.save_version_params(tparams, mparams, kwargs.get('version_name'), self.subversion ) 
+
+            #self.hparams = argparse.Namespace( **model.return_params() , **self.return_params() )
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
@@ -642,7 +828,9 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont','hypertune'])
         parser.add_argument('--version_name', default='DANet_V000', required=True)
         parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['LROnPlateau','cosine_warmup'])
-        parser.add_argument('--loss_type',default="BCE", required=False, type=str, choices=["BCE","FL","RL"])
+        parser.add_argument('--loss_type',default="BCE", required=False, type=str, choices=["BCE","FL","RL",'SFBL'])
+
+        parser.add_argument('-acc','--accelerator', default='ddp', required=False, type=str )
         
         parser.add_argument('-lcw','--loss_class_weight',default="[]", required=False, type=str)
         parser.add_argument('-lpw','--loss_pos_weight',default="[]", required=False, type=str)
@@ -651,6 +839,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-ra','--rl_alpha', default="[]", required=False, type=str)
         parser.add_argument('-rb','--rl_beta', default=None, required=False, type=float)
         parser.add_argument('-rs','--rl_shift', default=None, required=False, type=float)
+        parser.add_argument('-sfb','--sfbl_beta', default=None, required=False, type=float)
 
         parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
         parser.add_argument('-ml','--max_length', default=512, type=int)
@@ -666,6 +855,8 @@ class TrainingModule(pl.LightningModule):
         tparams.fl_alpha = json.loads(tparams.fl_alpha)
         tparams.rl_alpha = json.loads(tparams.rl_alpha)
 
+        if tparams.accelerator == 'none':
+            tparams.accelerator = None
 
         try:
             tparams.accumulate_grad_batches = int(tparams.accumulate_grad_batches)
@@ -762,6 +953,7 @@ class TrainingModule(pl.LightningModule):
         
             train_loss = outputs['loss']
             train_bacc= self.dict_bacc_macro[step_name+"_label"]( output, target )
+            train_csi = self.dict_csi_macro[step_name+"_label"]( output, target )
             train_prec = self.dict_recall[step_name+"_label"](output, target)
             train_rec = self.dict_prec[step_name+"_label"](output, target)   
             
@@ -769,16 +961,22 @@ class TrainingModule(pl.LightningModule):
                         'train/bacc_macro':train_bacc,
                         'train/prec_macro':train_prec,
                         'train/rec_macro':train_rec,
-                        "train/f1_macro":2*(train_prec*train_rec)/(train_prec+train_rec) }
+                        "train/f1_macro":2*(train_prec*train_rec)/(train_prec+train_rec),
+                        "train/csi_macro": train_csi }
             
             self.logger.log_metrics( scalar_dict, step=self.global_step)
-            
+
+            self.log(f"train/f1_macro", 2*(train_prec*train_rec)/(train_prec+train_rec), logger=False, prog_bar=True, on_step=True,on_epoch=False)
+            self.log("train/csi_macro", train_csi, logger=False, prog_bar=True, on_step=True,on_epoch=False)
+
 
         else:
             self.dict_bacc_macro[step_name+"_label"]( output, target )
+            self.dict_csi_macro[step_name+"_label"]( output, target )
             self.dict_recall[step_name+"_label"](output, target)
             self.dict_prec[step_name+"_label"](output, target)   
             
+
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs,"train")
 
@@ -802,6 +1000,7 @@ class TrainingModule(pl.LightningModule):
 
             #Logging Aggregated Class Performance to logger
             val_bacc = self.dict_bacc_macro[step_name+"_label"].compute()
+            val_csi = self.dict_csi_macro[step_name+"_label"].compute()
             val_rec = self.dict_recall[step_name+"_label"].compute()
             val_prec = self.dict_prec[step_name+"_label"].compute()
 
@@ -810,6 +1009,7 @@ class TrainingModule(pl.LightningModule):
                         'val/prec_macro':val_prec,
                         'val/rec_macro':val_rec,
                         'val/f1_macro': 2*(val_prec*val_rec)/(val_prec+val_rec),
+                        'val/csi_macro':val_csi,
                         'val/loss': loss }  
 
             if self.trainer.running_sanity_check == False:
@@ -818,11 +1018,22 @@ class TrainingModule(pl.LightningModule):
             # Logging aggregated class peformance to prog_bar
             self.log(f"{step_name}/f1_macro",  2*(val_prec*val_rec)/(val_prec+val_rec), logger=False, prog_bar=True)
             self.log(f"{step_name}/bacc_macro",  val_bacc, logger=False, prog_bar=True)
+            self.log(f"{step_name}/csi_macro",  val_bacc, logger=False, prog_bar=True)
             
             # Logging Dis-aggregated Class Performance to logger
             class_preds = torch.cat([x["output"] for x in outputs], axis=0)     # (n,17)
             class_obsrvd = torch.cat([x["target"] for x in outputs], axis=0)   # (n, 17)
             
+            if self.accelerator == "ddp":
+                li_class_preds = [ class_preds.new_empty( class_preds.shape ) for i in range(self.gpus) ]
+                li_class_obsrvd = [ class_obsrvd.new_empty( class_obsrvd.shape ) for i in range(self.gpus) ]
+
+                torch.distributed.all_gather( li_class_preds, class_preds )
+                torch.distributed.all_gather( li_class_obsrvd, class_obsrvd )
+
+                class_preds = torch.cat(li_class_preds, axis=-0)
+                class_obsrvd = torch.cat(li_class_obsrvd, axis=-0)
+
             class_preds = torch.where( class_preds>=0.5, 1.0 , 0.0 )
             class_preds = class_preds.detach().to('cpu').numpy().astype(np.int32)
             class_obsrvd = class_obsrvd.detach().to('cpu').numpy().astype(np.int32)
@@ -965,7 +1176,8 @@ class TrainingModule(pl.LightningModule):
         list_of_params = ['batch_size', 'accumulate_grad_batches', 'learning_rate'
                 'max_epochs', 'context_history_len', 'learning_rate','lr_schedule',
                 'warmup_proportion','loss_class_weight','loss_pos_weight','ordered_label_list',
-                'max_length','sub_version','tag']
+                'max_length','sub_version','tag', 'fl_alpha', 'fl_gamma','rl_alpha',
+                'rl_beta', 'rl_shift','sfbl_beta']
         
         params = { k:v for k,v in self.__dict__.items() if k in list_of_params }
 
@@ -1136,7 +1348,7 @@ def main(tparams, mparams):
     #checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
 
     early_stop_callback = EarlyStopping(
-        monitor= "val/bacc_macro" ,#'val/bacc_macro',
+        monitor= "val/f1_macro" ,#'val/bacc_macro',
         min_delta=0.00,
         patience=5 ,
         verbose=False,
@@ -1165,22 +1377,25 @@ def main(tparams, mparams):
         curr_tparams_dict = vars(tparams)
 
         curr_tparams_dict.update({key: old_tparams_dict[key] for key in 
-            ['accumulate_grad_batches','context_history_len','tag','warmup_proportion','lr_schedule','learning_rate']  })
+            ['tag','warmup_proportion','lr_schedule']  })
+            #['accumulate_grad_batches','context_history_len','tag','warmup_proportion','lr_schedule','learning_rate']  })
             #['accumulate_grad_batches','batch_size','workers','gpus','loss_pos_weight','loss_class_weight']  })
         tparams = argparse.Namespace(** curr_tparams_dict )
 
     danet = DaNet(**vars(mparams))    
    
-    if tparams.gpus not in [0,1]:
+    #if tparams.gpus not in [0,1]:
+    if tparams.accelerator == "ddp":
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
+    
     
     # Defining Training Module and Trainer
     if tparams.mode in ["train_new"]:
         training_module = TrainingModule(**vars(tparams), model=danet )
 
         trainer = pl.Trainer.from_argparse_args(tparams, 
-                         logger=tb_logger,
+                        logger=tb_logger,
                         default_root_dir= tparams.dir_checkpoints,
                         precision=16, callbacks=callbacks,
                         #num_sanity_val_steps = 0,
@@ -1188,7 +1403,8 @@ def main(tparams, mparams):
                         #limit_train_batches = 1.0,
                         #val_check_interval = 0.5
                         #limit_val_batches = 1,
-                        accelerator='ddp',
+                        accelerator=tparams.accelerator,
+                        gradient_clip_val=0.5,
                         #track_grad_norm = True,
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
@@ -1210,7 +1426,8 @@ def main(tparams, mparams):
                     precision=16, callbacks=callbacks ,
                     #num_sanity_val_steps = 0,
                     #val_check_interval = 0.5,
-                    accelerator=accelerator
+                    accelerator=tparams.accelerator,
+                    gradient_clip_val=0.75,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
@@ -1257,8 +1474,8 @@ def main(tparams, mparams):
         
 def main_tune(tparams, mparams, num_samples=int(1)):
 
-    agb_choices = [ 320 ]
-    lr_choices = [ 1e-4 ]
+    # agb_choices = [ 320 ]
+    # lr_choices = [ 1e-4 ]
 
     # #region BCE tuning
     # lcw_choices_round1 = [
@@ -1346,21 +1563,32 @@ def main_tune(tparams, mparams, num_samples=int(1)):
     # rl_alpha_choices = [ round_dp(li,3) for li in rl_alpha_choices ]
     # #rl_alpha_choices  = [ [0.643, 0.747, 0.784, 0.777, 0.779, 0.8, 0.789, 0.798, 0.825, 0.785, 0.792, 0.826, 0.829, 0.829, 0.776, 0.726, 0.827] ]
     
-    rl_beta_choices = np.linspace( 1.0, 4, 4 ).tolist()
-    rl_beta_choices = round_dp(rl_beta_choices,2)   
+    # rl_beta_choices = np.linspace( 1.0, 4, 4 ).tolist()
+    # rl_beta_choices = round_dp(rl_beta_choices,2)   
 
-    rl_shift_choices = np.linspace(0,2,5).tolist()
+    # rl_shift_choices = np.linspace(0,2,5).tolist()
 
-    config = {
-        "rl_beta":tune.grid_search(rl_beta_choices),
-        "rl_shift":tune.grid_search(rl_shift_choices)
+    # config = {
+    #     "rl_beta":tune.grid_search(rl_beta_choices),
+    #     "rl_shift":tune.grid_search(rl_shift_choices)
     
+    # }
+
+    
+    #Hypertuning Fbetaloss
+    sfbl_choices = round_dp( np.linspace(1.0, 3.0, 9).tolist(), 3)
+    config = {
+        
+        "sfbl_beta":tune.grid_search(sfbl_choices),
+        
     }
 
-    name = "tune_danet_rl_6"
+
+
+    name = "tune_danet_sfbl_1"
     scheduler = ASHAScheduler(
-        max_t=4,
-        grace_period=2,
+        max_t=10,
+        grace_period=3,
         reduction_factor=2)
 
     reporter = CLIReporter(
@@ -1369,6 +1597,7 @@ def main_tune(tparams, mparams, num_samples=int(1)):
 
     #removing params to hypertune from tparams and mparams
     li_hypertune_params = list(config.keys())
+    
     for k in li_hypertune_params:
         tparams.pop(k,None)
         mparams.pop(k,None)
@@ -1385,7 +1614,7 @@ def main_tune(tparams, mparams, num_samples=int(1)):
             "cpu": tparams.get('workers'),
             "gpu": 1
         },
-        metric="f1",
+        metric="bacc",
         mode="max",
         verbose=2,
         config=config,
@@ -1414,6 +1643,8 @@ def sample_vector(mu, spread, count=1):
     return li
 
 def tune_danet(config, tparams, mparams):
+
+    os.environ['NCCL_SOCKET_IFNAME'] =  'lo'
     
     if 'bert_output' not in mparams:
         mparams['bert_output'] = config['bert_output']
@@ -1426,7 +1657,8 @@ def tune_danet(config, tparams, mparams):
                 {
                     "loss": "val/loss",
                     "f1": "val/f1_macro",
-                    "bacc":"val/bacc_macro"
+                    "bacc":"val/bacc_macro",
+                    "csi":"val/csi_macro"
                 },
                 on="validation_end")
 
@@ -1443,8 +1675,9 @@ def tune_danet(config, tparams, mparams):
         callbacks=[
             callback_tunerreport
         ],
-        overfit_batches=0.08,
-        checkpoint_callback=False
+        overfit_batches=0.25,
+        checkpoint_callback=False,
+        accelerator=None
         )
     
     trainer.fit(module)
@@ -1496,4 +1729,7 @@ if __name__ == '__main__':
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train.py -bs 64 -agb {1:820,10:680, 15:560, 20: 420} --gpus 1 --max_epochs 48 --mode hypertune --version_name DaNet_v003 --bert_output PooledOutput -sv 1 -lr 1e-3  -ml 100 --loss_type "RL" -lcw "[0.0836, 0.1839, 0.3249, 0.2827, 0.2903, 0.4733, 0.3561, 0.4461, 1.8474, 0.3309, 0.3848, 2.1815, 3.4238, 3.5167, 0.2784, 0.1489, 2.4467]" --cache True --workers 2 --fla "[0.3997, 0.1492, 0.0793, 0.0922, 0.0896, 0.0531, 0.0718, 0.0565, 0.0131, 0.0777, 0.0661, 0.0111, 0.007, 0.0068, 0.0937, 0.1909, 0.0099]"
 
+# soft f1 loss
 
+# Testing a range of beta scores
+# CUDA_VISIBLE_DEVICES=0 python3 train.py -bs 240 -agb 1 --gpus 1 --max_epochs 20 --mode hypertune --version_name DaNet_v003 --bert_output PooledOutput -sv 1 -lr 1e-4  -ml 100 --loss_type "SFBL" -lcw "[0.0836, 0.1839, 0.3249, 0.2827, 0.2903, 0.4733, 0.3561, 0.4461, 1.8474, 0.3309, 0.3848, 2.1815, 3.4238, 3.5167, 0.2784, 0.1489, 2.4467]" --cache True --workers 2
