@@ -335,13 +335,9 @@ class NLG(nn.Module):
         #self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
 
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
-<<<<<<< HEAD
-        self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
-        self.config= self.transformer.config
-=======
-        self.transformer.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
+        self.transformer.transformer.forward = types.MethodType(forward,self.transformer.transformer) #monkey patch
         
->>>>>>> df5d5e646dc8cd41c7cfe3d0ac1bfa4276ec2296
+        self.config= self.transformer.config
 
         # Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -618,8 +614,6 @@ class NLG(nn.Module):
             cur_len = input_ids.shape[-1]
 
         #endregion
-
-
 
         #TODO: batch size is calculated on line 280 uses first index of input_ids or set to 1
         # input_embeds should be two dimensionl
@@ -1211,10 +1205,10 @@ class NLG(nn.Module):
         #Partially does the emebddign for our new inputs to the transformer
 
         # Creating embedded inputs and attention mask
-        # if self.fda and self.frst:
-        #     input_ = self.layer_embedding( input_ )
-        # elif self.fda==False and self.frst:
-        input_ = self.layer_embedding_exda( input_ )
+        if self.fda and self.frst:
+            input_ = self.layer_embedding( input_ )
+        elif self.fda==False and self.frst:
+            input_ = self.layer_embedding_exda( input_ )
         
         return input_
 
@@ -1232,22 +1226,13 @@ class NLG(nn.Module):
         if skip_embed1 == False:
             input_ = self.forward_embedding(input_)
 
-
-        # Feed input to distilgpt2
-<<<<<<< HEAD
         #print(input_.keys())
-        outputs = self.transformer( input_embeds=input_['input_embeds'],
-=======
-        #TODO: outputs will now caontain loss as well
-        #TODO: need to redefine patched forward function
-
-        outputs = self.transformer.transformer( inputs_embeds=input_['input_embeds'],
->>>>>>> df5d5e646dc8cd41c7cfe3d0ac1bfa4276ec2296
+        #outputs = self.transformer( input_embeds=input_['input_embeds'],
+        outputs = self.transformer.transformer.forward( input_embeds=input_['input_embeds'],
                                     attention_mask = input_['attn_mask'],
                                     position_embeds = input_['position_embeds'],
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                                             # Further we handle token_type embedding in forward_embedding layer
-                                    labels = input_['labels']
                                     return_dict=False)
         hidden_states = outputs[0]
 
@@ -1263,7 +1248,6 @@ class NLG(nn.Module):
                 
                 loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        
             return (lm_logits, loss) 
 
         else:
@@ -1283,18 +1267,18 @@ class NLG(nn.Module):
         """
         
         # token embedding
-        da_start_embed = self.transformer.wte( input_['da_start_token'] ).unsqueeze(1)
+        da_start_embed = self.transformer.transformer.wte( input_['da_start_token'] ).unsqueeze(1)
         das_embed = self.embedding_das(input_['tnsr_das']).permute(0,2,1)
 
-        rst_start_embed = self.transformer.wte( input_['rst_start_token'] ).unsqueeze(1)
+        rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ).unsqueeze(1)
         rst_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ).permute(0,2,1) # (bs, channels, seq_len)
 
-        topics_phrase_embed = self.transformer.wte(input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
+        topics_phrase_embed = self.transformer.transformer.wte(input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
         topics_score_embed = self.embedding_topics_score( input_['tnsr_topics_score']).permute(0,2,1)
 
         topics_embed = topics_phrase_embed + topics_score_embed
 
-        utt_embed = self.transformer.wte(input_['tknzd_utt'] ) #TODO: Add positional encoding for each word too
+        utt_embed = self.transformer.transformer.wte(input_['tknzd_utt'] ) #TODO: Add positional encoding for each word too
 
         input_embeds = torch.cat(
             [da_start_embed, das_embed,
@@ -1324,19 +1308,19 @@ class NLG(nn.Module):
                     since gpt-2 code indicates that 
         """
         #testing
-        position_embeds = self.transformer.wpe(input_['position_ids'])
+        position_embeds = self.transformer.transformer.wpe(input_['position_ids'])
         input_['position_embeds'] = position_embeds
 
         # token embedding
-        rst_start_embed = self.transformer.wte( input_['rst_start_token'] ).unsqueeze(1)
+        rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ) #.unsqueeze(1)
         rst_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ).permute(0,2,1) # (bs, channels, seq_len)
 
-        topics_phrase_embed = self.transformer.wte( input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
+        topics_phrase_embed = self.transformer.transformer.wte( input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
         topics_score_embed = self.embedding_topics_score( input_['tnsr_topics_score']).permute(0,2,1)
 
         topics_embed = topics_phrase_embed + topics_score_embed
         
-        utt_embed = self.transformer.wte( input_['tknzd_utt'] )
+        utt_embed = self.transformer.transformer.wte( input_['tknzd_utt'] )
 
 
         input_embeds = torch.cat(
@@ -1686,7 +1670,7 @@ class NLG_tokenizer():
         #Creating labels/targets for GPT Language Model Head
         try:
             labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
-            labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
+            labels[0][rt_dim:utt_dim-utt_pad_count] =  tknzd_utt[ : utt_dim-utt_pad_count-rt_dim ]
         except Exception:
             labels = None
         
@@ -1825,8 +1809,10 @@ class NLG_tokenizer():
         #TODO: When you move to training on large seequences performing variable batch sizes to reduce time
         if generate_mode == False:
             utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
+            add_prefix_space=False
         else:
             utterance ='<|endoftext|>' + utterance
+            add_prefix_space = True
             #utterance = utterance
 
         if pad == True:
@@ -1840,7 +1826,7 @@ class NLG_tokenizer():
                                         return_tensors='pt',
                                         return_length=True,
                                         return_token_type_ids=None,
-                                        add_prefix_space=True
+                                        add_prefix_space = add_prefix_space
                                         )
             
             #tokenizer length usually returns the padded length as opposed the original length.
@@ -1850,7 +1836,8 @@ class NLG_tokenizer():
             tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(self.e2m_tokenizer.eos_token_id) ],axis=-1 )[0]
                                            
         
-        elif pad == False:
+        elif pad == False
+                        
             encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
                                         padding='do_not_pad',
@@ -1858,7 +1845,8 @@ class NLG_tokenizer():
                                         max_length= self.context_len['utt'],
                                         return_tensors='pt',
                                         return_length=True,
-                                        return_token_type_ids=None)
+                                        return_token_type_ids=None,
+                                        add_prefix_space=add_prefix_space)
             tknzd_utt_no_pad_len = encoded['length'][0]
             pad_count = 0
 
