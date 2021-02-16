@@ -40,7 +40,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
         output['tokenizer'] = AutoTokenizer.from_pretrained(_dir_transformer)
 
     if transformer == True:
-        output['transformer'] = AutoModel.from_pretrained(_dir_transformer)
+        output['transformer'] = GPT2LMHeadModel.from_pretrained(_dir_transformer)
     
     return output
 

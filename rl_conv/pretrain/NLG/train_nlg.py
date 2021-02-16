@@ -331,9 +331,17 @@ class NLG(nn.Module):
                                 fda=fda, frst=frst, ftopic=ftopic, max_input_len=max_input_len,
                                  **kwargs)
         
+        #self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
+        #self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
+
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
+<<<<<<< HEAD
         self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
         self.config= self.transformer.config
+=======
+        self.transformer.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
+        
+>>>>>>> df5d5e646dc8cd41c7cfe3d0ac1bfa4276ec2296
 
         # Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -347,20 +355,23 @@ class NLG(nn.Module):
         
         elif self.fda == False and self.frst:
             self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
+            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.0001)
+
             self.token_type_embeddings = torch.nn.Embedding( 3 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
                                                 #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                                 #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
             
             self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
-            
-            self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
-            self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
+            self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.001)
+
+            # self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
+            # self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
         
         self.loss_type = loss_type 
         self.loss_fct = CrossEntropyLoss()
 
     def get_output_embeddings(self):
-        return self.lm_head
+        return self.transformer.lm_head
 
     @torch.no_grad()
     def generate(self, 
@@ -1223,15 +1234,24 @@ class NLG(nn.Module):
 
 
         # Feed input to distilgpt2
+<<<<<<< HEAD
         #print(input_.keys())
         outputs = self.transformer( input_embeds=input_['input_embeds'],
+=======
+        #TODO: outputs will now caontain loss as well
+        #TODO: need to redefine patched forward function
+
+        outputs = self.transformer.transformer( inputs_embeds=input_['input_embeds'],
+>>>>>>> df5d5e646dc8cd41c7cfe3d0ac1bfa4276ec2296
                                     attention_mask = input_['attn_mask'],
                                     position_embeds = input_['position_embeds'],
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                                             # Further we handle token_type embedding in forward_embedding layer
+                                    labels = input_['labels']
                                     return_dict=False)
         hidden_states = outputs[0]
-        lm_logits = self.lm_head( hidden_states )
+
+        lm_logits = self.transformer.lm_head( hidden_states )
 
         if 'labels' in input_:
             
@@ -1243,9 +1263,6 @@ class NLG(nn.Module):
                 
                 loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-            elif self.loss_type == "UtteranceSimilarity":
-                loss = None
-                raise NotImplementedError
         
             return (lm_logits, loss) 
 
@@ -1855,7 +1872,7 @@ class TrainingModule(pl.LightningModule):
     def __init__(self, model_params, batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
-                    max_epochs=100,
+                    max_epochs=25,
                     gpus=1, 
                     learning_rate=1e-3,
                     warmup_proportion=0.1,
@@ -1901,7 +1918,7 @@ class TrainingModule(pl.LightningModule):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('-me','--max_epochs', default=80, type=int)
+        parser.add_argument('-me','--max_epochs', default=32, type=int)
         parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=5, type=int)
         parser.add_argument('-lr','--learning_rate', default=5e-4, type=float)
@@ -1994,14 +2011,16 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=20,
+            patience=3,
             verbose=False,
             mode='min'
         )
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
 
-
+        if tparams['gpus'] in [1]:
+            accelerator='none'
+        
         if tparams['mode'] in ["train_new"]:
             
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
@@ -2011,9 +2030,9 @@ class TrainingModule(pl.LightningModule):
                         log_every_n_steps=1,
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
-                        accelerator='ddp',
-                        #limit_train_batches = 0.4,
-                        val_check_interval=0.5,
+                        accelerator=accelerator,
+                        limit_train_batches = 2,
+                        #val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -2032,7 +2051,7 @@ class TrainingModule(pl.LightningModule):
                     log_every_n_steps=1,   
                     precision=tparams['precision'],callbacks=callbacks,
                     #accelerator='ddp2',  amp_level='O2', # use_amp=True,
-                    accelerator='ddp',
+                    accelerator=accelerator,
                     #limit_train_batches = 0.4,
                     val_check_interval=0.5,
                     #limit_val_batches = ,
@@ -2070,6 +2089,7 @@ class TrainingModule(pl.LightningModule):
             torch.cuda.empty_cache()
 
         elif tparams['mode'] in ["test"]:
+            
             #restoring checkpoint             
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])
 
@@ -2079,7 +2099,7 @@ class TrainingModule(pl.LightningModule):
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                     check_val_every_n_epoch=1,
                     checkpoint_callback=False,
-                    logger=False,
+                    logger=tb_logger,
                     log_every_n_steps=1,   
                     precision=tparams['precision'],
                     )
@@ -2088,7 +2108,7 @@ class TrainingModule(pl.LightningModule):
             trainer.on_load_checkpoint(checkpoint)
            
 
-        return trainer , training_module
+        return trainer,training_module
     
     @staticmethod
     def get_ckpt_file(_dir_checkpoint,mode='best'):
@@ -2134,12 +2154,12 @@ class TrainingModule(pl.LightningModule):
                 existing_results = {}
             else:
                 with open( fn, 'r' ) as outfile:
-                    existing_results = json.load( outfile)
+                    existing_results = json.load( outfile )
 
-            existing_results[ mparams['model_name'] ] = dict_results[0]['test_loss']
+            existing_results[ f"{mparams['model_name']}_{tparams['version']}" ] = dict_results[0]['test_loss']
             
             with open( fn, 'w' ) as outfile:
-                json.dump(existing_results, outfile)
+                json.dump( existing_results, outfile)
             
                     
         elif tparams['mode'] in ['infernece']: 
@@ -2250,7 +2270,7 @@ class TrainingModule(pl.LightningModule):
             warmup_steps = int( self.warmup_proportion*self.total_steps() )
 
             lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
-                            warmup_steps, self.total_steps(), 3 )
+                            warmup_steps, self.total_steps(), 0.5 )
 
             return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step", "monitor":"val_loss"}]
         
@@ -2552,3 +2572,11 @@ if __name__ == '__main__':
 # dullduks server version 42 - Extends 41 with larger lookback range
 # python3 train_nlg.py -bs 20 -agb 2 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode train_cont -lr 1e-4 -me 30 -mil 512
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
+
+# dullduks server version 43 - Extends 42 with smaller lookback range
+# python3 train_nlg.py -bs 100 -agb 2 --gpus 1 -fda 0 --workers 8 --version 43 -opt AdamW --precision 16 --mode train_new -lr 1-4 -me 64 -mil 200
+# python3 train_nlg.py -bs 40 -agb 1 --gpus 1 -fda 0 --workers 16 --version 43 -opt AdamW --precision 16 --mode test
+
+# dullduks server version 99 - Just trained for one epoch
+# python3 train_nlg.py -bs 250 -agb 1 --gpus 1 -fda 0 --workers 8 --version 99 -opt AdamW --precision 16 --mode train_new -lr 1e-3 -me 2 -mil 160
+# # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 44 -opt AdamW --precision 16 --mode test

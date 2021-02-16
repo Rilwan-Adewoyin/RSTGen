@@ -1,6 +1,6 @@
 import os
 import json
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 dirname = os.path.dirname(__file__)
 from datetime import date
@@ -23,7 +23,7 @@ def get_path(_path,_dir=False):
     return _path
 
 
-def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, tokenizer=False):
+def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, tokenizer=False, **kwargs):
     #If model name contains a forward slash then only take second half
     if "/" in model_name:
         _dir_transformer = os.path.join( get_path("./models"), model_name.split("/")[-1] )
@@ -53,7 +53,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
         if model_name == "tuner007/pegasus_paraphrase":
             output['transformer'] = PegasusForConditionalGeneration.from_pretrained(_dir_transformer)
         else:
-            output['transformer'] = AutoModel.from_pretrained(_dir_transformer)
+            output['transformer'] = AutoModel.from_pretrained(_dir_transformer, **kwargs)
     
     return output
 
@@ -92,7 +92,7 @@ def get_best_ckpt_path(dir_path, epoch_step=None):
 
     li_files = glob.glob(os.path.join(dir_path,"*.ckpt"))
     
-    li_ckpts = [ re.findall( r"val_bAcc=[\S]{5}" ,fname)[-1][-3:] for fname in li_files ]
+    li_ckpts = [ re.findall( r"epoch=[\S]{3}" ,fname)[-1][-3:] for fname in li_files ]
 
     index = li_ckpts.index( max(li_ckpts, key=float) )
 

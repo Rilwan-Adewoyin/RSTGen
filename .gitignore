@@ -4,7 +4,7 @@
 */[Dd]ataset/*
 
 #DialogueAct
-rl_conv/pretrain/DialogueAct/combined_data
+rl_conv/pretrain/DialogueAct/combined_data*
 rl_conv/pretrain/DialogueAct/MRDA-Corpus
 rl_conv/pretrain/DialogueAct/Switchboard-Corpus
 rl_conv/pretrain/DialogueAct/MIDAS-Corpus
@@ -16,6 +16,7 @@ rl_conv/pretrain/DialogueAct/cache/*
 
 #NLG
 rl_conv/pretrain/NLG/dataset/*
+rl_conv/pretrain/NLG/Evaluation/*
 rl_conv/pretrain/NLG/dataset_opensubs
 rl_conv/pretrain/NLG/models
 rl_conv/pretrain/NLG/models/*
