@@ -1,4 +1,3 @@
-
 # import matplotlib
 # matplotlib.use('Agg')
 
@@ -79,10 +78,25 @@ from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
 from ray.tune.integration.pytorch_lightning import TuneReportCallback, \
     TuneReportCheckpointCallback
 
-#import en_core_web_sm
-#from spacy.language import Language
 
 from pathlib import Path
+
+#SGNN imports
+import functools
+import random as rand
+import re
+
+from nearpy.hashes import RandomBinaryProjections
+from nltk.util import skipgrams
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from sklearn.base import BaseEstimator
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline, FeatureUnion
+
+from sklearn.preprocessing import LabelEncoder
 
 #Monkey Patch for logging class
 def monkey_log_dir(self):
@@ -210,11 +224,9 @@ class Mish(nn.Module):
     def forward(self, input_):
         return input_ * torch.tanh(F.softplus(input_))
 
-
 class DaNet(nn.Module):
     """Transformer Based Model for DA classfication Task
     """
-
     def __init__(self, freeze_transformer=False, dropout=0.1, 
         base_model_name='bert-base-cased', model_name="DaNet", 
         bert_output =  "PooledOutput", 
@@ -224,7 +236,6 @@ class DaNet(nn.Module):
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
         #D_in, H, D_out = 768, 50, 12 #transformer frozer
         
-
         # Instantiate BERT model
         self.base_model_name = base_model_name       
         self.model_name = model_name
@@ -233,7 +244,7 @@ class DaNet(nn.Module):
         self.tokenizer = dict_transformertokenizer['tokenizer']
         self.freeze_transformer = freeze_transformer
         self.dropout = dropout
-        self.bert_output =bert_output
+        self.bert_output = bert_output
 
         # Create Entity masker
         self.nem = NamedEntityMasker()
@@ -276,7 +287,6 @@ class DaNet(nn.Module):
                     if layer.bias is not None:
                         layer.bias.data.zero_()
 
-
     @staticmethod
     def parse_model_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
@@ -287,7 +297,7 @@ class DaNet(nn.Module):
         parser.add_argument('--base_model_name', default='bert-base-cased', required=False)
         parser.add_argument('--dropout', default=0.1, required=False, help="dropout")
         parser.add_argument('--freeze_transformer', default=False, required=False, type=bool)
-        parser.add_argument('--model_name', default='DaNet', required=False)
+        parser.add_argument('--model_name', default='SGNN', required=False)
         parser.add_argument('--bert_output', default='CLSRepresentation', required=False,
                 choices=['PooledOutput','CLSRepresentation'] )
         
@@ -369,6 +379,210 @@ class DaNet(nn.Module):
         params = {k:self.__dict__[k] for k in param_names}
         return params
 
+#region SGNN
+class Transformer_RBP(BaseEstimator, RandomBinaryProjections):
+    """
+        Class that modifies RandomBinaryProjections to use as an sklearn transformer
+    """
+    rand_seed = None  # Declare it as class variable
+    def __init__(self, hash_name='hasher', projection_count=1, rand_seed=None):
+        RandomBinaryProjections.__init__(self, hash_name, projection_count, rand_seed=rand_seed)
+
+    def fit(self, X, y):
+        self.rand = np.random.RandomState(self.rand_seed)  # rand seed after param setting
+        self.reset(X.shape[1])
+
+    def transform(self, X):
+        return self.hash_vector(X)
+
+    def fit_transform(self, X, y):
+        self.fit(X, y)
+        return self.transform(X)
+
+    def hash_vector(self, v, querying=False):
+        """
+        Hashes the vector and returns the binary bucket key as string.
+        """
+        if sp.issparse(v):
+            # If vector is sparse, make sure we have the CSR representation
+            # of the projection matrix
+            if self.normals_csr is None:
+                self.normals_csr = sp.csr_matrix(self.normals)
+            # Make sure that we are using CSR format for multiplication
+            if not sp.isspmatrix_csr(v):
+                v = sp.csr_matrix(v)
+            # Project vector onto all hyperplane normals
+            # projection = self.normals_csr.dot(v)
+            projection = v.dot(sp.csr_matrix.transpose(self.normals_csr))
+        else:
+            # Project vector onto all hyperplane normals
+            projection = np.dot(v, np.matrix.transpose(self.normals))
+        # Return binary key
+        return projection > 0
+
+class SGNN_tokenizer():
+    
+    def __init__(self, T=80, d=14):
+
+        #build input layer
+        self.pipeline = self.build_pipeline( T, d)
+        
+    def build_pipeline(self, T, d ):
+        """
+        Transformer to build the input layer, in SGNN style.
+        Uses nltk skipgrams, and several Transformer_RBP layers as elements of the SGNN pipeline.
+        """
+        # T=80 projections for each of dimension d=14: 80 * 14 = 1120-dimensionnal word projections
+
+        # Wrap skipgrams to use with CountVectorizer
+        skipper = functools.partial(skipgrams, n=3, k=2) # 2-skip-3-grams
+        # CountVectorizer params
+        char_term_frequency_params = {
+            'char_term_frequency__analyzer': skipper,
+            'char_term_frequency__min_df': 3,
+            'char_term_frequency__max_df': 0.9,
+            'char_term_frequency__max_features': int(1e7),
+        }
+
+        # Transformer_RBP params
+        rand_seeds = [rand.randint(0, T*100) for i in range(T)] # Need a different repeatable seed for each hasher
+        hashing_feature_union_params = {
+            **{'union__random_binary_projection_hasher_{}__projection_count'.format(t): d
+            for t in range(T)
+            },
+            **{'union__random_binary_projection_hasher_{}__hash_name'.format(t): 'hasher' + str(t)
+            for t in range(T)
+            },
+            **{'union__random_binary_projection_hasher_{}__rand_seed'.format(t): rand_seeds[t]  # only AFTER hashing.
+            for t in range(T)
+            }
+        }
+
+        # Pipeline to create input layer
+        preprocessor = Pipeline([
+            ("char_term_frequency", CountVectorizer()),
+            
+            ('union', FeatureUnion([
+                ('random_binary_projection_hasher_{}'.format(t), Transformer_RBP())
+                for t in range(T)
+            ]))
+            ],
+        )
+
+        params = dict()
+        params.update(char_term_frequency_params)
+        params.update(hashing_feature_union_params)
+        preprocessor.set_params(**params)
+
+        return preprocessor
+
+    def fit(self, train_utterances):
+        """[summary]
+            Args:
+                data (Pandas dataframe): A Pandas series containing a sequenceof utterances.
+        """
+        self.pipeline.fit( train_utterances ) #Fit on the text only
+        
+
+    # Patching Pipeline class so it can be used in a similar manner to the Huggingface tokenizers
+    def __call__(self, *args_str, **kwargs ):
+        """ 
+            A list of current string and previous string
+        """
+        #TODO: consider adding method to judge which speaker is speaking
+        
+        encoded_input = {}
+        encoded_text = self.pipeline.transform( args_str )
+        encoded_input['input_hashed'] = Torch.FloatTensor(encoded_text)
+
+        return encoded_input
+
+class SGNN(nn.Module):
+
+    def __init__(self, 
+        T=80,
+        d=14,
+        dropout=0.25,
+        output_type = "unilabel",
+        model_name="SGNN",
+        **kwargs):
+        super(SGNN, self).__init__()
+
+        self.output_type = output_type
+        self.dropout = dropout 
+        self.tokenizer = SGNN_tokenizer(T, d)
+        self.nem = NamedEntityMasker()
+        self.model_name = model_name
+
+        self.neural_network = nn.Sequential(
+                nn.Linear( 1120 , 256),
+                Mish(), #Test using MISH
+                nn.Dropout(self.dropout),
+
+                nn.Linear( 256 , 256 ),
+                Mish(),
+                nn.Dropout(self.dropout),
+
+                nn.Linear( 256, 17 ) )
+        
+        # self.neural_network2 = nn.Sequential(
+        #         nn.LSTM( batch_true=False,
+        #                     input_size=1120
+        #                     hidden_size =256,
+        #                     bidirectional=True, dropout=self.dropout),
+        #         nn.Linear( 256, 17 ) )
+            
+        # )
+
+        if self.output_type == "multilabel":
+            #self.neural_network.add_module( 'output_activation') # = nn.Sigmoid()
+            pass
+
+        elif self.output_type == "unilabel":
+            self.neural_network.add_module( 'output_activation', nn.Softmax(dim=-1) )
+            
+    def forward(self, input_):
+        input_['loss_mask'] = input_['loss_mask']>0 #creating boolean tensor
+
+        input_['input_hashed'] = input_['input_hashed'][input_['loss_mask'] ]
+
+        output = self.neural_network( input_['input_hashed'] )
+
+        return output
+
+    @staticmethod
+    def parse_model_specific_args(parent_parser):
+        parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
+        
+        parser.add_argument('--config_file_m', default=None, help="Path to the \
+            training hyperameters for this model ")
+        
+        parser.add_argument('--dropout', default=0.25, required=False, help="dropout")
+        parser.add_argument('--model_name', default='SGNN', required=False)
+        parser.add_argument('--T', default=80, required=True, type=int)
+        parser.add_argument('--d', default=14, required=True, type=int)
+        parser.add_argument('--tokenizer_path', default='./models/SGNN_tokenizer.pkl', required=False)
+
+        
+        mparams = parser.parse_known_args( )[0]
+
+        if mparams.config_file_m != None:
+            mparams = json.load(open(utils.get_path(mparams.config_file_m)),"r" )
+        
+        return mparams
+
+    def return_params(self):
+        #Important params for training
+        list_of_params = ['batch_size', 'accumulate_grad_batches', 'learning_rate'
+                'max_epochs', 'context_history_len', 
+                'warmup_proportion','loss_class_weight','loss_pos_weight','ordered_label_list',
+                'sub_version','tag']
+        
+        params = { k:v for k,v in self.__dict__.items() if k in list_of_params }
+
+        return params
+#endregion
+
 class NamedEntityMasker():
 
     def __init__(self,
@@ -394,14 +608,6 @@ class NamedEntityMasker():
         text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in doc])
         return text
 
-# @Language.component('Entity_mask')
-# def mask_pipe(doc):
-#     text = ''.join([token.text_with_ws if not token.ent_type else token.pos_+token.whitespace_ for token in doc])
-
-#     return text
-
-
-
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, batch_size=30, 
@@ -418,6 +624,7 @@ class TrainingModule(pl.LightningModule):
                     loss_class_weight = [0.08357422207100744, 0.18385707428187334, 0.32489418776359946, 0.28270948437883026, 0.29028076340137576, 0.4732623391826486, 0.35614498126635913, 0.4461250027511672, 1.8474137400874857, 0.3309135146499394, 0.38481047800771817, 2.1815475734200995, 3.423830830287625, 3.5166546883532006, 0.2784219377456878, 0.14890703368264488, 2.446652148668739],
                     loss_pos_weight = [17]*17,
                     max_length = 512,
+                    mask_utterance=True,
                     tag='',
                     model=None,
                     subversion=0,
@@ -430,14 +637,12 @@ class TrainingModule(pl.LightningModule):
         self.gpus =  gpus
         self.context_history_len = context_history_len
         self.max_length = max_length
+        self.mask_utterance = mask_utterance
         
         self.loss_class_weight =  loss_class_weight
         self.loss_pos_weight = loss_pos_weight
         
-        if model == None:
-            self.model = DaNet(**kwargs.get('mparams'))
-        else:
-            self.model = model
+           
         self.mode = mode
         self.workers = workers
 
@@ -449,12 +654,27 @@ class TrainingModule(pl.LightningModule):
         self.loss = nn.BCEWithLogitsLoss( weight=torch.FloatTensor( self.loss_class_weight ), 
                      pos_weight= torch.FloatTensor(self.loss_pos_weight))
 
+        # Creating Model
+        if model == None:
+            mparams = kwargs.get('mparams')
+            mn = mparams.get('model_name')
+            
+            if mn == "DaNet":
+                self.model = DaNet(**mparams)
+            
+            elif mn == "SGNN":
+                self.model = SGNN(**mparams)
+                
+        else:
+            self.model = model
+
+
         if self.mode in ['train_new','train_cont','test','hypertune']:
             self.dir_data = utils.get_path(dir_data)
             self.max_epochs = max_epochs
             self.warmup_proportion = warmup_proportion
-            self.lr_schedule = lr_schedule
             self.create_data_loaders(**kwargs)
+
             self.learning_rate = learning_rate
             self.accumulate_grad_batches = accumulate_grad_batches
 
@@ -477,9 +697,26 @@ class TrainingModule(pl.LightningModule):
                     threshold=0.5, average='macro'
                     ) for k in self.step_names } )
 
+        if self.mode in ['train_new',"hypertune"] and self.model.model_name == "SGNN" :
+            self.model.tokenizer.fit( self.dg.whole_dataset("train").da )
+                        
+            fp = kwargs.get('mparams').get('tokenizer_path', './models/SGNN_tokenizer.pkl')
+            #region: remove after debgug
+            if os.path.isfile(fp):
+                with open(fp,"rb") as f:
+                    self.model.tokenizer = pickle.load(f)
+            else:
+                with open(fp, "wb" ) as f:
+                    pickle.dump( self.model.tokenizer, f )
+        
+        elif self.mode in ["train_cont","test","inference"] and kwargs.get('model_name') == "SGNN":
+            fp = kwargs.get('mparams').get('tokenizer_path')
+            with open(fp,"rb") as f:
+                self.model.tokenizer = pickle.load(f)
+        
         # Saving training params and model params
         if self.mode in ['train_new']:
-            mparams = argparse.Namespace(**model.return_params())
+            mparams = argparse.Namespace(**self.model.return_params())
             tparams = argparse.Namespace(**self.return_params())
 
             utils.save_version_params(tparams, mparams, kwargs.get('version_name'), self.subversion ) 
@@ -499,16 +736,16 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--workers', default=8, type=int)
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','test','train_cont','hypertune'])
-        parser.add_argument('--version_name', default='DANet_V000', required=True)
-        parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['LROnPlateau','cosine_warmup'])
-        parser.add_argument('--loss_type',default="BCE", required=False, type=str)
+        parser.add_argument('--version_name', default='DaNet_v2', required=True)
         parser.add_argument('-lcw','--loss_class_weight',default="[]", required=False, type=str)
         parser.add_argument('-lpw','--loss_pos_weight',default="[]", required=False, type=str)
         parser.add_argument('--default_root_dir', default=utils.get_path("./models/") )
-        parser.add_argument('-ml','--max_length', default=512, type=int)
+        parser.add_argument('-ml','--max_length', default=None, type=int)
         parser.add_argument('-sv','--subversion', default=None,required=False, type=int, help="The Experimental sub Versioning for this run" )
         parser.add_argument('--tag', default='', type=str)
+        parser.add_argument('--mask_utterance',default=True, type=bool)
         parser.add_argument('--cache', default=False, type=bool)
+        parser.add_argument('--model_name',required=True)
         tparams = parser.parse_known_args()[0]
 
         tparams.loss_class_weight = json.loads( tparams.loss_class_weight )
@@ -725,12 +962,15 @@ class TrainingModule(pl.LightningModule):
         dir_val_set = os.path.join(self.dir_data,"val")
         dir_test_set = os.path.join(self.dir_data,"test") 
         
-        dg = DataLoaderGenerator(dir_train_set, dir_val_set,
+        self.dg = DataLoaderGenerator(dir_train_set, dir_val_set,
             dir_test_set, self.batch_size, self.model.tokenizer, self.model.nem,
-            workers=self.workers, mode=self.mode, max_length=self.max_length, cache=kwargs.get('cache',False)
+            workers=self.workers, mode=self.mode, max_length=self.max_length,
+            cache=kwargs.get('cache',False), 
+            context_history_len = self.context_history_len,
+            mask_utterance = self.mask_utterance
             )
         
-        self.train_dl, self.val_dl, self.test_dl = dg()
+        self.train_dl, self.val_dl, self.test_dl = self.dg()
     
     def train_dataloader(self):
         return self.train_dl
@@ -779,18 +1019,13 @@ class TrainingModule(pl.LightningModule):
         total_steps = self.total_steps()
         warmup_steps = int( total_steps * self.warmup_proportion )
 
-        if self.lr_schedule == "cosine_warmup" :
-            lr_scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps,
-                num_cycles = 0.5
-                )
-            interval = "step"
-        
-        elif self.lr_schedule == "LROnPlateau":
-            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3,)
-            interval = "epoch"
+        lr_scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles = 0.5
+            )
+        interval = "step"
 
         return [optimizer], [{"scheduler": lr_scheduler, "interval": interval, "monitor":"val/loss"}]
 
@@ -803,22 +1038,24 @@ class TrainingModule(pl.LightningModule):
     def return_params(self):
         #Important params for training
         list_of_params = ['batch_size', 'accumulate_grad_batches', 'learning_rate'
-                'max_epochs', 'context_history_len', 'learning_rate','lr_schedule',
+                'max_epochs', 'context_history_len', 'mask_utterance',
                 'warmup_proportion','loss_class_weight','loss_pos_weight','ordered_label_list',
                 'max_length','sub_version','tag']
         
         params = { k:v for k,v in self.__dict__.items() if k in list_of_params }
 
         return params
+
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
     """
     def __init__(self, dir_train_set, dir_val_set,
                     dir_test_set, batch_size,
-                    tokenizer, nem,
+                    tokenizer, nem=None,
                     context_history_len=1,
                     workers=6, mode='train_new',
                     max_length = 512, cache=False,
+                    mask_utterance = True,
                     **kwargs):
 
         self.dir_train_set = dir_train_set
@@ -831,12 +1068,12 @@ class DataLoaderGenerator():
         self.target_binarizer = sklp.MultiLabelBinarizer()
         self.target_binarizer.fit( [label_mapping['MCONV']['labels_list'] ] )
 
-            #Add a utility code that downloads pretrained bert tokenizer if it is not already in the relatively directory above
         self.bs = batch_size
         self.context_history_len = context_history_len
         self.workers  = workers
         self.mode = mode
         self.max_length = max_length
+        self.mask_utterance = mask_utterance
         self.cache = cache
 
     def prepare_datasets(self):
@@ -863,22 +1100,18 @@ class DataLoaderGenerator():
 
         if self.mode == "hypertune":
             li_dsets = [ SingleDataset(_f, self.tokenizer, self.nem, self.target_binarizer, 
-                self.context_history_len, self.max_length) for _f in files ]
+                self.context_history_len, self.max_length,self.mask_utterance) for _f in files ]
         
         elif self.mode in ['train_new','train_cont',"test"]:
             with Pool(self.workers) as pool:
                 res = pool.starmap( SingleDataset, [ (_f, self.tokenizer, self.nem, 
                         self.target_binarizer, self.context_history_len, 
-                        self.max_length) for _f in files ] )
+                        self.max_length, self.mask_utterance) for _f in files ] )
 
             li_dsets = res
 
-        #concat_dset = torch.utils.data.ConcatDataset(li_dsets)
-
         if self.cache == True:
-
             concat_dset = td.datasets.ChainDataset(li_dsets).cache(td.cachers.Pickle(Path(f"./cachedata/{dir_dset.split('/')[-2]}_{dir_dset.split('/')[-1] }")))
-            #concat_dset = WrapDataset(concat_dset).cache(Pickle(f"./cachedata/{name}_{dir_dset}"))
         else:
             concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
@@ -889,21 +1122,58 @@ class DataLoaderGenerator():
         return dataloader
 
     def __call__(self):
-        
         train_dl, val_dl, test_dl = self.prepare_datasets()
         return train_dl, val_dl, test_dl
+
+    def whole_dataset(self, dset_name="train" ):
+        """This functions returns the whole dataset as a pandas DataFrame
+            It also removes lines that do not include dialogue label acts
+
+        Args:
+            dset_name (str, optional): [description]. Defaults to "train".
+        """
+        if dset_name == 'train':
+            path = self.dir_train_set
+        
+        elif dset_name == "val":
+            path = self.dir_val_set
+        
+        elif dset_name == "test":
+            path = self.dir_test_set
+
+        all_files = glob.glob(path + "/*.txt")
+
+        li = []
+
+        for filename in all_files:
+            try:
+                df = pd.read_csv(filename, index_col=None, header=0, sep='|')
+                li.append(df)
+            except pd.errors.ParserError:
+                pass
+
+        df = pd.concat(li, axis=0, ignore_index=True)
+        
+        # removing empty lines and non string utterances
+        df = df[ ~(df.da == ' ')]
+        df = df[ [isinstance(x,str) for x in df.da] ]
+
+        return df
 
 class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
     """
-    def __init__(self, file_path, tokenizer, named_entity_masker ,target_binarizer, context_history_len, max_length=512  ):
+    def __init__(self, file_path, tokenizer, named_entity_masker,
+            target_binarizer, context_history_len, max_length=512,
+            mask_utterance=True  ):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.nem = named_entity_masker
         self.target_binarizer = target_binarizer
         self.context_history_len = context_history_len
         self.max_length = max_length
+        self.mask_utterance = mask_utterance
 
     #def parse_file(self, file_path):
         with open(self.fp, 'r') as f:
@@ -911,21 +1181,22 @@ class SingleDataset(torch.utils.data.Dataset):
             self.lines = len(self.data)
             self.data = self.data.T.values.tolist()
             _, self.li_utterances, self.li_das = self.data
-            #self.li_utterances = list(self.nem(self.li_utterances))
                 
     def __len__(self):
         return self.lines - self.context_history_len
     
     def __getitem__(self, index):
 
-        
         utterances = self.li_utterances[ index:index+1+self.context_history_len ]
         utterances = [ utt if ( type(utt) == str ) else " " for utt in utterances ]
 
         das = self.li_das[ index+self.context_history_len ]
-
-        masked_utterances = list(self.nem(utterances))
-        encoded_input = self.encode_tokenize( masked_utterances )
+        
+        if self.mask_utterance == True:
+            masked_utterances = list(self.nem(utterances))
+            encoded_input = self.encode_tokenize( masked_utterances )
+        else:
+            encoded_input = self.encode_tokenize( utterances )
         
         try:
             with warnings.catch_warnings():
@@ -947,8 +1218,7 @@ class SingleDataset(torch.utils.data.Dataset):
         return map_datum
 
     def encode_tokenize(self, li_str):
-        #_str_tknized = self.tokenizer.tokenize(_str)
-        
+                
         encoded_input = self.tokenizer(*li_str, add_special_tokens=True, padding='max_length', 
             truncation=True, max_length=self.max_length, return_tensors='pt', return_token_type_ids=True )
                 
@@ -999,13 +1269,12 @@ def main(tparams, mparams):
     if tparams.mode == "train_cont":
         # Restoring old tparams and combining with some params in new tparams
         old_tparams_dict = json.load( open( os.path.join(dir_model_version,"tparam.json"),"r" ) )
-        curr_tparams_dict = va
-        
-        rs(tparams)
+        curr_tparams_dict = vars(tparams)
+
         old_tparams_dict.update({key: curr_tparams_dict[key] for key in ['accumulate_grad_batches','batch_size','workers','gpus','mode','loss_pos_weight','loss_class_weight']  })
         tparams = argparse.Namespace(** old_tparams_dict )
 
-    danet = DaNet(**vars(mparams))    
+    #danet = DaNet(**vars(mparams))    
    
     if tparams.gpus not in [0,1]:
         os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
@@ -1013,17 +1282,17 @@ def main(tparams, mparams):
     
     # Defining Training Module and Trainer
     if tparams.mode in ["train_new"]:
-        training_module = TrainingModule(**vars(tparams), model=danet )
+        training_module = TrainingModule(mparams= vars(mparams), **vars(tparams) )
 
         trainer = pl.Trainer.from_argparse_args(tparams, 
                         check_val_every_n_epoch=1, logger=tb_logger,
                         default_root_dir= tparams.dir_checkpoints,
                         precision=16, callbacks=callbacks,
-                        overfit_batches = 0.1,
-                        #limit_train_batches = 0.2,
+                        #overfit_batches = 0.1,
+                        limit_train_batches = 0.1,
                         #val_check_interval = 0.5,
                         #limit_val_batches = 1,
-                        accelerator='ddp',
+                        #accelerator='ddp',
                         #track_grad_norm = True,
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
@@ -1036,7 +1305,7 @@ def main(tparams, mparams):
 
         accelerator = "ddp" if tparams.mode=="train_cont" else None
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        training_module = TrainingModule(**vars(tparams), model=danet, resume_from_checkpoint=checkpoint_path )
+        training_module = TrainingModule( mparams=vars(mparams), resume_from_checkpoint=checkpoint_path ,**vars(tparams) )
         training_module.load_state_dict(checkpoint['state_dict'])
 
         trainer = pl.Trainer.from_argparse_args(tparams,
@@ -1044,7 +1313,7 @@ def main(tparams, mparams):
                     default_root_dir=tparams.dir_checkpoints,
                     precision=16, callbacks=callbacks ,
                     val_check_interval = 0.5,
-                    accelerator=accelerator
+                    #accelerator=accelerator
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=True, 
@@ -1212,12 +1481,16 @@ def round_dp(values, dp):
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
-    
-    # add model specific args
-    mparams = DaNet.parse_model_specific_args(parent_parser)
 
     # add the trainer specific args
     tparams = TrainingModule.parse_train_specific_args(parent_parser)
+
+    
+    # add model specific args
+    if tparams.model_name == "DaNet":
+        mparams = DaNet.parse_model_specific_args(parent_parser)
+    elif tparams.model_name == "SGNN":
+        mparams = SGNN.parse_model_specific_args(parent_parser)
 
     if tparams.mode in ['train_new','train_cont','test','inference']:
         main(tparams, mparams)

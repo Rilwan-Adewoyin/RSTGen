@@ -40,6 +40,7 @@ import random
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
 from transformers import Adafactor
+from transformers.generation_beam_search import BeamHypotheses
 
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.core.decorators import auto_move_data
@@ -52,6 +53,11 @@ from copy import deepcopy
 
 from itertools import permutations, combinations, combinations_with_replacement
 from typing import Optional, Callable, Union, Optional, List, Iterable
+
+from transformers.generation_logits_process import (
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
@@ -86,7 +92,7 @@ def forward(
     token_type_ids=None,
     position_ids=None,
     head_mask=None,
-    inputs_embeds=None,
+    input_embeds=None,
     position_embeds=None,
     encoder_hidden_states=None,
     encoder_attention_mask=None,
@@ -106,33 +112,33 @@ def forward(
     use_cache = use_cache if use_cache is not None else self.config.use_cache
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-    if input_ids is not None and inputs_embeds is not None:
-        raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+    if input_ids is not None and input_embeds is not None:
+        raise ValueError("You cannot specify both input_ids and input_embeds at the same time")
     elif input_ids is not None:
         input_shape = input_ids.size()
         input_ids = input_ids.view(-1, input_shape[-1])
         batch_size = input_ids.shape[0]
-    elif inputs_embeds is not None:
-        input_shape = inputs_embeds.size()[:-1]
-        batch_size = inputs_embeds.shape[0]
+    elif input_embeds is not None:
+        input_shape = input_embeds.size()[:-1]
+        batch_size = input_embeds.shape[0]
     else:
-        raise ValueError("You have to specify either input_ids or inputs_embeds")
+        raise ValueError("You have to specify either input_ids or input_embeds")
 
     if token_type_ids is not None:
         token_type_ids = token_type_ids.view(-1, input_shape[-1])
     
     if position_ids is not None:
-        position_ids = position_ids.view(-1, input_shape[-1]) #.to(inputs_embeds.device)
+        position_ids = position_ids.view(-1, input_shape[-1]) #.to(input_embeds.device)
 
-    if position_ids is not None and inputs_embeds is not None:
-        raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+    if position_ids is not None and input_embeds is not None:
+        raise ValueError("You cannot specify both input_ids and input_embeds at the same time")
     elif position_ids is not None:
         input_shape = position_ids.size()
         position_ids = position_ids.view(-1, input_shape[-1])
     elif position_embeds is not None:
         pass
     else:
-        raise ValueError("You have to specify either input_ids or inputs_embeds")
+        raise ValueError("You have to specify either input_ids or input_embeds")
 
     if past_key_values is None:
         past_length = 0
@@ -142,7 +148,7 @@ def forward(
     
     if position_ids is None:
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        device = input_ids.device if input_ids is not None else input_embeds.device
         position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
@@ -150,7 +156,7 @@ def forward(
     if attention_mask is not None:
 
         attention_mask = attention_mask[:, None, :, :]
-        attention_mask = attention_mask.type_as(inputs_embeds) # fp16 compatibility
+        attention_mask = attention_mask.type_as(input_embeds) # fp16 compatibility
         attention_mask = (1.0 - attention_mask) *-10000.0
 
     # If a 2D ou 3D attention mask is provided for the cross-attention
@@ -170,13 +176,13 @@ def forward(
     # head_mask has shape n_layer x batch x n_heads x N x N
     head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
-    if inputs_embeds is None:
-        inputs_embeds = self.wte(input_ids)
+    if input_embeds is None:
+        input_embeds = self.wte(input_ids)
 
     if position_embeds is None:
         position_embeds = self.wpe(position_ids)    
 
-    hidden_states = inputs_embeds + position_embeds
+    hidden_states = input_embeds + position_embeds
 
     if token_type_ids is not None:
         token_type_embeds = self.wte(token_type_ids)
@@ -246,8 +252,58 @@ def forward(
     else:
         raise NotImplementedError
 
+def top_k_top_p_filtering(
+    logits: torch.FloatTensor,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    filter_value: float = -float("Inf"),
+    min_tokens_to_keep: int = 1,
+    ) -> torch.FloatTensor:
+    """
+    Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+    Args:
+        logits: logits distribution shape (batch size, vocabulary size)
+        if top_k > 0: keep only top k tokens with highest probability (top-k filtering).
+        if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+            Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+        Make sure we keep at least min_tokens_to_keep per batch example in the output
+    From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+    """
+    if top_k > 0:
+        logits = TopKLogitsWarper(top_k=top_k, filter_value=filter_value, min_tokens_to_keep=min_tokens_to_keep)(
+            None, logits
+        )
 
+    if 0 <= top_p <= 1.0:
+        logits = TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=min_tokens_to_keep)(None, logits)
 
+    return logits
+
+def calc_banned_ngram_tokens(prev_input_ids, num_hypos: int, no_repeat_ngram_size: int, cur_len: int) -> None:
+    """Copied from fairseq for no_repeat_ngram in beam_search"""
+    if cur_len + 1 < no_repeat_ngram_size:
+        # return no banned tokens if we haven't generated no_repeat_ngram_size tokens yet
+        return [[] for _ in range(num_hypos)]
+
+    generated_ngrams = [{} for _ in range(num_hypos)]
+
+    for idx in range(num_hypos):
+        gen_tokens = prev_input_ids[idx].tolist()
+        generated_ngram = generated_ngrams[idx]
+        for ngram in zip(*[gen_tokens[i:] for i in range(no_repeat_ngram_size)]):
+            prev_ngram_tuple = tuple(ngram[:-1])
+            generated_ngram[prev_ngram_tuple] = generated_ngram.get(prev_ngram_tuple, []) + [ngram[-1]]
+
+    def _get_generated_ngrams(hypo_idx):
+        # Before decoding the next token, prevent decoding of ngrams that have already appeared
+        start_idx = cur_len + 1 - no_repeat_ngram_size
+        ngram_idx = tuple(prev_input_ids[hypo_idx, start_idx:cur_len].tolist())
+        
+        return generated_ngrams[hypo_idx].get(ngram_idx, [])
+
+    banned_tokens = [_get_generated_ngrams(hypo_idx) for hypo_idx in range(num_hypos)]
+    
+    return banned_tokens
 class NLG(nn.Module):
     """NLG unit
     """
@@ -255,7 +311,7 @@ class NLG(nn.Module):
     def __init__(self, 
         base_model_name= 'distilgpt2', model_name="NLG",
         reset_base_transformer=True, loss_type="CrossEntropy",
-        fda=True, frst=True, ftopic=True, max_input_len=264 ,**kwargs ):
+        fda=False, frst=True, ftopic=True, max_input_len=264 ,**kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
         
@@ -268,7 +324,8 @@ class NLG(nn.Module):
 
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
-        
+        self._use_cache = False
+
         self.nlg_tokenizer = NLG_tokenizer(base_model_name,
                                 os.path.join( ("./models"), f"{model_name}_tokenizer"),
                                 fda=fda, frst=frst, ftopic=ftopic, max_input_len=max_input_len,
@@ -276,7 +333,7 @@ class NLG(nn.Module):
         
         self.transformer.resize_token_embeddings( len(self.nlg_tokenizer.e2m_tokenizer) )
         self.transformer.forward = types.MethodType(forward,self.transformer) #monkey patch
-        
+        self.config= self.transformer.config
 
         # Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
@@ -307,7 +364,7 @@ class NLG(nn.Module):
 
     @torch.no_grad()
     def generate(self, 
-        _input,
+        input_,
         max_length: Optional[int] = None,
         min_length: Optional[int] = None,
         do_sample: Optional[bool] = None,
@@ -334,10 +391,12 @@ class NLG(nn.Module):
 
         #Half Embedded the inputs to get input_embed
         input_ids = input_['tknzd_utt'] #need to make sure no padding is done here ??
-        input_ = self.forward_embedding(encoded_input) 
+
+        input_ = self.forward_embedding(input_) 
+        
         input_embeds = input_['input_embeds']
         attention_mask = input_['attn_mask']
-        position_ids = input_['position_ids']
+        position_embeds = input_['position_embeds']
         token_type_ids = None
         # Need to get the input ids (tknzd_utterance)
         
@@ -375,7 +434,7 @@ class NLG(nn.Module):
         )
 
         if input_ids is not None:
-            batch_size = inputs_embeds.shape[0]  #changed here : overriden by the input batch_size
+            batch_size = input_embeds.shape[0]  #changed here : overriden by the input batch_size
         else:
             batch_size = 1
         
@@ -449,9 +508,9 @@ class NLG(nn.Module):
         # set pad_token_id to eos_token_id if not set. Important that this is done after
         # attention_mask is created
         if pad_token_id is None and eos_token_id is not None:
-            logger.warning(
-                "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
-            )
+            # logger.warning(
+            #     "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
+            # )
             pad_token_id = eos_token_id
 
         # current position and vocab size
@@ -486,8 +545,6 @@ class NLG(nn.Module):
         #     encoder = self.get_encoder()
 
         #     encoder_outputs: tuple = encoder(input_ids, attention_mask=attention_mask)
-
-
         #endregion
         
         #region  -(Reshaping tensors that need it and some more encoder-decoder logic)
@@ -495,22 +552,29 @@ class NLG(nn.Module):
         # Expand input ids if num_beams > 1 or num_return_sequences > 1
         if num_return_sequences > 1 or num_beams > 1:
             input_ids_len = input_ids.shape[-1]
+            input_embeds_len = input_embeds.shape[-2]
             input_embeds_dim = input_embeds.shape[-1]
 
             input_ids = input_ids.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len)
-            input_embeds = input_embeds.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len, input_embeds_dim) #Change
+            input_embeds = input_embeds.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_embeds_len, input_embeds_dim) #Change
+            # attention_mask = attention_mask.unsqueeze(1).expand(
+            #     batch_size, effective_batch_mult * num_beams, input_ids_len, input_ids_len
+            # )
             attention_mask = attention_mask.unsqueeze(1).expand(
-                batch_size, effective_batch_mult * num_beams, input_ids_len, input_ids_len
+                batch_size, effective_batch_mult * num_beams, input_embeds_len, input_embeds_len
             )
 
             input_ids = input_ids.contiguous().view(
                 effective_batch_size * num_beams, input_ids_len
             )  # shape: (batch_size * num_return_sequences * num_beams, cur_len)
             input_embeds = input_embeds.contiguous().view(
-                effective_batch_size * num_beams, input_ids_len, input_embeds_dim
+                effective_batch_size * num_beams, input_embeds_len, input_embeds_dim
             )  # shape: (batch_size * num_return_sequences * num_beams, cur_len, dim1)
+            # attention_mask = attention_mask.contiguous().view(
+            #     effective_batch_size * num_beams, input_ids_len, input_ids_len
+            # )  # shape: (batch_size * num_return_sequences * num_beams, cur_len, dim1)
             attention_mask = attention_mask.contiguous().view(
-                effective_batch_size * num_beams, input_ids_len, input_ids_len
+                effective_batch_size * num_beams, input_embeds_len, input_embeds_len
             )  # shape: (batch_size * num_return_sequences * num_beams, cur_len, dim1)
 
         if self.config.is_encoder_decoder:
@@ -550,9 +614,9 @@ class NLG(nn.Module):
         # input_embeds should be two dimensionl
         if num_beams > 1:
             output = self._generate_beam_search(  
-                inputs_ids = input_ids,
-                inputs_embeds = input_embeds,
-                position_ids=position_ids,
+                input_ids = input_ids,
+                input_embeds = input_embeds,
+                position_embeds=position_embeds,
                 attention_mask = attention_mask,
                 token_type_ids = None,
 
@@ -576,15 +640,15 @@ class NLG(nn.Module):
                     vocab_size=vocab_size,
                     encoder_outputs=encoder_outputs,
                     use_cache=use_cache,
-                    model_specific_kwargs=model_specific_kwargs,
-                **generate_params )
+                    model_specific_kwargs=model_specific_kwargs)#,
+                #**generate_params )
                 #may need to add other special tokens to the mix here
 
         else:
             output = self._generate_no_beam_search(
-                inputs_ids = input_ids,
-                inputs_embeds = input_embeds,
-                position_ids=position_ids,
+                input_ids = input_ids,
+                input_embeds = input_embeds,
+                position_embeds=position_embeds,
                 attention_mask = attention_mask,
                 token_type_ids = None,
 
@@ -698,14 +762,15 @@ class NLG(nn.Module):
             next_input_embed =  self.trasnformer.wte(tokens_to_add) # (batch, 1)
 
             if self.fda and self.frst:
-                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(4) #Token type id of context utterance
+                next_token_type_ids = tokens_to_add.new_full(next_input_embed.shape[1:2],4) #Token type id of context utterance
             elif self.fda==False and self.frst:
-                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(3) #Token type id of context utterance
+                next_token_type_ids = tokens_to_add.new_full(next_input_embed.shape[1:2],3) #Token type id of context utterance
 
             #Joining new outputs to existing or redifining old inputs
             input_ids = torch.cat([input_ids, tokens_to_add.unsqueeze(-1)], dim=-1) 
             input_embeds = torch.cat( [input_embeds, next_input_embed ], axis=-2 ).contiguous()
             
+            #Move the below code to prepare_inputs_for_generation
             position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device )
             position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
 
@@ -713,11 +778,13 @@ class NLG(nn.Module):
                 
                 #The new utterance token will be able to attend to all prev values
             old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
-            _ = old_attnm_shape.shape
-            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device )
+            _ = old_attnm_shape
+            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=attention_mask )
             
-            new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
-            new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
+            new_mask_col = attention_mask.new_full( attention_mask.shape[-2:-1] , 0)
+            new_mask_row = attention_mask.new_full( attention_mask.shape[-1:] , 1)
+            new_attn_mask[:, :-1, :-1 ] = attention_mask
+
             new_attn_mask[:, -1:, : ] = new_mask_col.repeat([_[0],1,1])
             new_attn_mask[:, :, -1: ] = new_mask_row.repeat([_[0],1,1])
             attention_mask = new_attn_mask.contiguous()
@@ -748,6 +815,11 @@ class NLG(nn.Module):
     def _generate_beam_search(
         self,
         input_ids,
+        input_embeds,
+        attention_mask,
+        position_embeds,
+
+        token_type_ids,
         cur_len,
         max_length,
         min_length,
@@ -767,7 +839,6 @@ class NLG(nn.Module):
         num_beams,
         vocab_size,
         encoder_outputs,
-        attention_mask,
         use_cache,
         model_specific_kwargs,
          ):
@@ -794,17 +865,21 @@ class NLG(nn.Module):
         # done sentences
         done = [False for _ in range(batch_size)]
 
+        # print(cur_len)
+        # print(max_length)
+
         while cur_len < max_length:
+        
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids, past=past, attention_mask=attention_mask,
-                position_ids=position_ids , 
+                input_ids, input_embeds, past=past, attention_mask=attention_mask,
+                position_embeds=position_embeds , 
                 token_type_ids = token_type_ids, use_cache=use_cache, **model_specific_kwargs
             )
-            lm_logits = self(model_inputs, True)  # (batch_size * num_beams, cur_len, vocab_size)
+            lm_logits = self(input_=model_inputs, skip_embed1 = True )  # (batch_size * num_beams, cur_len, vocab_size)
             next_token_logits = lm_logits[:, -1, :]  # (batch_size * num_beams, vocab_size)
 
             # if model has past, then set the past variable to speed up decoding
-            if self._use_cache(outputs, use_cache):
+            if False: #self._use_cache(outputs, use_cache):
                 past = outputs[1]
             if self.config.is_encoder_decoder and do_sample is False:
                 # TODO (PVP) still a bit hacky here - there might be a better solution
@@ -936,43 +1011,43 @@ class NLG(nn.Module):
             # re-order batch and update current length
             input_ids = input_ids[beam_idx, :]
             input_ids = torch.cat([input_ids, beam_tokens.unsqueeze(1)], dim=-1)
-            cur_len = cur_len + 1
 
             #region changed : creating / adding to model inputs
-            input_embeds = input_embeds[beam_idx, :, :]
-            next_input_embed =  self.trasnformer.wte(beam_tokens.unsqueeze(1)) # (batch, 1)
-            input_embeds = torch.cat([input_embeds, next_input_embed ] , dim=-2 )
+            new_tokens = beam_tokens.unsqueeze(1)
+            input_embeds = torch.cat( [input_embeds, self.transformer.wte( new_tokens ) ], axis=1 ) # (batch, 1)
 
             if self.fda and self.frst:
-                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(4) #Token type id of context utterance
+                new_token_type_ids = input_ids.new_full(new_tokens.shape,4) #Token type id of context utterance
             elif self.fda==False and self.frst:
-                next_token_type_ids = tokens_to_add.new(next_input_embed.shape[1])._fill(3) #Token type id of context utterance
-            token_type_ids = torch.cat( [token_type_ids, next_token_type_ids[None, ...] ] )
+                new_token_type_ids = input_ids.new_full(new_tokens.shape,3) #Token type id of context utterance
+            
+            new_token_embedding = self.token_type_embeddings( new_token_type_ids )
+            input_embeds[:, -1:, :] = input_embeds[:, -1:, :] + new_token_embedding
 
             #Joining new outputs to existing or redifining old inputs                        
-            position_ids = torch.arange(1, input_embeds.shape[-2], dtype=torch.long, device=input_embeds.device)
-            position_ids = position_ids.unsqueeze(0).view(-1, input_embeds.shape[-2])
+            position_ids = torch.arange( 1, input_embeds.shape[1]+1, dtype=torch.long )
+            position_ids = torch.stack( input_embeds.shape[0]*[position_ids] ) #repeating position_ids for each beam
+            position_embeds = self.transformer.wpe(position_ids) 
                        
                 #The new utterance token will be able to attend to all prev values
-            old_attnm_shape = attention_mask.shape() #bs, old_seq_len, old_seq_len
-            _ = old_attnm_shape.shape
-            new_attn_mask = torch.emmpty( [_[0],_[1]+1,_[2]+2], device=old_attnm_shape.device)
+            old_attn_shape = attention_mask.shape #bs, old_seq_len, old_seq_len
+            _ = old_attn_shape
+            new_attn_mask = torch.empty( [_[0],_[1]+1,_[2]+1], device=attention_mask.device, dtype=torch.float)
             
-            new_mask_col = attention_mask.new( attention_mask.shape[-2] )._fill(0)
-            new_mask_row = attention_mask.new( attention_mask.shape[-1] )._fill(1)
-            new_attn_mask[:, -1:, : ] = new_mask_col.repeat([_[0],1,1])
-            new_attn_mask[:, :, -1: ] = new_mask_row.repeat([_[0],1,1])
+            new_attn_mask[ :, :-1, :-1] = attention_mask
+            new_attn_mask[:, -1:, : ] = 0.0 # new_mask_col.repeat([_[0],1,1])
+            new_attn_mask[:, :, -1: ] = 1.0 #new_mask_row.repeat([_[0],1,1])
             attention_mask = new_attn_mask.contiguous()
-
+            
+            cur_len = cur_len + 1
             #endregion
             
-
             # re-order internal states
             if past is not None:
                 past = self._reorder_cache(past, beam_idx)
 
             # extend attention_mask for new generated input if only decoder
-            if self.config.is_encoder_decoder is False:
+            if False: # self.config.is_encoder_decoder is False: 
                 attention_mask = torch.cat(
                     [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
                 )
@@ -1034,6 +1109,67 @@ class NLG(nn.Module):
 
         return decoded    
 
+    def enforce_repetition_penalty_(self, lprobs, batch_size, num_beams, prev_output_tokens, repetition_penalty):
+        """
+        Enforce the repetition penalty (from the `CTRL paper <https://arxiv.org/abs/1909.05858>`__).
+        """
+        for i in range(batch_size * num_beams):
+            for previous_token in set(prev_output_tokens[i].tolist()):
+                # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
+                if lprobs[i, previous_token] < 0:
+                    lprobs[i, previous_token] *= repetition_penalty
+                else:
+                    lprobs[i, previous_token] /= repetition_penalty
+
+    def postprocess_next_token_scores(
+        self,
+        scores,
+        input_ids,
+        no_repeat_ngram_size,
+        bad_words_ids,
+        cur_len,
+        min_length,
+        max_length,
+        eos_token_id,
+        repetition_penalty,
+        batch_size,
+        num_beams,
+            ):
+        # repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858)
+        if repetition_penalty != 1.0:
+            self.enforce_repetition_penalty_(
+                scores,
+                batch_size,
+                num_beams,
+                input_ids,
+                repetition_penalty,
+            )
+
+        # set eos token prob to zero if min_length is not reached
+        if eos_token_id is not None and cur_len < min_length:
+            scores[:, eos_token_id] = -float("inf")
+
+        if no_repeat_ngram_size > 0:
+            # calculate a list of banned tokens to prevent repetitively generating the same ngrams
+            num_batch_hypotheses = batch_size * num_beams
+            # from fairseq: https://github.com/pytorch/fairseq/blob/a07cb6f40480928c9e0548b737aadd36ee66ac76/fairseq/sequence_generator.py#L345
+            banned_batch_tokens = calc_banned_ngram_tokens(
+                input_ids, num_batch_hypotheses, no_repeat_ngram_size, cur_len
+            )
+            for i, banned_tokens in enumerate(banned_batch_tokens):
+                scores[i, banned_tokens] = -float("inf")
+
+        if bad_words_ids is not None:
+            # Exclude EOS token (already processed)
+            bad_words_ids = list(filter(lambda bad_token_seq: bad_token_seq != [eos_token_id], bad_words_ids))
+            # calculate a list of banned tokens according to bad words
+            banned_tokens = calc_banned_bad_words_ids(input_ids.tolist(), bad_words_ids)
+            # Modify the scores in place by setting the banned tokens logits to `-inf`
+            set_scores_to_inf_for_banned_tokens(scores, banned_tokens)
+
+        return scores
+
+
     @staticmethod
     def parse_model_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
@@ -1082,12 +1218,13 @@ class NLG(nn.Module):
         """       
 
         # Handles embedding of our new non word features
-        #if skip_embed1 == False:
-        input_ = self.forward_embedding(input_)
+        if skip_embed1 == False:
+            input_ = self.forward_embedding(input_)
 
 
         # Feed input to distilgpt2
-        outputs = self.transformer( inputs_embeds=input_['input_embeds'],
+        #print(input_.keys())
+        outputs = self.transformer( input_embeds=input_['input_embeds'],
                                     attention_mask = input_['attn_mask'],
                                     position_embeds = input_['position_embeds'],
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
@@ -1115,7 +1252,6 @@ class NLG(nn.Module):
         else:
             return lm_logits
         
-    
     def layer_embedding(self, input_):
         """Performs the input embedding and token type embedding calcs
 
@@ -1178,13 +1314,13 @@ class NLG(nn.Module):
         rst_start_embed = self.transformer.wte( input_['rst_start_token'] ).unsqueeze(1)
         rst_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ).permute(0,2,1) # (bs, channels, seq_len)
 
-        topics_phrase_embed = self.transformer.wte(input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
+        topics_phrase_embed = self.transformer.wte( input_['tnsr_topics_phrase']  )  #TODO: Add positional encoding to each sub-phrase
         topics_score_embed = self.embedding_topics_score( input_['tnsr_topics_score']).permute(0,2,1)
 
         topics_embed = topics_phrase_embed + topics_score_embed
-
         
         utt_embed = self.transformer.wte( input_['tknzd_utt'] )
+
 
         input_embeds = torch.cat(
             [rst_start_embed, rst_embed,
@@ -1225,23 +1361,26 @@ class NLG(nn.Module):
 
         return None
 
-    def prepare_inputs_for_generation(self, input_ids, input_embeds, attention_mask, position_ids ,past=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, input_embeds, position_embeds,
+            attention_mask, past=None, **kwargs):
         
-        # only last token for inputs_ids if past is defined in kwargs
+        # only last token for input_ids if past is defined in kwargs
         if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
+            #input_ids = input_ids[:, -1].unsqueeze(-1)
             input_embeds = input_embeds[:, -1, :].unsqueeze(-2)
             #TODO: may also have to crop the input_embeds and attneiton_mask
         
         return {
-            "input_ids": input_ids,
+            #"input_ids": input_ids,
             'input_embeds':input_embeds,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-
+            "attn_mask": attention_mask,
+            'position_embeds': position_embeds,
             "past_key_values": past,
-
             "token_type_ids": None,
+
+            #"rst_start_token":self.e2m_tokenizer.encode("<|rst|>")[0] ,
+            #"":,
+            #'tnsr_topics_score':,
         }
 
 class NLG_tokenizer():
@@ -1264,9 +1403,7 @@ class NLG_tokenizer():
                  **kwargs
                  ):
 
-
         self.e2m_base_model_name = e2m_base_model_name
-
         self.fda = fda
         self.frst = frst
         self.ftopic = ftopic
@@ -1275,14 +1412,12 @@ class NLG_tokenizer():
         self.max_input_len = max_input_len  #self.e2m_tokenizer.max_len
         
         # Setting up RST utilities
-            
         if self.frst:
             self.rst_rel_li = ['Attribution',
                 'Background','Cause','Comparison','Condition',
                 'Contrast','Elaboration','Enablement','Evaluation',
                 'Explanation','Joint','Manner-Means','Topic-Comment',
                 'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
-
 
             self.rst_rel_binarizer = sklp.MultiLabelBinarizer()
             self.rst_rel_binarizer.fit( [ self.rst_rel_li ] )
@@ -1336,7 +1471,6 @@ class NLG_tokenizer():
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
                 config.save_pretrained(dir_tokenizer)
 
-
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
             """
                 Allows the user to select partiuclar rst_vectors in order to control their output
@@ -1344,22 +1478,23 @@ class NLG_tokenizer():
                 version: rule to decide how to compose relations
                 relations: A list of the relations to utilise
              """
+            count = kwargs.get('count',1)
             assert ( count>0 and count<7 )
 
-            if relations == "all":
-                relations = [[rel] for rel in self.rst_rel_li]
-            
-            assert type(relations)== list
+            #selecting sub rst relations to evaluate
+            rst_rel_li = [ rel for rel in self.rst_rel_li if ( rel in relations) or relations=="all" ]
 
+            if version == "independent":
+                rst_rel_encoded = [[rel] for rel in rst_rel_li]
+            
+            
             if version=="combinations":
                 
                 combination_count = kwargs.get('combinatoric_count',3)
                 iter_rst_comb = combinations( rst_rel_li, combination_count )
                 li_rst_comb =  list(iter_rst_comb)
                 li_rst_comb = random(li_rst_comb)
-
                 li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
-
 
                 rst_rel_encoded = self.rst_rel_binarizer.transform( li_rst_comb ) #list of list of each relation
             
@@ -1371,7 +1506,6 @@ class NLG_tokenizer():
                 li_rst_perm = random(li_rst_perm)
 
                 li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]           
-
                 rst_rel_encoded = self.rst_rel_binarizer.transform( li_rst_perm ) #list of list of each relation
 
             elif version=="combinations_with_replacement":
@@ -1388,8 +1522,7 @@ class NLG_tokenizer():
 
             return rst_rel_encoded
 
-
-    def encode_v2( self, das ,rst_rels,topics, topics_score, utterance, pad_utterance):
+    def encode_v2( self, das ,rst_rels,topics, topics_score, utterance, pad_utterance,generate_mode):
 
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -1480,8 +1613,8 @@ class NLG_tokenizer():
                  'token_type_ids':token_type_ids
                  }
 
-    def encode_v2_exda( self,rst_rels,topics, topics_score, 
-        utterance, pad_utterance):
+    def encode_v2_exda( self, rst_rels, topics, topics_score, 
+        utterance, pad_utterance, generate_mode):
 
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -1495,25 +1628,30 @@ class NLG_tokenizer():
         """
         
         #Getting Special Tokens
-        rst_start_token = self.e2m_tokenizer.encode("<|rst|>")[0] 
-        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") 
+        rst_start_token = self.e2m_tokenizer.encode("<|rst|>",return_tensors="pt")[0] 
+        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>",return_tensors="pt") 
 
 
         #Getting Vectors
         tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
         tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance, generate_mode)
                             
         # Building Attention Mask
 
             # calc the ending cumulative dim for, rst, topics, utt, segments,
         r_dim = self.context_len['rst']       # tnsr_rst_rels.shape[0]
         rt_dim = r_dim +self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
-        utt_dim = rt_dim + self.context_len['utt']  
+        
+        if pad_utterance == True:
+            utt_dim = rt_dim + self.context_len['utt']  
+        else:
+            utt_dim = rt_dim + tknzd_utt.shape[-1]
+        
 
-                
             # creating mask
-        attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
+        #attn_mask = torch.tril( torch.ones([self.max_input_len,self.max_input_len]))
+        attn_mask = torch.tril( torch.ones([utt_dim, utt_dim]))
                     #pre_utterance general masking
         attn_mask[ :rt_dim , :rt_dim ] = 1 
 
@@ -1529,16 +1667,22 @@ class NLG_tokenizer():
         attn_mask[ utt_dim-utt_pad_count: , : ] = 0
 
         #Creating labels/targets for GPT Language Model Head
-        labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
-
-        labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
+        try:
+            labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
+            labels[0][rt_dim:utt_dim] =  tknzd_utt[ : utt_dim- rt_dim ]
+        except Exception:
+            labels = None
         
         # Creating Positional Emebeddings
             # ALL words in drt get a positional encoding of 0 -> No positional meaning
             # utterance has normal positional encoding        
         position_ids_rt = torch.zeros([rt_dim], dtype=torch.long) 
-        position_ids_utt =  torch.arange( 1, utt_dim-rt_dim + 1  , dtype=torch.long)
-        position_ids = torch.cat([position_ids_rt,position_ids_utt], axis=-1)
+#        if pad_utterance == True:
+        position_ids_utt =  torch.arange( 1, utt_dim-rt_dim + 1, dtype=torch.long)
+        # else:
+        #     position_ids_utt =  torch.arange( 1, tknzd_utt.shape[1] + 1, dtype=torch.long)
+
+        position_ids = torch.cat([position_ids_rt, position_ids_utt], axis=-1)
 
         # Creating Token Type Ids
             # 1:rst, 
@@ -1546,8 +1690,11 @@ class NLG_tokenizer():
             # 3:utterance part
 
         token_type_ids_r = torch.zeros( [self.context_len['rst']], dtype=torch.long) + 1
-        token_type_ids_utt = torch.zeros( [self.context_len['utt']  ], dtype=torch.long ) + 2
-        
+        #if pad_utterance == True:
+        token_type_ids_utt = torch.zeros( [ utt_dim-rt_dim  ], dtype=torch.long ) + 2
+        # else:
+        #     token_type_ids_utt = torch.zeros( [ tknzd_utt.shape[1]   ], dtype=torch.long ) + 2 
+
         _ = torch.zeros( [self.context_len['topics'] ], dtype=torch.long)
         _[ ta_tokens_pos ] = 1
         token_type_ids_t =  _.cumsum(axis=0) + 2
@@ -1598,7 +1745,7 @@ class NLG_tokenizer():
         
         return tnsr_das
 
-    def encode_topic_v2(self, topics, topics_score, max_len=16, padding_token="<|endoftext|>"):
+    def encode_topic_v2(self, topics, topics_score, padding_token, max_len=16,):
         """[summary]
 
             Args:
@@ -1653,15 +1800,18 @@ class NLG_tokenizer():
 
         return topic_phrases , tnsr_score, diff, ta_idxs
 
-    def encode_utterance_v2(self, utterance, pad=True):
+    def encode_utterance_v2(self, utterance, pad=True, generate_mode=False):
         #pad: 
         #   set to True during training to ensure all batches have the same length
         #   set to False in the case of Generation in order to work with huggingface .generate()
         #TODO: change to be able to handle batches of data
         #TODO: When you move to training on large seequences performing variable batch sizes to reduce time
+        if generate_mode == False:
+            utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
+        else:
+            utterance ='<|endoftext|>' + utterance
+            #utterance = utterance
 
-        utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
-        
         if pad == True:
             encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
@@ -1672,7 +1822,9 @@ class NLG_tokenizer():
                                                                                 
                                         return_tensors='pt',
                                         return_length=True,
-                                        return_token_type_ids=None)
+                                        return_token_type_ids=None,
+                                        add_prefix_space=True
+                                        )
             
             #tokenizer length usually returns the padded length as opposed the original length.
             #So using 'do_not_pad' and then padding manually
@@ -2258,13 +2410,13 @@ class SingleDataset(torch.utils.data.Dataset):
     def __len__(self):
         return (self.line_end - self.line_start)
     
-    def __getitem__(self, index):
+    def __getitem__(self, index,pad_utterance=True):
         
         das, rst_rels, topics, topics_score,utterance = self.getitem_extract_datum(index)
                     
         encoded = self.getitem_tokenize(das, rst_rels, topics, 
                                     topics_score, utterance,
-                                    pad_utterance=True )
+                                    pad_utterance=pad_utterance )
 
             # encoded May include some of the following
             #( da_start_token, tnsr_das,    
@@ -2325,17 +2477,18 @@ class SingleDataset(torch.utils.data.Dataset):
         return das, rst_rels, topics, topics_score,utterance
 
     def getitem_tokenize(self, das, rst_rels, topics, topics_score,
-        utterance,pad_utterance=True):
+        utterance,pad_utterance=True, generate_mode=False):
         
         if self.fda and self.frst:
             encoded = self.tokenizer.encode_v2(das, rst_rels, topics, 
                         topics_score, utterance,
-                        pad_utterance=True)
+                        pad_utterance=pad_utterance,
+                        generate_mode=generate_mode)
 
         elif self.fda == False and self.frst:
             encoded = self.tokenizer.encode_v2_exda(rst_rels, topics, 
                         topics_score, utterance,
-                        pad_utterance=True)
+                        pad_utterance=pad_utterance, generate_mode=generate_mode)
 
         return encoded
 
