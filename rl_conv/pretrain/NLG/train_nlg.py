@@ -1019,7 +1019,7 @@ class NLG(nn.Module):
 
             #region changed : creating / adding to model inputs
             new_tokens = beam_tokens.unsqueeze(1)
-            input_embeds = torch.cat( [input_embeds, self.transformer.wte( new_tokens ) ], axis=1 ) # (batch, 1)
+            input_embeds = torch.cat( [input_embeds, self.transformer.transformer.wte( new_tokens ) ], axis=1 ) # (batch, 1)
 
             if self.fda and self.frst:
                 new_token_type_ids = input_ids.new_full(new_tokens.shape,4) #Token type id of context utterance
@@ -1032,7 +1032,7 @@ class NLG(nn.Module):
             #Joining new outputs to existing or redifining old inputs                        
             position_ids = torch.arange( 1, input_embeds.shape[1]+1, dtype=torch.long )
             position_ids = torch.stack( input_embeds.shape[0]*[position_ids] ) #repeating position_ids for each beam
-            position_embeds = self.transformer.wpe(position_ids) 
+            position_embeds = self.transformer.transformer.wpe(position_ids) 
                        
                 #The new utterance token will be able to attend to all prev values
             old_attn_shape = attention_mask.shape #bs, old_seq_len, old_seq_len
@@ -1836,7 +1836,7 @@ class NLG_tokenizer():
             tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(self.e2m_tokenizer.eos_token_id) ],axis=-1 )[0]
                                            
         
-        elif pad == False
+        elif pad == False:
                         
             encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
