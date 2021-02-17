@@ -352,14 +352,17 @@ class NLG(nn.Module):
                  #therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
         
         elif self.fda == False and self.frst:
-            self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
-            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.002)
+            bias= False if self.freeze_pretrained else True
+            self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1, bias=bias )
+            
+            
+            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.02)
 
             self.token_type_embeddings = torch.nn.Embedding( 3 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
             self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.002) #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                                 #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
             
-            self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
+            self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1, bias=bias)
             self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.002)
 
             # self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
@@ -373,12 +376,9 @@ class NLG(nn.Module):
             for name, param in self.transformer.transformer.named_parameters(): 
                 param.requires_grad = False
 
-            #freeze LM Head
-            for name, param in self.transformer.lm_head.named_parameters():
-                #if "embedding" not in name:
-                param.requires_grad = False
-
-
+            self.transformer.lm_head.requires_grad = False
+                
+                
     def get_output_embeddings(self):
         return self.transformer.lm_head
 
@@ -1194,7 +1194,7 @@ class NLG(nn.Module):
                 
         parser.add_argument('--base_model_name', default='distilgpt2', required=False)
         parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
-        parser.add_argument('--freeze_pretrained', default=False, required=False, type=bool)
+        parser.add_argument('--freeze_pretrained', default=False, required=False, type=lambda x: bool(int(x)) )
 
         parser.add_argument('--model_name', default='NLG', required=False)
         parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
