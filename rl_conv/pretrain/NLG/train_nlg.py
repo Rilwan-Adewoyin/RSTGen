@@ -311,12 +311,14 @@ class NLG(nn.Module):
     def __init__(self, 
         base_model_name= 'distilgpt2', model_name="NLG",
         reset_base_transformer=True, loss_type="CrossEntropy",
-        fda=False, frst=True, ftopic=True, max_input_len=264 ,**kwargs ):
+        fda=False, frst=True, ftopic=True, max_input_len=264 , 
+        freeze_pretrained=False,**kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
         
         self.base_model_name = base_model_name   
         self.model_name = model_name
+        self.freeze_pretrained = freeze_pretrained
         
         self.fda = fda 
         self.frst = frst
@@ -351,20 +353,31 @@ class NLG(nn.Module):
         
         elif self.fda == False and self.frst:
             self.embedding_rst_rels = torch.nn.Conv1d( 19, self.embd_outp_dim, kernel_size=1 )
-            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.0001)
+            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.002)
 
             self.token_type_embeddings = torch.nn.Embedding( 3 + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
-                                                #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
+            self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.002) #1 for each of da, rst, utterance and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
                                                 #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
             
             self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1)
-            self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.001)
+            self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.002)
 
             # self.lm_head = nn.Linear( self.embd_outp_dim, self.transformer.config.vocab_size, bias=False  )
             # self.lm_head.weight.data.normal_(mean=0.0, std=0.02)
         
         self.loss_type = loss_type 
         self.loss_fct = CrossEntropyLoss()
+
+        if self.freeze_pretrained == True:
+            #freeze All base gpt weights
+            for name, param in self.transformer.transformer.named_parameters(): 
+                param.requires_grad = False
+
+            #freeze LM Head
+            for name, param in self.transformer.lm_head.named_parameters():
+                #if "embedding" not in name:
+                param.requires_grad = False
+
 
     def get_output_embeddings(self):
         return self.transformer.lm_head
@@ -1181,6 +1194,8 @@ class NLG(nn.Module):
                 
         parser.add_argument('--base_model_name', default='distilgpt2', required=False)
         parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
+        parser.add_argument('--freeze_pretrained', default=False, required=False, type=bool)
+
         parser.add_argument('--model_name', default='NLG', required=False)
         parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
             choices=['CrossEntropy','UtteranceSimilarity']) 
@@ -1341,6 +1356,7 @@ class NLG(nn.Module):
         params = {}
 
         params['base_model_name'] = self.base_model_name
+        params['freeze_pretrained'] = self.freeze_pretrained
         params['loss_type'] = self.loss_type 
         params['max_input_len'] = self.nlg_tokenizer.max_input_len
         params['fda'] = self.fda
@@ -1836,7 +1852,7 @@ class NLG_tokenizer():
             tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(self.e2m_tokenizer.eos_token_id) ],axis=-1 )[0]
                                            
         
-        elif pad == False
+        elif pad == False:
                         
             encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                         return_attention_mask = False, 
@@ -1999,7 +2015,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=3,
+            patience=4,
             verbose=False,
             mode='min'
         )
@@ -2015,12 +2031,13 @@ class TrainingModule(pl.LightningModule):
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
                         check_val_every_n_epoch=1, logger=tb_logger,
-                        log_every_n_steps=1,
+                        log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator=accelerator,
-                        limit_train_batches = 2,
-                        #val_check_interval=0.5,
+                        #limit_train_batches = 20,
+                        #limit_val_batches = 2,
+                        val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=5,
                         #fast_dev_run=2, 
@@ -2036,7 +2053,7 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                     check_val_every_n_epoch=1, logger=tb_logger,
-                    log_every_n_steps=1,   
+                    log_every_n_steps=20,   
                     precision=tparams['precision'],callbacks=callbacks,
                     #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
