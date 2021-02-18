@@ -1979,6 +1979,7 @@ class TrainingModule(pl.LightningModule):
         
             train_params_to_save = self.return_params()
             model_params_to_save = self.model.return_params()
+
             self.save_hyperparameters( train_params_to_save )
             self.save_hyperparameters( model_params_to_save )
         
@@ -1989,7 +1990,7 @@ class TrainingModule(pl.LightningModule):
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated", help="Relative directory path for datafiles")
+        parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated_fixed_long3", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('-me','--max_epochs', default=32, type=int)
         parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
@@ -2373,6 +2374,7 @@ class TrainingModule(pl.LightningModule):
         params['max_epochs'] = self.max_epochs
         params['warmup_proportion'] = self.warmup_proportion 
         params['optimizer_type'] = self.optimizer_type
+        params['dir_data'] = self.dir_data
 
         return params
 

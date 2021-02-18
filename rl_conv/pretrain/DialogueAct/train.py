@@ -1051,12 +1051,14 @@ class TrainingModule(pl.LightningModule):
         
         # Saving training params and model params
         if self.mode in ['train_new']:
+            self.save_hyperparameters( self.model.return_params() )
+            self.save_hyperparameters( self.return_params() )
+
             mparams = argparse.Namespace(**self.model.return_params())
             tparams = argparse.Namespace(**self.return_params())
 
             utils.save_version_params(tparams, mparams, kwargs.get('version_name'), self.subversion ) 
 
-            #self.hparams = argparse.Namespace( **model.return_params() , **self.return_params() )
 
     @staticmethod
     def parse_train_specific_args(parent_parser):
