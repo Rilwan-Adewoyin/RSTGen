@@ -304,6 +304,66 @@ def calc_banned_ngram_tokens(prev_input_ids, num_hypos: int, no_repeat_ngram_siz
     banned_tokens = [_get_generated_ngrams(hypo_idx) for hypo_idx in range(num_hypos)]
     
     return banned_tokens
+
+def calc_banned_bad_words_ids(prev_input_ids: Iterable[int], bad_words_ids: Iterable[int]) -> Iterable[int]:
+    banned_tokens = []
+
+    def _tokens_match(prev_tokens, tokens):
+        if len(tokens) == 0:
+            # if bad word tokens is just one token always ban it
+            return True
+        if len(tokens) > len(prev_tokens):
+            # if bad word tokens are longer than prev tokens they can't be equal
+            return False
+
+        if prev_tokens[-len(tokens) :] == tokens:
+            # if tokens match
+            return True
+        else:
+            return False
+
+    for prev_input_ids_slice in prev_input_ids:
+        banned_tokens_slice = []
+
+        for banned_token_seq in bad_words_ids:
+            assert len(banned_token_seq) > 0, "Banned words token sequences {} cannot have an empty list".format(
+                bad_words_ids
+            )
+
+            if _tokens_match(prev_input_ids_slice, banned_token_seq[:-1]) is False:
+                # if tokens do not match continue
+                continue
+
+            banned_tokens_slice.append(banned_token_seq[-1])
+
+        banned_tokens.append(banned_tokens_slice)
+
+    return banned_tokens
+
+
+def set_scores_to_inf_for_banned_tokens(scores: torch.Tensor, banned_tokens: List[List[int]]) -> None:
+    """Modifies the scores in place by setting the banned token positions to `-inf`. Banned token is expected to be
+    a list of list of banned tokens to ban in the format [[batch index, vocabulary position],...]
+        Args:
+            scores: logits distribution of shape (batch size, vocabulary size)
+            banned_tokens: list of list of tokens to ban of length (batch_size)
+    """
+    banned_mask_list = []
+    for idx, batch_banned_tokens in enumerate(banned_tokens):
+        for token in batch_banned_tokens:
+            banned_mask_list.append([idx, token])
+    if not banned_mask_list:
+        return
+    banned_mask = torch.LongTensor(banned_mask_list)
+    indices = torch.ones(len(banned_mask))
+    # A sparse tensor is generated from a list of coordinates: [[0, 1], [0, 2], [2, 0]]. A conversion to dense tensor generates:
+    # [ 0  1  1 ]
+    # [ 0  0  0 ]
+    # [ 1  0  0 ]
+
+    banned_mask = torch.sparse.LongTensor(banned_mask.t(), indices, scores.size()).to(scores.device).to_dense().bool()
+    scores.masked_fill_(banned_mask, -float("inf"))
+
 class NLG(nn.Module):
     """NLG unit
     """
@@ -1043,7 +1103,16 @@ class NLG(nn.Module):
             input_embeds[:, -1:, :] = input_embeds[:, -1:, :] + new_token_embedding
 
             #Joining new outputs to existing or redifining old inputs                        
-            position_ids = torch.arange( 1, input_embeds.shape[1]+1, dtype=torch.long )
+            #position_ids = torch.arange( 1, input_embeds.shape[1]+1, dtype=torch.long )
+            if self.fda and self.frst:
+                raise NotImplementedError
+
+            if self.fda==False and self.frst:
+                rt_dim = self.nlg_tokenizer.context_len['rst'] + self.nlg_tokenizer.context_len['topics']
+                position_ids_rt = torch.zeros([rt_dim], dtype=torch.long) 
+                position_ids_utt =  torch.arange( 1, input_ids.shape[1]+ 1, dtype=torch.long)
+                position_ids = torch.cat([position_ids_rt, position_ids_utt], axis=-1)
+
             position_ids = torch.stack( input_embeds.shape[0]*[position_ids] ) #repeating position_ids for each beam
             position_embeds = self.transformer.transformer.wpe(position_ids) 
                        
@@ -1828,7 +1897,7 @@ class NLG_tokenizer():
             add_prefix_space=False
         else:
             utterance ='<|endoftext|>' + utterance
-            add_prefix_space = True
+            add_prefix_space = False
             #utterance = utterance
 
         if pad == True:
@@ -2437,7 +2506,7 @@ class SingleDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, index,pad_utterance=True):
         
-        das, rst_rels, topics, topics_score,utterance = self.getitem_extract_datum(index)
+        das, rst_rels, topics, topics_score, utterance = self.getitem_extract_datum(index)
                     
         encoded = self.getitem_tokenize(das, rst_rels, topics, 
                                     topics_score, utterance,
@@ -2465,11 +2534,11 @@ class SingleDataset(torch.utils.data.Dataset):
         
         #RST
         if self.frst:
-            try:
-                li_rst = json.loads(datum['rst'].values[0])  #list of dictionaries 
+            #try:
+            li_rst = json.loads(datum['rst'].values[0])  #list of dictionaries 
             
-            except json.decoder.JSONDecodeError as e:
-                li_rst = ast.literal_eval(datum['rst'].values[0])
+            # except json.decoder.JSONDecodeError as e:
+            #     li_rst = ast.literal_eval(datum['rst'].values[0])
         
             rst_rels = [ [ _dict['rel'] for _dict in li_rst ] ]
             rst_ns = [ [_dict['ns']] for _dict in li_rst ]
@@ -2482,22 +2551,20 @@ class SingleDataset(torch.utils.data.Dataset):
         
         #Topic scores
         if self.ftopic:
-            try:
-                topics_textrank = json.loads(datum['topic_textrank'].values[0])
-            except json.decoder.JSONDecodeError as e:
-                topics_textrank = ast.literal_eval(datum['topic_textrank'].values[0])
+            topics_textrank = json.loads(datum['topic_textrank'].values[0])
 
-            if len(topics_textrank)!=0: #TODO: remove later
-                topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
-            else:
-                topics = [""]
-                topics_score = [0.0]
+            #if len(topics_textrank)!=0: #TODO: remove later
+            topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
+            # else:
+            #     topics = [""]
+            #     topics_score = [0.0]
         else:
             topics = None
             topics_score = None
         
         #Utterance
-        utterance = datum['txt_preproc'].values[0].strip('\"')
+        utterance = datum['txt_preproc'].values[0]
+        
         
         return das, rst_rels, topics, topics_score,utterance
 
