@@ -1349,15 +1349,7 @@ class NLG(nn.Module):
             shift_labels = input_['labels'][..., 1:].contiguous() 
             
             loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            
-            # Check labels are what they should be
-            mask = torch.where( shift_labels[0][0]>=0 )[0].long()
-            true_words = self.nlg_tokenizer.e2m_tokenizer.decode( shift_labels[0][0][ mask ] )
-            # Check softmax logit values predictions
-            logits_sample = shift_logits[0][mask,...]
-            pred_word_idxs = torch.argmax(logits_sample,axis=1)
-            pred_words =self.nlg_tokenizer.e2m_tokenizer.decode( pred_word_idxs )
-            
+                        
             return (lm_logits, loss) 
 
         else:
@@ -2891,7 +2883,7 @@ if __name__ == '__main__':
 
 
 # dullduks server version 01 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 80 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
 # dullduks server version 02 - No Freezing, partial RST
