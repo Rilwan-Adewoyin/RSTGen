@@ -2182,7 +2182,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-opt','--optimizer_type', default="AdamW",required=True, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
-        parser.add_argument('--inference_context_utt', default=5, type=int)
+        parser.add_argument('--inference_context_utt', default=4, type=int)
             #TODO: check --version of required type None actually works
         tparams = parser.parse_known_args()[0]
         #tparams.splits = json.loads(tparams.splits)
@@ -2591,21 +2591,13 @@ class TrainingModule(pl.LightningModule):
 
     def return_params(self):
         params = {}
-        keys = ['batch_size','accumulate_grad_batches','lr_schedule','learning_rate','max_epochs',
+        keys = ['batch_size','accumulate_grad_batches','lr_schedule','learning_rate','max_epochs','dir_data'
             'warmup_proportion','optimizer_type','tag','inference_context_type']
         
         params = {
             k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
         }
 
-        # params['batch_size'] = self.batch_size
-        # params['accumulate_grad_batches'] = self.accumulate_grad_batches
-        # params['lr_schedule'] = self.lr_schedule 
-        # params['learning_rate'] = self.learning_rate
-        # params['max_epochs'] = self.max_epochs
-        # params['warmup_proportion'] = self.warmup_proportion 
-        # params['optimizer_type'] = self.optimizer_type
-        # params['tag'] = self.tag
 
         return params
 
@@ -2896,24 +2888,13 @@ if __name__ == '__main__':
     main(vars(tparams), vars(mparams))
 
 
-# CUDA_VISIBLE_DEVICES=0,1,2 python3 train_nlg.py -bs 24 -agb 3 --gpus 3 
-
-# Training with no DA
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python3 train_nlg.py -bs 28 -agb 2 --gpus 2 -fda 0 --workers 16 --version 40
-# python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode train_new
-
-# dullduks server version 41
-# python3 train_nlg.py -bs 56 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode train_new
+# dullduks server version 01 - No Freezing, Full RST
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
-# dullduks server version 42 - Extends 41 with larger lookback range
-# python3 train_nlg.py -bs 20 -agb 2 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode train_cont -lr 1e-4 -me 30 -mil 512
+# dullduks server version 02 - No Freezing, partial RST
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
 
-# dullduks server version 43 - Extends 42 with smaller lookback range
-# python3 train_nlg.py -bs 100 -agb 2 --gpus 1 -fda 0 --workers 8 --version 43 -opt AdamW --precision 16 --mode train_new -lr 1-4 -me 64 -mil 200
-# python3 train_nlg.py -bs 40 -agb 1 --gpus 1 -fda 0 --workers 16 --version 43 -opt AdamW --precision 16 --mode test
-
-# dullduks server version 99 - Just trained for one epoch
-# python3 train_nlg.py -bs 250 -agb 1 --gpus 1 -fda 0 --workers 8 --version 99 -opt AdamW --precision 16 --mode train_new -lr 1e-3 -me 2 -mil 160
-# # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 44 -opt AdamW --precision 16 --mode test
+# Corsari server version 03 - Freezing, Full RST
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 1 -frstv 1 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
