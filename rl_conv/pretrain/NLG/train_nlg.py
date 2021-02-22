@@ -409,27 +409,26 @@ class NLG(nn.Module):
 
         if self.fda:
             self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1, bias=False )
-            self.embedding_das.weight.data.normal_(mean=0.0, std=0.002) #use smaller start variance to minimize init impact of new info
+            self.embedding_das.weight.data.normal_(mean=0.0, std=0.005) #use smaller start variance to minimize init impact of new info
         
         if self.frst:
-            self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li ), self.embd_outp_dim )
-            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.001)
+            self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ) )
+            self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.005)
 
-        
         if self.frst_version == 1:
-            self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li ), self.embd_outp_dim )
-            self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.001)
+            self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ) )
+            self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.005)
 
-            self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenzier.rst_pos_maxidx + 1 , self.embd_outp_dim )
-            self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.001)
+            self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenizer.rst_pos_maxidx + 1 + 1 , self.embd_outp_dim, padding_idx=self.nlg_tokenizer.rst_pos_maxidx + 1  )
+            self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
 
         if self.ftopic:
             self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1, bias=False)
-            self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.002)
+            self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.005)
 
     
         self.token_type_embeddings = torch.nn.Embedding( special_token_count + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
-        self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.002)
+        self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.005)
         # 1 for each of da, rst and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
         #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
 
@@ -1692,7 +1691,7 @@ class NLG_tokenizer():
 
             return rst_rel_encoded
 
-    def encode_v2( self, das ,rst_rels,topics, topics_score,
+    def encode_v2( self, das ,rst_rels, rst_ns, rst_pos, topics, topics_score,
              utterance, pad_utterance,generate_mode):
 
         """
@@ -1723,8 +1722,8 @@ class NLG_tokenizer():
             tnsr_rst_ns = torch.zeros([1])
             tnsr_rst_pos = torch.zeros([1])
 
-        elif self.frst_verstion == 1:
-            tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        elif self.frst_version == 1:
+            tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels, rst_ns, rst_pos ,max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
 
 
         tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos, ta_phrase_lens  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
@@ -1830,7 +1829,7 @@ class NLG_tokenizer():
             tnsr_rst_pos = torch.zeros([1])
 
         elif self.frst_version == 1:
-            tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+            tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels,rst_ns, rst_pos, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
         
         tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos, ta_phrase_lens  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
         tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance, generate_mode)
@@ -1923,7 +1922,7 @@ class NLG_tokenizer():
         _len = tnsr_rels.shape[0]
         diff = (max_len - _len)
         if diff > 0:
-            tnsr_rels = torch.cat([tnsr_rels, torch.zeros( [diff], dtype=torch.long)] , axis=-1 ) 
+            tnsr_rels = torch.cat([tnsr_rels, torch.full( [diff], len(self.rst_rel_li ), dtype=torch.long)] , axis=-1 ) 
         elif diff == 0:
             pass
         else:
@@ -1943,7 +1942,7 @@ class NLG_tokenizer():
             Also includes an encoding for rst_ns and rst_pos
         """
 
-        tnsr_rels, diff = encode_rst_v2(rst_rels, max_len=max_len)
+        tnsr_rels, diff = self.encode_rst_v2(rst_rels, max_len=max_len)
 
         # Encoding the rst ns 
             #Encoded to the sequence of integers representing the ns values
@@ -1952,6 +1951,21 @@ class NLG_tokenizer():
 
         # Encoding the rst position
         tnsr_pos = torch.LongTensor( rst_pos ) #.reshape([1,-1])
+
+        # padding ns and pos
+            # The ns and pos embedding layer uses the index value 0 as a padding index
+            # For this index the vector is initialized to zer0 and as such never updates
+        
+        len_ =  tnsr_ns.shape[0]
+        if len_ > max_len:
+            tnsr_ns = tnsr_ns[:max_len]
+            tnsr_pos = tnsr_pos[:max_len]
+        
+        elif len_ < max_len:
+            _ = max_len-len_
+            tnsr_ns = torch.cat( [tnsr_ns, torch.full([_],len(self.rst_ns_li ))])
+            tnsr_pos = torch.cat( [tnsr_pos, torch.full([_],self.rst_pos_maxidx+1)])
+
 
         return tnsr_rels, diff, tnsr_ns, tnsr_pos
 
@@ -2122,15 +2136,15 @@ class TrainingModule(pl.LightningModule):
         
             train_params_to_save = self.return_params()
             model_params_to_save = self.model.return_params()
-            self.save_hyperparameters( train_params_to_save )
-            self.save_hyperparameters( model_params_to_save )
+
+            self.hparams = { **train_params_to_save, **model_params_to_save}
 
             self.inference_samples = list( islice( self.inference_dl, 5 ) )
-            bad_words = ["<|rst|>","<|ta|>",r"\n" ]
+            bad_words = ["<|rst|>","<|ta|>",r"\n" ] 
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [[526], [55],[8172]]
-            bad_words_ids = None
+            
 
             generation_params = {'num_beams':1, 'temperature':1.1, 'repitition_penalty':1.2, 
                                 'top_k': 50, 'top_p':0.85,
@@ -2267,7 +2281,7 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
-                        check_val_every_n_epoch=1, logger=None,
+                        check_val_every_n_epoch=1, logger=tb_logger,
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
@@ -2846,8 +2860,7 @@ def main(tparams={}, mparams={}):
     else:
         NotImplementedError
     
-    mparams['model_name'] += f"_frst{mparams['frst_version']}"
-
+    
     # Defining Logger
     tb_logger = pl_loggers.TensorBoardLogger( 
                     save_dir = os.path.abspath(tparams['model_dir']),
