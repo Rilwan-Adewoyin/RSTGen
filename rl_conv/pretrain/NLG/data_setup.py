@@ -788,8 +788,10 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
     # pytextrank using entity linking when deciding important phrases, for entity coreferencing
 
     doc = nlp(str_utterance)
-    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases if p.rank>lowest_score ]
+    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases if p.rank>lowest_score ] #Take all bar the lowest score
 
+    if len(li_ranked_kws) == 0:
+        li_ranked_kws = [["",0.0]]
     return li_ranked_kws
         
 def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):

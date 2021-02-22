@@ -52,7 +52,11 @@ def process_and_save( fp, new_fp, fix_ds=True, gen_long_ds=True, gen_long_dir=No
         data = data.apply(process_row, axis=1, result_type='expand')
         
         #remove empty rows
-        data = data[  [ not txt.isspace()  and any(c.isalpha() for c in txt) for txt in data.txt_preproc]  ]
+        data = data[  [ not txt.isspace() and any(c.isalpha() for c in txt) for txt in data.txt_preproc]  ]
+
+        #remove rows where the topic_textrank is length 0
+        #data = data [  [len(json.loads(txt))!=0 for txt in data.topic_textrank] ]
+
             
         #saving fixed files
         new_fp = f"{new_fp[:-10]}{len(data):010d}"
@@ -62,6 +66,13 @@ def process_and_save( fp, new_fp, fix_ds=True, gen_long_ds=True, gen_long_dir=No
         data.to_csv(new_fp, index=False) #, quoting=csv.QUOTE_NONE)
     
     if gen_long_ds ==True:
+        
+        #remove empty rows
+        if not fix_ds:
+            data = data[  [ not txt.isspace() and any(c.isalpha() for c in txt) for txt in data.txt_preproc]  ]
+            #remove rows where the topic_textrank is length 0
+            #data = data [  [len(json.loads(txt))!=0 for txt in data.topic_textrank] ]
+
         # saving utterances with sentences longer than 2 approx dus
         fps_long2 = os.path.join( gen_long_dir+"2", *os.path.normpath(new_fp).split(os.sep)[2:] )
         os.makedirs( os.path.dirname(fps_long2), exist_ok=True)
@@ -127,10 +138,13 @@ def process_row(datum):
         li_txt_score[0] = re.sub(pattern_deleted, '', li_txt_score[0])
         li_txt_score[0] = re.sub(pattern_txt_emojis, '', li_txt_score[0])
         li_txt_score[0] = re.sub(pattern_subreddits, r'\2', li_txt_score[0])
+    
+    if len(topic_textrank) == 0:
+        entry = ['',0.0]
+        topic_textrank = [ ['',0.0] ]
 
     datum['topic_textrank'] = json.dumps(topic_textrank)
 
-    
     return datum 
 
     
