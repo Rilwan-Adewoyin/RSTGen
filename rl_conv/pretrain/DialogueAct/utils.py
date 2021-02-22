@@ -1,6 +1,6 @@
 import os
 import json
-from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import AutoTokenizer, AutoModel, AutoConfig, AutoModelForCausalLM
 from transformers import PegasusForConditionalGeneration, PegasusTokenizer
 dirname = os.path.dirname(__file__)
 from datetime import date
@@ -42,6 +42,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
         else:
             model_tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
             model = AutoModel.from_pretrained(model_name)
+            #model = AutoModelForCausalLM.from_pretrained(model_name)
 
         model_tokenizer.save_pretrained(_dir_transformer)
         model.save_pretrained(_dir_transformer)
@@ -54,7 +55,9 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
             output['transformer'] = PegasusForConditionalGeneration.from_pretrained(_dir_transformer)
         else:
             output['transformer'] = AutoModel.from_pretrained(_dir_transformer, **kwargs)
-    
+            #output['transformer'] =  AutoModelForCausalLM.from_pretrained(_dir_transformer, **kwargs)
+            
+            
     return output
 
 def save_version_params(t_params=None, m_params=None, version="DaNet_v000",subversion="0"):

@@ -52,7 +52,7 @@ import multiprocessing as mp
 import distutils
 # import torch.multiprocessing as mp
 # from torch.multiprocessing import set_start_method
-
+import html
 
 from unidecode import unidecode
 batches_completed = 0
@@ -64,8 +64,18 @@ pattern_repword = re.compile(r'\b([\S]+)(\s+\1)+\b')
 pattern_repdot = re.compile(r'[\.]{2,}')
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
 pattern_multwspace = re.compile(r'[\s]{2,}')
-pattern_emojis = re.compile(":[\S]{2,}:")
-pattern_amp = re.compile("&(amp)?")
+#pattern_emojis = re.compile(":[\S]{2,}:") #this is the pattern for emojis from the demojize
+pattern_emojis = re.compile(":[^_]+?(_){1}[\S]{2,}:") #this is the pattern for emojis from the demojize
+pattern_txt_emojis = re.compile(r'(?::|;|=)(?:-)?(?:\)|\(|D|P)')
+pattern_amp = re.compile("&(amp){1}")
+#pattern_toremove = re.compile("(\[deleted\]|\[removed\])")
+pattern_toremove = re.compile("(\[deleted\]|\[removed\]|EDIT:)")
+
+pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoutes 
+pattern_subreddits = re.compile(r"(/??r/)([^/]+)")
+
+
+# &
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
 
@@ -418,6 +428,10 @@ def _load_data(reddit_dataset_version):
 def _preprocess(text):
     # removing leading and trailing whitespace characters
     text = text.strip()
+
+    # removing unwanted characters from start of text
+    text = text.strip('\\')
+
     # replacing hyperlinks with [link token]
     text = re.sub(pattern_hlinks,r"\1", text)
 
@@ -437,9 +451,20 @@ def _preprocess(text):
 
                 #so need to have regex code to compress words between two colons (with underscores)
     text = re.sub(pattern_emojis,"",text)
+    text = re.sub(pattern_txt_emojis,"", text)
+    # removing reddit qoutes
+    text = re.sub( pattern_qoutes, '', text )
+
+    # removing [deleted] and [removed] from texts
+    text  = re.sub( pattern_toremove,'',text)
+    text = re.sub( pattern_subreddits, r'\2',text)
+    # removing html codes
+    #text = re.sub( pattern_amp, '&', text )
+    text = html.unescape(text)
 
     # remove repeated words
     text = re.sub(pattern_repword, r'\1', text)
+
 
     #remove repeated periods
     text = re.sub(pattern_repdot, ".", text)
@@ -452,9 +477,6 @@ def _preprocess(text):
 
     # remove multiple spaces
     text = re.sub(pattern_multwspace, ' ', text)
-
-    # swapping &amp for and
-    text = re.sub( pattern_amp, 'and', text )
 
     # Possible ading questions marks to subsentences that start with a question word
     li_segmented_txt = sent_detector.tokenize(text)
@@ -483,7 +505,7 @@ def _valid_utterance(txt):
 
     # post_not_deleted = txt!="[deleted]"
 
-    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!="[deleted]" and txt!="removed" and txt!="deleted"
+    return (not txt.isspace()) and any( c.isalpha() for c in txt) 
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
     try:
@@ -611,7 +633,6 @@ def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
         
             #sequence of vectors, vector=logit score for each da class           
         
-
         [
             _dict.update({'li_da':li_da }) for _dict, li_da in 
             zip( li_thread_utterances, li_li_da)
@@ -653,7 +674,6 @@ def _tree_to_rst_code(_tree):
         # sublist of rst relation and nuclearity tag
         subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
         subli_rels_ns = [ [_li[0],''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
-
         li_rels_ns.extend(subli_rels_ns)
 
     # Getting List 3
@@ -705,10 +725,6 @@ def _tree_to_li_du(_tree, li_results=None):
 
         # otherwise segment to sentence
         li_segmented_utt = sent_detector.tokenize(li_du_str[idx])
-        # except  Exception as e:
-        #     print(type(li_du_str[idx]))
-        #     print(li_child)
-        #     raise Exception
 
         #If over two sentences long then perform the method again
         if len(li_segmented_utt) <= 2:            
@@ -717,9 +733,6 @@ def _tree_to_li_du(_tree, li_results=None):
         elif len(li_segmented_utt) > 2 :
             #try:
             _tree_to_li_du(li_child[idx], li_results ) 
-            # except Exception as e:
-            #     print(li_child[idx])
-            #     raise Exception
     
     return li_results
 
@@ -775,8 +788,10 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
     # pytextrank using entity linking when deciding important phrases, for entity coreferencing
 
     doc = nlp(str_utterance)
-    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases if p.rank>lowest_score ]
+    li_ranked_kws = [ [str(p.chunks[0]), p.rank] for p in doc._.phrases if p.rank>lowest_score ] #Take all bar the lowest score
 
+    if len(li_ranked_kws) == 0:
+        li_ranked_kws = [["",0.0]]
     return li_ranked_kws
         
 def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
@@ -796,8 +811,9 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_oper
     for subreddit, _li_utterances in grouped_li_utterances:
         subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
         
-        _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
-        
+        _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]        
+        #_li_utterances = [ { str(k):v for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
+
         #unlimited batch_size
         if batch_save_size < 0:
             files_ = os.listdir(subreddit_dir)
@@ -818,12 +834,11 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_oper
             
             keys = _li_utterances[0].keys()
             with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
-                dict_writer = csv.DictWriter(fn, keys)
+                dict_writer = csv.DictWriter(fn, keys, quoting=csv.QOUTE_MINIMAL,
+                    doublequote=False, escapechar=None )
                 dict_writer.writerows(_li_utterances)
             
             os.rename( old_fp, new_fp )
-
-        
 
             # Updating record of last batch operated on for each subreddit
             new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
@@ -837,6 +852,7 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_oper
 
         #limited batch save size - saving to existing file and any new files
         else:
+            raise NotImplementedError
             while len(_li_utterances)>0:
                 #todo: add os.rename to files that get appended to 
                 files_ = os.listdir(subreddit_dir)
@@ -888,9 +904,6 @@ class Timer():
         time_taken = self.end_time - self.start_time
         print(f"\t{segment_name} segment: {time_taken} secs")
             
-
-
-
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     

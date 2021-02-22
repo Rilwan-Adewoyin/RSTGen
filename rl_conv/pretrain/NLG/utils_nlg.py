@@ -40,7 +40,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
         output['tokenizer'] = AutoTokenizer.from_pretrained(_dir_transformer)
 
     if transformer == True:
-        output['transformer'] = AutoModel.from_pretrained(_dir_transformer)
+        output['transformer'] = GPT2LMHeadModel.from_pretrained(_dir_transformer)
     
     return output
 
@@ -77,4 +77,19 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
 
     return True    
 
+tree_order = {
+    ():0,
     
+    (0,):1,(1,):2,
+    
+    (0,0):3,(0,1):4,(1,0):5,(1,1):6,
+    
+    (0,0,0):7, (0,0,1):8,(0,1,0):9, (0,1,1):10,
+    (1,0,0):11, (1,0,1):12, (1,1,0):13, (1,1,1):14,
+    
+    (0,0,0,0):15, (0,0,0,1):16, (0,0,1,0):17, (0,0,1,1):18,
+    (0,1,0,0):19, (0,1,0,1):20, (0,1,1,0):21, (0,1,1,1):22,
+    (1,0,0,0):23, (1,0,0,1):24, (1,0,1,0):25, (1,0,1,1):26,
+    (1,1,0,0):27, (1,1,0,1):28, (1,1,1,0):29, (1,1,1,1):30,
+    
+    }
