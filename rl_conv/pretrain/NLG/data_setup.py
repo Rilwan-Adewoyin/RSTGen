@@ -878,7 +878,12 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
 
         # Updating record of last batch operated on for each subreddit
         new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
-        df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+        if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
+            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+        else:
+            df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
+            df_records.index.names = ['subreddit']
+
         df_records = df_records.append(new_record, ignore_index=False)
 
         for k,v in new_record.items():
