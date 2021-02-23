@@ -1349,15 +1349,7 @@ class NLG(nn.Module):
             shift_labels = input_['labels'][..., 1:].contiguous() 
             
             loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            
-            # Check labels are what they should be
-            mask = torch.where( shift_labels[0][0]>=0 )[0].long()
-            true_words = self.nlg_tokenizer.e2m_tokenizer.decode( shift_labels[0][0][ mask ] )
-            # Check softmax logit values predictions
-            logits_sample = shift_logits[0][mask,...]
-            pred_word_idxs = torch.argmax(logits_sample,axis=1)
-            pred_words =self.nlg_tokenizer.e2m_tokenizer.decode( pred_word_idxs )
-            
+                        
             return (lm_logits, loss) 
 
         else:
@@ -2179,7 +2171,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
-        parser.add_argument('-opt','--optimizer_type', default="AdamW",required=True, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
+        parser.add_argument('-opt','--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
         parser.add_argument('--inference_context_utt', default=4, type=int)
@@ -2264,7 +2256,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=4,
+            patience=6,
             verbose=False,
             mode='min'
         )
@@ -2274,6 +2266,8 @@ class TrainingModule(pl.LightningModule):
        
         if tparams['gpus'] in [0,1]:
             accelerator=None
+        else:
+            accelerator = 'ddp'
 
         
         if tparams['mode'] in ["train_new"]:
@@ -2290,7 +2284,7 @@ class TrainingModule(pl.LightningModule):
                         #limit_val_batches = 10,
                         #val_check_interval=0.5,
                         #track_grad_norm = True,
-                        overfit_batches=25,
+                        #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
                         )
@@ -2889,12 +2883,12 @@ if __name__ == '__main__':
 
 
 # dullduks server version 01 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 80 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
 # dullduks server version 02 - No Freezing, partial RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing partial rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
 
 # Corsari server version 03 - Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 1 -frstv 1 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1,3 python3 train_nlg.py -bs 300 -agb 1 --gpus 2 -fda 0 -fp 1 -frstv 1 --workers 8 --version 03 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "freezing partial rst" --base_model_name "distilgpt2"

@@ -239,6 +239,7 @@ class bAccuracy_macro(Metric):
         vals = torch.masked_select( vals, ~torch.isnan(vals) )
         
         return torch.mean(vals)
+
 class csi_macro(Metric):
     r"""Critical sucess index
         Computes `balanced Accuracy <https://en.wikipedia.org/wiki/Precision_and_recall>`_:
@@ -300,10 +301,11 @@ class csi_macro(Metric):
             dist_sync_fn=dist_sync_fn,
         )
 
-        self.add_state("correct_positive", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
-        self.add_state("correct_negative", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("tp", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("fn", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
 
-        self.add_state("positive_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+        self.add_state("fp", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
+
         self.add_state("negative_samples", default=torch.zeros([num_classes]), dist_reduce_fx="sum")
 
         self.threshold = threshold
@@ -327,9 +329,6 @@ class csi_macro(Metric):
         self.fn += torch.sum( torch.logical_and( ~correct, pos_mask), dim=[0] )
         self.fp +=torch.sum( torch.logical_and( ~correct, ~pos_mask), dim=[0] )
 
-
-        self.positive_samples += torch.sum( pos_mask, dim=[0])
-        self.negative_samples += torch.sum( ~pos_mask, dim=[0])
         
     def compute(self):
         """
@@ -339,11 +338,11 @@ class csi_macro(Metric):
         fn = self.fn.float()
         fp = self.fp.float()
 
-        vals = tp/(tp+fn+fp)
+        vals = (tp)/(tp+fn+fp)
         
         vals = torch.masked_select( vals, ~torch.isnan(vals) )
         
-        return torch.mean(vals)
+        return vals.mean()
 
 #alpha default = 0.25, gamma= 2
 class FocalLoss(nn.modules.loss._Loss):
@@ -386,7 +385,6 @@ class FocalLoss(nn.modules.loss._Loss):
             loss = loss.sum()
 
         return loss
-
 
 class RichardLoss(torch.nn.modules.loss._Loss):
 
@@ -457,39 +455,40 @@ class SoftFbetaLoss(torch.nn.modules.loss._Loss):
             # alpha is now the weighting for the negative values assuming
         self.register_buffer('beta', beta) # relative importance of recall compared to precision, #set above one to make recall more importance
 
-        self.register_buffer('epsilon', 1e-7)
+        self.register_buffer('epsilon', torch.FloatTensor([1e-3]) )
 
 
     def forward(self, input_: Tensor, target: Tensor) -> Tensor:
-
         #TODO: adapt for 0,1 target and 0,1 input
 
-        tp = (target * input_)
+        input_ = torch.sigmoid(input_)
+
+        tp = (target * input_).sum(dim=0)
 
         #tn = ((1 - target) * (1 - input_)) 
 
-        fp = ((1 - target) * input_)
+        fp = ((1 - target) * input_ ).sum(dim=0)
 
-        fn = (target * (1 - input_))
+        fn = (target * (1 - input_)).sum(dim=0)
         
         
-        precision = tp / (tp + fp + self.epsilon)
-        recall = tp / (tp + fn + self.epsilon)
+        # precision = tp / (tp + fp + self.epsilon)
+        # recall = tp / (tp + fn + self.epsilon)
         
-        f1 = (self.beta**2 + 1)* (precision*recall) / ( (self.beta**2)*precision + recall + self.epsilon)
+        #fb_loss = ( (self.beta**2 + 1)* (precision*recall) ) / ( (self.beta**2)*precision + recall + self.epsilon)
         
-        #applying class weightings
-        f1_loss = torch.where(torch.is_nan(f1_loss), 0.0, f1_loss )
-        f1_loss = f1_loss * self.class_weight
-        f1_loss = f1.clamp(min=self.epsilon, max=1-self.epsilon)
+        fb_loss = ( (self.beta**2 + 1)* (tp) ) / ( tp*(self.beta**2) + (self.beta**2)*fn + fp + self.epsilon )
+                
+        #fb_loss = torch.where(torch.isnan(fb_loss), 0.0, fb_loss )
+        
+        fb_loss = fb_loss.clamp(min=1e-3, max=1-1e-3)
                         
-        if self.reduction == "mean":
-            f1_loss = 1 - f1_loss.mean()
+        #if self.reduction == "mean":
+        fb_loss = ( (1 - fb_loss) ) # * self.class_weight )
 
-        elif self.reduction == "sum":
-            f1_loss = 1 - f1_loss.sum()
+        fb_loss = fb_loss.sum()
 
-        return f1_loss
+        return fb_loss
 
     
 
@@ -913,13 +912,9 @@ class TrainingModule(pl.LightningModule):
                     rl_alpha = None,
                     rl_beta = None,
                     rl_shift = None,
-                    sfb_alpha = None,
-                    sfb_beta = None,
-
+                    sfbl_beta = None,
 
                     accelerator='ddp',
-
-
                     max_length = 512,
                     mask_utterance=True,
                     tag='',
@@ -1051,11 +1046,16 @@ class TrainingModule(pl.LightningModule):
         
         # Saving training params and model params
         if self.mode in ['train_new']:
-            self.save_hyperparameters( self.model.return_params() )
-            self.save_hyperparameters( self.return_params() )
 
-            mparams = argparse.Namespace(**self.model.return_params())
-            tparams = argparse.Namespace(**self.return_params())
+            mparams=model.return_params()
+            tparams = self.return_params()
+
+
+            self.hparams = { **mparams, **tparams}
+            
+            mparams = argparse.Namespace(**mparams)
+            tparams = argparse.Namespace(**tparams)
+
 
             utils.save_version_params(tparams, mparams, kwargs.get('version_name'), self.subversion ) 
 
@@ -1686,7 +1686,7 @@ def main(tparams, mparams):
                         #val_check_interval = 0.5
                         #limit_val_batches = 1,
                         accelerator=tparams.accelerator,
-                        gradient_clip_val=0.5,
+                        #gradient_clip_val=0.5,
                         #track_grad_norm = True,
                         #,fast_dev_run=True, 
                         #log_gpu_memory=True
@@ -1859,7 +1859,15 @@ def main_tune(tparams, mparams, num_samples=int(1)):
 
     
     #Hypertuning Fbetaloss
-    sfbl_choices = round_dp( np.linspace(1.0, 3.0, 9).tolist(), 3)
+    # sfbl_choices = round_dp( np.linspace(1.0, 3.0, 5).tolist(), 3)
+    # config = {
+        
+    #     "sfbl_beta":tune.grid_search(sfbl_choices),
+        
+    # }
+
+    sfbl_choices = round_dp( np.linspace(0.25, 0.75, 2).tolist(), 2) + round_dp( np.linspace(3.5, 5., 2).tolist(), 3)
+    sfbl_choices =  [0.25, 0.75, 3.75, 5.0]
     config = {
         
         "sfbl_beta":tune.grid_search(sfbl_choices),
@@ -1868,15 +1876,15 @@ def main_tune(tparams, mparams, num_samples=int(1)):
 
 
 
-    name = "tune_danet_sfbl_1"
+    name = "tune_danet_sfbl_2"
     scheduler = ASHAScheduler(
-        max_t=10,
-        grace_period=3,
+        max_t=6,
+        grace_period=1,
         reduction_factor=2)
 
     reporter = CLIReporter(
         parameter_columns=list(config.keys()),
-        metric_columns=["loss", "bacc", "f1","training_iteration"]) #"val/rec_macro","val/prec_macro"])
+        metric_columns=["loss", "bacc", "f1", "csi","training_iteration"]) #"val/rec_macro","val/prec_macro"])
 
     #removing params to hypertune from tparams and mparams
     li_hypertune_params = list(config.keys())
@@ -1927,7 +1935,7 @@ def sample_vector(mu, spread, count=1):
 
 def tune_danet(config, tparams, mparams):
 
-    os.environ['NCCL_SOCKET_IFNAME'] =  'lo'
+    #os.environ['NCCL_SOCKET_IFNAME'] =  'lo'
     
     if 'bert_output' not in mparams:
         mparams['bert_output'] = config['bert_output']
@@ -1958,9 +1966,9 @@ def tune_danet(config, tparams, mparams):
         callbacks=[
             callback_tunerreport
         ],
-        overfit_batches=0.25,
+        overfit_batches=0.1,
         checkpoint_callback=False,
-        accelerator=None
+        #gradient_clip_val=2.0
         )
     
     trainer.fit(module)

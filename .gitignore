@@ -13,7 +13,7 @@ rl_conv/pretrain/DialogueAct/models/*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
 rl_conv/pretrain/DialogueAct/log
 rl_conv/pretrain/DialogueAct/cache/*
-
+rl_conv/pretrain/DialogueAct/cachedata
 #NLG
 rl_conv/pretrain/NLG/dataset/*
 rl_conv/pretrain/NLG/dataset_v2/*
