@@ -15,7 +15,9 @@ from convokit import Corpus, download
 import argparse
 import utils_nlg
 import random
-from train import TrainingModule, DaNet
+#from train import TrainingModule, DaNet
+TrainingModule=None
+DaNet=None
 import pytorch_lightning as pl
 import emoji
 from transformers import AutoTokenizer, AutoModel
@@ -222,7 +224,7 @@ def main(danet_vname,
     batches_completed = start_batch
 
     while len(li_id_dictconv) > 0 :
-
+        time.sleep(3)
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
         print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
@@ -445,7 +447,7 @@ def _load_data(reddit_dataset_version):
         corpus = Corpus(filename=download(subdir,
                             data_dir=full_path,use_local=use_local),
                             disable_type_check=True,
-                            merge_lines=True)
+                            merge_lines=False)
             
         corpus.print_summary_stats()
 
@@ -847,7 +849,7 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
         if len(files_)>0:
             fn = files_[0]
         else:
-            fn = "0000_0000000000"
+            fn = "0000_0000000000"           
             with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
                 dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
                 dict_writer.writeheader()
@@ -860,12 +862,19 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
         new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
         
         keys = _li_utterances[0].keys()
-        with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
-            dict_writer = csv.DictWriter(fn, keys, quoting=csv.QOUTE_MINIMAL,
-                doublequote=False, escapechar=None )
-            dict_writer.writerows(_li_utterances)
+
+        # with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
+        #     dict_writer = csv.DictWriter(fn, keys, quoting=csv.QUOTE_MINIMAL,
+        #         doublequote=False )
+        #     dict_writer.writerows(_li_utterances)
+
+        df_ = pd.read_csv(old_fp)
+        df_ = df_.append( _li_utterances, ignore_index=True, sort=False)
+        df_.to_csv( new_fp, index=False)
+
+        if os.path.exists(old_fp) and old_fp!=new_fp:
+            os.remove(old_fp)
         
-        os.rename( old_fp, new_fp )
 
         # Updating record of last batch operated on for each subreddit
         new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
