@@ -64,11 +64,9 @@ pattern_repword = re.compile(r'\b([\S]+)(\s+\1)+\b')
 pattern_repdot = re.compile(r'[\.]{2,}')
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
 pattern_multwspace = re.compile(r'[\s]{2,}')
-#pattern_emojis = re.compile(":[\S]{2,}:") #this is the pattern for emojis from the demojize
 pattern_emojis = re.compile(":[^_]+?(_){1}[\S]{2,}:") #this is the pattern for emojis from the demojize
 pattern_txt_emojis = re.compile(r'(?::|;|=)(?:-)?(?:\)|\(|D|P)')
 pattern_amp = re.compile("&(amp){1}")
-#pattern_toremove = re.compile("(\[deleted\]|\[removed\])")
 pattern_toremove = re.compile("(\[deleted\]|\[removed\]|EDIT:)")
 
 pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoutes 
@@ -100,12 +98,10 @@ r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,m
 
 def main(danet_vname,
             batch_process_size=20,
-            batch_save_size=-1,
             rst_method="feng-hirst",
             mp_count=5,
             start_batch=0,
             end_batch = 0,
-            mp_damodules =3,
             annotate_rst=True,
             annotate_da=True,
             annotate_topic= True,
@@ -116,7 +112,6 @@ def main(danet_vname,
     Args:
         danet_vname ([type]): [description]
         batch_process_size (int, optional): [description]. Defaults to 200.
-        batch_save_size (int, optional): [description]. Defaults to -1.
         rst_method (str, optional): [description]. Defaults to "feng-hirst".
     """
     
@@ -178,15 +173,50 @@ def main(danet_vname,
 
     #Creating Save directory
     if reddit_dataset_version == "small":
-        dir_save_dataset = utils_nlg.get_path("./dataset/reddit_small_annotated",_dir=True)
+        dir_save_dataset = utils_nlg.get_path("./dataset_v2/reddit_small_annotated",_dir=True)
     else: 
-        dir_save_dataset = utils_nlg.get_path("./dataset/reddit_large_annotated",_dir=True)
+        dir_save_dataset = utils_nlg.get_path("./dataset_v2/reddit_large_annotated",_dir=True)
 
     # setting up corpus data
     corpus = _load_data(reddit_dataset_version)
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
+    # Optionally auto-resuming from last completed batch
+    if start_batch = "-1":
+        # checking if df_records exists and if a column for this subreddit exists
+        fn = os.path.join(dir_save_dataset,'last_batch_record')
+        _bool_file_check = os.path.exists( fn )
+
+        auto_fnd_failed = lambda : print("User choose auto-resume from last recorded batch. \
+                    But no last records exists, so initialising from batch 0")
+
+        if not _bool_file_check: #s if file exist
+            start_batch = 0
+            auto_fnd_failed()
+            
+        else: #if file does not exists
+            df_records = pd.from_csv( fn, index_col = "subreddit" )
+            _bool_record_check = reddit_dataset_version in df_records.index.tolist()
+
+            if not _bool_record_check:
+                start_batch = 0
+            
+            else:
+                start_batch = df_records.loc[ subreddit, 'last_batch' ] + 1
+                batch_process_size = df_records.loc[subreddit, 'batch_process_size']
+        
+
+
+
+            
+
+
+
+
+
+    
+    # selecting sub batch to operate on if applicable
     if end_batch != 0:
         li_id_dictconv = li_id_dictconv[ : end_batch*batch_process_size] 
     if start_batch != 0:
@@ -364,7 +394,7 @@ def main(danet_vname,
         timer.start()
             # format = subreddit/convo_code
         li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
-        _save_data(li_utterances, batch_save_size, dir_save_dataset, batches_completed, batch_process_size )
+        _save_data(li_utterances, dir_save_dataset, batches_completed, batch_process_size )
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
@@ -392,15 +422,31 @@ def _load_data(reddit_dataset_version):
     
     else:
 
-        #_list_options = [ 'CasualConversation','relationship_advice','interestingasfuck','science' ]
-        #_list = ['interestingasfuck']
-        #_list = ['science' ] #,'interestingasfuck','penpals','science'] 
-            #'relationship_advice' (9,995,066,31 bytes)
-            # CasualConversation 735,386,980
-            # interestingasfuck 354770199
-            # penpals 35372354
-        
-        #for idx, subreddit in enumerate( _list ):
+        # _list_options = [CasualConversation,
+        #                     relationship_advice,
+        #                     interestingasfuck,
+        #                     science,
+
+        #                     ChangeMyView,
+        #                     PoliticalDiscussion,
+        #                     DebateReligion,
+        #                     PersonalFinance,
+        #                     TrueGaming,
+        #                     Relationships,
+
+        #                     Music,
+        #                     worldnews,
+        #                     todayilearned,
+        #                     movies,
+        #                     Showerthoughts,
+        #                     askscience,
+        #                     LifeProTips,
+        #                     explainlikeimfive,
+        #                     DIY,
+        #                     sports,
+        #                     anime,
+        #                       "IamA"]
+
         subdir = f"subreddit-{reddit_dataset_version}"
 
         full_path = os.path.join(_dir_path,subdir)
@@ -458,13 +504,12 @@ def _preprocess(text):
     # removing [deleted] and [removed] from texts
     text  = re.sub( pattern_toremove,'',text)
     text = re.sub( pattern_subreddits, r'\2',text)
+    
     # removing html codes
-    #text = re.sub( pattern_amp, '&', text )
     text = html.unescape(text)
 
     # remove repeated words
     text = re.sub(pattern_repword, r'\1', text)
-
 
     #remove repeated periods
     text = re.sub(pattern_repdot, ".", text)
@@ -504,6 +549,8 @@ def _valid_utterance(txt):
     # contains_alphabet = any( c.isalpha() for c in txt)
 
     # post_not_deleted = txt!="[deleted]"
+
+    # checking
 
     return (not txt.isspace()) and any( c.isalpha() for c in txt) 
 
@@ -792,18 +839,18 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
 
     if len(li_ranked_kws) == 0:
         li_ranked_kws = [["",0.0]]
+
     return li_ranked_kws
         
-def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
+def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
     
     # Split list of utterances by the subreddit name
     # Then for each sublist
         # Get directory save name
         # Get the last saved csv file in directory
         # (fn-format = file_number_utterances in file )
-            #if line count less than batch_save_size, then append more lines
-            #otherwise make new file 
-
+            # then append more lines
+            
     # Grouping utterances by the subreddit 
     grouped_li_utterances = [ ( k, list(g)) for k,g in itertools.groupby(li_utterances, lambda _dict: _dict['subreddit'] ) ]
         #a list of tuples; elem0: subreddit name elem1: list of convos for that subreddit
@@ -815,78 +862,41 @@ def _save_data(li_utterances, batch_save_size, dir_save_dataset, last_batch_oper
         #_li_utterances = [ { str(k):v for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
 
         #unlimited batch_size
-        if batch_save_size < 0:
-            files_ = os.listdir(subreddit_dir)
-            if len(files_)>0:
-                fn = files_[0]
-            else:
-                fn = "0000_0000000000"
-                with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
-                    dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
-                    dict_writer.writeheader()
-                    pass
-            
-            curr_len = int(fn[-10:])
-            new_len = curr_len + len(_li_utterances)
-
-            old_fp = os.path.join(subreddit_dir,fn)
-            new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
-            
-            keys = _li_utterances[0].keys()
-            with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
-                dict_writer = csv.DictWriter(fn, keys, quoting=csv.QOUTE_MINIMAL,
-                    doublequote=False, escapechar=None )
-                dict_writer.writerows(_li_utterances)
-            
-            os.rename( old_fp, new_fp )
-
-            # Updating record of last batch operated on for each subreddit
-            new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
-            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
-            df_records = df_records.append(new_record, ignore_index=False)
-
-            for k,v in new_record.items():
-                df_records.loc[ subreddit, [k] ] =  k
-
-            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
-
-        #limited batch save size - saving to existing file and any new files
+    
+        files_ = os.listdir(subreddit_dir)
+        if len(files_)>0:
+            fn = files_[0]
         else:
-            raise NotImplementedError
-            while len(_li_utterances)>0:
-                #todo: add os.rename to files that get appended to 
-                files_ = os.listdir(subreddit_dir)
+            fn = "0000_0000000000"
+            with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
+                dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
+                dict_writer.writeheader()
+                pass
+        
+        curr_len = int(fn[-10:])
+        new_len = curr_len + len(_li_utterances)
 
-                #most recent filename saved to
-                last_fn = max( files_, key=int(fn[:4]) , default=f"0000_0000000000.csv")
+        old_fp = os.path.join(subreddit_dir,fn)
+        new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
+        
+        keys = _li_utterances[0].keys()
+        with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
+            dict_writer = csv.DictWriter(fn, keys, quoting=csv.QOUTE_MINIMAL,
+                doublequote=False, escapechar=None )
+            dict_writer.writerows(_li_utterances)
+        
+        os.rename( old_fp, new_fp )
 
-                # checking whether file is full
-                utt_count_in_last_file = int(last_fn[-10:])
-                
-                # extracting contents for file to add to
-                max_utt_to_add = batch_save_size - utt_count_in_last_file
-                
-                # making newer empty file then skipping to next round of loop
-                if max_utt_to_add == 0:
-                    fn = f"{int(last_fn[:4])+1:04d}_0000.csv"
-                    fp = os.path.join(subreddit_dir, fn )
-                    with open(fp,"a+", newline='\n',encoding='utf-8') as _f:
-                        pass
-                    continue
-                # or saving a chunk of li_utterances and moving on
-                else:
-                    li_utt_to_save = li_utterances[:max_utt_to_add]
-                    li_utterances = li_utterances[max_utt_to_add:]
-                    
+        # Updating record of last batch operated on for each subreddit
+        new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
+        df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+        df_records = df_records.append(new_record, ignore_index=False)
 
-                    # defining new filename
-                    fp = os.path.join(subreddit_dir, max_fn )
-                    keys = li_utterances[0].keys()
-                    with open(fp,"a+", newline='') as _f:
-                        dict_writer = csv.DictWriter(_f, keys)
-                        dict_writer.writeheader()
-                        dict_writer.writerows(li_utterances)
-                
+        for k,v in new_record.items():
+            df_records.loc[ subreddit, [k] ] =  v
+
+        df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
+
             
 class Timer():
     def __init__(self):
@@ -915,21 +925,18 @@ if __name__ == '__main__':
     
     parser.add_argument('-bps','--batch_process_size', default=120,
         help='',type=int)        
-
-    parser.add_argument('--batch_save_size', default=-1,
-        help='',type=int)        
+   
 
     parser.add_argument('--rst_method', default="feng-hirst",
         choices=['feng-hirst','akanni-rst'], type=str)
 
     parser.add_argument('--mp_count', default=6,
         type=int)
-
-    parser.add_argument('-sb','--start_batch', default=0, type=int)
+    
+    parser.add_argument('-sb','--start_batch', default=0, type=int, help="batch of data to start from. Pass \
+                                    in -1 for this batch to be autodetermined from records" )
 
     parser.add_argument('-eb','--end_batch', default=0, type=int, help="Final batch to finish on. Set to 0 to run until end")
-
-    parser.add_argument('--mp_damodules', default=3, type=int)
 
     parser.add_argument('-ad','--annotate_da',default=True, type=lambda x: bool(int(x)) )
 
@@ -938,15 +945,37 @@ if __name__ == '__main__':
 
     parser.add_argument('-at','--annotate_topic',default=True, type=lambda x: bool(int(x)) )
 
-    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=['small','CasualConversation','relationship_advice','interestingasfuck','science'])
+    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=["CasualConversation",
+                                                                        "relationship_advice",
+                                                                        "interestingasfuck",
+                                                                        "science",
+
+                                                                        "ChangeMyView",
+                                                                        "PoliticalDiscussion",
+                                                                        "DebateReligion",
+                                                                        "PersonalFinance",
+                                                                        "TrueGaming",
+                                                                        "Relationships",
+
+                                                                        "Music",
+                                                                        "worldnews",
+                                                                        "todayilearned",
+                                                                        "movies",
+                                                                        "Showerthoughts",
+                                                                        "askscience",
+                                                                        "LifeProTips",
+                                                                        "explainlikeimfive",
+                                                                        "DIY",
+                                                                        "sports",
+                                                                        "anime",
+                                                                        "IamA"])
 
     args = parser.parse_args()
     
     dict_args = vars(args)
 
     completed = False
-    #set_start_method('spawn')
-
+    
     while completed == False:
         try:
             main( **dict_args )
@@ -957,22 +986,11 @@ if __name__ == '__main__':
             dict_args['start_batch'] = batches_completed + 1
             
         finally :
-            #cmd = "docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & docker rmi $(docker images -a -q)"
             cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
             os.system(cmd)
-            time.sleep(5)
+            time.sleep(3)
             os.system(cmd)
-            time.sleep(5)
+            time.sleep(3)
 
-    #last bacth = 105
 
-#CUDA_VISIBLE_DEVICES= python3 data_setup.py -bps 120 --mp_count 16 --danet_vname DaNet_v008
-
-#-sb 0 -eb 127    
-#-sb 1400 -eb 1410
-#-sb 1800 -eb 2100 
-
-#python3 data_setup.py -bps 120 -ad 0 -rdv CasualConversation -sb  -eb 3000 --mp_count 2 
-#3675 #python3 data_setup.py -bps 120 -ad 0 -rdv relationship_advice -sb  0 -eb 1500 --mp_count 2
-#1604 #python3 data_setup.py -bps 120 -ad 0 -rdv interestingasfuck -sb 500 -eb 1500 --mp_count 2
-#python3 data_setup.py -bps 120 -ad 0 -rdv science -sb 2101 -eb 2137 --mp_count 2
+#python3 data_setup.py -bps 120 -ad -1 -rdv CasualConversation -sb "auto" --mp_count 2 

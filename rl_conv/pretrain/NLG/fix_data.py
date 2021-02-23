@@ -20,7 +20,6 @@ sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
 #pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoutes 
 pattern_qoutes = re.compile("andgt;")
 pattern_deleted = re.compile("(\[deleted\]|\[removed\]|EDIT:)")
-pattern_edu = re.compile("[,\-!?:.]+")
 pattern_txt_emojis = re.compile(r'(?::|;|=)(?:-)?(?:\)|\(|D|P)')
 pattern_subreddits = re.compile(r"(/??r/)([^/]+)")
 #endregion
@@ -78,7 +77,6 @@ def process_and_save( fp, new_fp, fix_ds=True, gen_long_ds=True, gen_long_dir=No
         os.makedirs( os.path.dirname(fps_long2), exist_ok=True)
 
         #saving texts that have at least two sentences, distinguished using markers such as full stop
-        #_ = [ re.split( pattern_edu, txt) for txt in data.txt_preproc.values.tolist() ]
         _ = [ sent_detector.tokenize(txt)  for txt in data.txt_preproc.values.tolist() ]
         bol_mask_long2 = [ len(split_text)>1 for split_text in _ ] #utterances with more than 2 subsections
         
@@ -140,7 +138,6 @@ def process_row(datum):
         li_txt_score[0] = re.sub(pattern_subreddits, r'\2', li_txt_score[0])
     
     if len(topic_textrank) == 0:
-        entry = ['',0.0]
         topic_textrank = [ ['',0.0] ]
 
     datum['topic_textrank'] = json.dumps(topic_textrank)
