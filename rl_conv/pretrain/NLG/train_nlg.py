@@ -4,7 +4,7 @@ import os
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
 #os.environ["NCCL_P2P_LEVEL"] = "3"
 #os.environ['NCCL_P2P_DISABLE'] = '1'
-#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
 #os.environ['CUDA_LAUNCH_BLOCKING']="1"
 
 import torch
@@ -2304,7 +2304,7 @@ class TrainingModule(pl.LightningModule):
                     #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
                     #limit_train_batches = 0.4,
-                    val_check_interval=0.5,
+                    #val_check_interval=0.5,
                     #limit_val_batches = ,
                     #track_grad_norm = True,
                     #overfit_batches=5
@@ -2882,13 +2882,20 @@ if __name__ == '__main__':
     main(vars(tparams), vars(mparams))
 
 
-# dullduks server version 01 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 01 --precision 16 --mode train_new -lr 4e-4 -me 80 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# dullduks server version 1 - No Freezing, Full RST
+
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 1 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 11 --precision 16 --mode train_new -lr 1e-5 -me 60 -mil 160 --tag "no freezing full rst, lower learning rate" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
+
+
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
-# dullduks server version 02 - No Freezing, partial RST
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 02 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing partial rst" --base_model_name "distilgpt2"
+
+# dullduks server version 2 - No Freezing, partial RST
+# CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 2 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 1660 --tag "no freezing partial rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
 
-# Corsari server version 03 - Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=1,3 python3 train_nlg.py -bs 300 -agb 1 --gpus 2 -fda 0 -fp 1 -frstv 1 --workers 8 --version 03 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "freezing partial rst" --base_model_name "distilgpt2"
+# version 3 - Freezing, Full RSTa
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_nlg.py -bs 40 -agb 2 --gpus 2 -fda 0 -fp 1 -frstv 1 --workers 8 --version 3 --precision 16 --mode train_new -lr 1e-5 -me 80 -mil 160 --tag "freezing, full rst" --base_model_name "distilgpt2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 1 -frstv 1 --workers 8 --version 31 --precision 16 --mode train_new -lr 1e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, dataset with sentences with two sections" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
