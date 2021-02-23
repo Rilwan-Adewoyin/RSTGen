@@ -62,7 +62,7 @@ dict_args = {}
 pattern_hlinks =  re.compile("(\[?[\S ]*\]?)(\((https|www|ftp|http)?[\S]+\))")
 pattern_hlinks2 =  re.compile("([\(]?(https|www|ftp|http){1}[\S]+)")
 pattern_repword = re.compile(r'\b([\S]+)(\s+\1)+\b')
-pattern_repdot = re.compile(r'[\.]{2,}')
+pattern_reppunc = re.compile( r'([\.!?])\1+' )
 pattern_qdab = re.compile("[\"\-\*\[\]]+")
 pattern_multwspace = re.compile(r'[\s]{2,}')
 pattern_emojis = re.compile(":[^_]+?(_){1}[\S]{2,}:") #this is the pattern for emojis from the demojize
@@ -189,8 +189,8 @@ def main(danet_vname,
         fn = os.path.join(dir_save_dataset,'last_batch_record')
         _bool_file_check = os.path.exists( fn )
 
-        auto_fnd_failed = lambda : print("User choose auto-resume from last recorded batch. \
-                    But no last records exists, so initialising from batch 0")
+        auto_fnd_failed = lambda : print("User choose auto-resume from last recorded batch.\
+            But no last records exists, so initialising from batch 0")
 
         if not _bool_file_check: #s if file exist
             start_batch = 0
@@ -444,8 +444,8 @@ def _load_data(reddit_dataset_version):
 
         corpus = Corpus(filename=download(subdir,
                             data_dir=full_path,use_local=use_local),
-
-                            merge_lines=False)
+                            disable_type_check=True,
+                            merge_lines=True)
             
         corpus.print_summary_stats()
 
@@ -492,7 +492,7 @@ def _preprocess(text):
     text = re.sub(pattern_repword, r'\1', text)
 
     #remove repeated periods
-    text = re.sub(pattern_repdot, ".", text)
+    text = re.sub(pattern_reppunc, r"\1", text)
 
     # convert to ascii
     text = text.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "")
