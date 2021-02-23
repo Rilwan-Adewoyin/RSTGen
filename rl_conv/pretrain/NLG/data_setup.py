@@ -184,7 +184,7 @@ def main(danet_vname,
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
     # Optionally auto-resuming from last completed batch
-    if start_batch == "-1":
+    if start_batch == -1:
         # checking if df_records exists and if a column for this subreddit exists
         fn = os.path.join(dir_save_dataset,'last_batch_record')
         _bool_file_check = os.path.exists( fn )
@@ -448,7 +448,6 @@ def _load_data(reddit_dataset_version):
                             merge_lines=False)
             
         corpus.print_summary_stats()
-
 
     return corpus
 
@@ -974,4 +973,4 @@ if __name__ == '__main__':
             time.sleep(3)
 
 
-#python3 data_setup.py -bps 120 -ad -0 -rdv CasualConversation -sb -1 --mp_count 6 
+#python3 data_setup.py -bps 120 -ad 0 -rdv CasualConversation -sb -1 --mp_count 6 
