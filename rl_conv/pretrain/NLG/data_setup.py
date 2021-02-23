@@ -33,8 +33,9 @@ import en_core_web_sm
 sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
     #install using python -m spacy download en_core_web_sm
 nlp = en_core_web_sm.load()
-tr = pytextrank.TextRank()
-nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
+#tr = pytextrank.TextRank()
+#nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
+nlp.add_pipe("textrank", last=True)
 
 import csv
 import pickle
@@ -67,7 +68,7 @@ pattern_multwspace = re.compile(r'[\s]{2,}')
 pattern_emojis = re.compile(":[^_]+?(_){1}[\S]{2,}:") #this is the pattern for emojis from the demojize
 pattern_txt_emojis = re.compile(r'(?::|;|=)(?:-)?(?:\)|\(|D|P)')
 pattern_amp = re.compile("&(amp){1}")
-pattern_toremove = re.compile("(\[deleted\]|\[removed\]|EDIT:)")
+pattern_toremove = re.compile("(\[deleted\]|\[removed\]|EDIT:|Edit:)")
 
 pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoutes 
 pattern_subreddits = re.compile(r"(/??r/)([^/]+)")
@@ -144,7 +145,7 @@ def main(danet_vname,
 
     # setting up docker image for rst
         #Platform dependent way to start docker
-        # linux: If an error in next line, changeother "other" permission on /var/run/docker.sock to read write execute chmod o=7 /var/run/docker.sock
+        # linux: If an error in next line, changeother "other" permission on /var/run/docker.sock to read write execute : chmod o+rwx /var/run/docker.sock
     if annotate_rst == True:
         try:
             client = docker.from_env(timeout=int(60*3))
@@ -183,7 +184,7 @@ def main(danet_vname,
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
     # Optionally auto-resuming from last completed batch
-    if start_batch = "-1":
+    if start_batch == "-1":
         # checking if df_records exists and if a column for this subreddit exists
         fn = os.path.join(dir_save_dataset,'last_batch_record')
         _bool_file_check = os.path.exists( fn )
@@ -206,16 +207,6 @@ def main(danet_vname,
                 start_batch = df_records.loc[ subreddit, 'last_batch' ] + 1
                 batch_process_size = df_records.loc[subreddit, 'batch_process_size']
         
-
-
-
-            
-
-
-
-
-
-    
     # selecting sub batch to operate on if applicable
     if end_batch != 0:
         li_id_dictconv = li_id_dictconv[ : end_batch*batch_process_size] 
@@ -407,14 +398,12 @@ def main(danet_vname,
 def _load_data(reddit_dataset_version):
     # Donwload reddit-corpus-small if it doesnt exist
     if reddit_dataset_version == 'small':
-        _dir_path = utils_nlg.get_path("./dataset/reddit_small")
+        _dir_path = utils_nlg.get_path("./dataset_v2/reddit_small")
     
     else:
-        _dir_path = utils_nlg.get_path("./dataset/reddit_large")
+        _dir_path = utils_nlg.get_path("./dataset_v2/reddit_large")
 
     os.makedirs(_dir_path, exist_ok=True)
-
-
 
     if reddit_dataset_version == 'small':
         use_local = os.path.exists(_dir_path)
@@ -453,21 +442,13 @@ def _load_data(reddit_dataset_version):
         use_local = os.path.exists(full_path)
         print(full_path)
 
-        corpus = Corpus(filename=download(f"subreddit-{reddit_dataset_version}",
+        corpus = Corpus(filename=download(subdir,
                             data_dir=full_path,use_local=use_local),
+
                             merge_lines=False)
             
         corpus.print_summary_stats()
 
-        #     if idx == 0:
-        #         merged_corpus = _corpus
-        #     else:
-        #         merged_corpus.merge(_corpus,warnings=False)
-
-        # corpus = merged_corpus
-    
-    print('\n')
-    corpus.print_summary_stats()
 
     return corpus
 
@@ -830,8 +811,8 @@ def _rake_kw_extractor(str_utterance, lowest_score=0.0):
 
 def _textrank_extractor(str_utterance, lowest_score=0.0):
     # Add the below to docker file
-    # os.system(') install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.1.0/en_core_web_sm-2.1.0.tar.gz')
-    # os.system python -m spacy download en_core_web_sm
+    # os.system('install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.1.0/en_core_web_sm-2.1.0.tar.gz')
+    # os.system(' python -m spacy download en_core_web_sm ')
     # pytextrank using entity linking when deciding important phrases, for entity coreferencing
 
     doc = nlp(str_utterance)
@@ -993,4 +974,4 @@ if __name__ == '__main__':
             time.sleep(3)
 
 
-#python3 data_setup.py -bps 120 -ad -1 -rdv CasualConversation -sb "auto" --mp_count 2 
+#python3 data_setup.py -bps 120 -ad -0 -rdv CasualConversation -sb -1 --mp_count 6 
