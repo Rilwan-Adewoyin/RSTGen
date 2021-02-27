@@ -884,7 +884,7 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
             df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
             df_records.index.names = ['subreddit']
 
-        df_records = df_records.append(new_record, ignore_index=False)
+        df_records = df_records.append(new_record, ignore_index=True)
 
         for k,v in new_record.items():
             df_records.loc[ subreddit, [k] ] =  v
@@ -944,7 +944,7 @@ if __name__ == '__main__':
                                                                         "interestingasfuck",
                                                                         "science",
 
-                                                                        "ChangeMyView",
+                                                                        "changemyview",
                                                                         "PoliticalDiscussion",
                                                                         "DebateReligion",
                                                                         "PersonalFinance",
@@ -987,4 +987,6 @@ if __name__ == '__main__':
             time.sleep(3)
 
 
-#python3 data_setup.py -bps 120 -ad 0 -rdv CasualConversation -sb -1 --mp_count 6 
+#python3 data_setup.py -bps 60 -ad 0 -rdv CasualConversation -sb -1 --mp_count 6 
+
+# python3 data_setup.py -bps 60 -ad 0 -rdv changemyview -sb 0 --mp_count 2
