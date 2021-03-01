@@ -373,8 +373,8 @@ class NLG(nn.Module):
         base_model_name= 'distilgpt2', model_name="NLG",
         reset_base_transformer=True,
         fda=False, frst=True, ftopic=True, frst_version=0,
-        max_input_len=264 , 
-        freeze_pretrained=0,**kwargs ):
+        max_input_len=264 , freeze_pretrained=0,
+        scale_grad_by_freq=False, **kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
         super(NLG, self).__init__()
         
@@ -386,6 +386,7 @@ class NLG(nn.Module):
         self.frst = frst
         self.ftopic = ftopic
         self.frst_version = frst_version
+        self.scale_grad_by_freq = scale_grad_by_freq
 
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
@@ -411,15 +412,16 @@ class NLG(nn.Module):
             self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1, bias=False )
             self.embedding_das.weight.data.normal_(mean=0.0, std=0.005) #use smaller start variance to minimize init impact of new info
         
+
         if self.frst:
-            self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ) )
+            self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
             self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.005)
 
         if self.frst_version == 1:
-            self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ) )
+            self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ),scale_grad_by_freq=self.scale_grad_by_freq )
             self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.005)
 
-            self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenizer.rst_pos_maxidx + 1 + 1 , self.embd_outp_dim, padding_idx=self.nlg_tokenizer.rst_pos_maxidx + 1  )
+            self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenizer.rst_pos_maxidx + 1 + 1 , self.embd_outp_dim, padding_idx=self.nlg_tokenizer.rst_pos_maxidx + 1 , scale_grad_by_freq=self.scale_grad_by_freq )
             self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
 
         if self.ftopic:
@@ -427,7 +429,7 @@ class NLG(nn.Module):
             self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.005)
 
     
-        self.token_type_embeddings = torch.nn.Embedding( special_token_count + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim) #The maximum value this can take is based on the different types of input
+        self.token_type_embeddings = torch.nn.Embedding( special_token_count + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim, scale_grad_by_freq=self.scale_grad_by_freq) #The maximum value this can take is based on the different types of input
         self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.005)
         # 1 for each of da, rst and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
         #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
@@ -1303,6 +1305,8 @@ class NLG(nn.Module):
         parser.add_argument( '-ftopic' ,'--ftopic', type= lambda x: bool(int(x) )
              ,help="whether or not to include topic info in feature", default=True  )
 
+        parser.add_argument('-cl','--context_len',type= lambda x: json.loads(x) )
+
         parser.add_argument( '-frstv' ,'--frst_version', type= int, choices=[0,1] 
              ,help="which version of frst to use", default=0  ) 
              #version 0, only uses the relations
@@ -1311,6 +1315,8 @@ class NLG(nn.Module):
         
         parser.add_argument('-mil','--max_input_len', type=int, default=264)
         
+        parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=False, 
+                help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         mparams = parser.parse_known_args( )[0]
        
         return mparams
@@ -1485,15 +1491,21 @@ class NLG(nn.Module):
         return input_
 
     def return_params(self):
-        params = {}
+        keys = ['base_model_name','freeze_pretrained','max_input_len',
+                        'fda','frst','ftopic','frst_version','scale_grad_by_freq']
 
-        params['base_model_name'] = self.base_model_name
-        params['freeze_pretrained'] = self.freeze_pretrained
-        params['max_input_len'] = self.nlg_tokenizer.max_input_len
-        params['fda'] = self.fda
-        params['frst'] = self.frst
-        params['ftopic'] = self.ftopic
-        params['frst_version'] = self.frst_version
+        json_keys = ['context_len']
+        
+        params = {
+            k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
+        }
+
+        json_params = {
+            k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.__dict__.keys()
+        }
+
+        params = {**params, **json_params}
+        
 
         return params
 
@@ -1583,10 +1595,10 @@ class NLG_tokenizer():
 
         # Setting up context lengths
         if self.fda and self.frst and self.ftopic:
-            self.context_len = { 'da':2, 'rst':6, 'topics':20 } #add this to config
+            self.context_len = kwargs.get( 'context_len' , { 'da':2, 'rst':6, 'topics':20 } ) #add this to config
         
         elif self.fda==False and self.frst and self.ftopic:
-            self.context_len = { 'rst':6, 'topics':16 } #add this to config
+            self.context_len = kwargs.get( 'context_len', { 'rst':6, 'topics':16 } ) #add this to config )
         
         self.context_len_pre_utterance =  sum(self.context_len.values())
 
@@ -2131,7 +2143,7 @@ class TrainingModule(pl.LightningModule):
 
             self.hparams = { **train_params_to_save, **model_params_to_save}
 
-            self.inference_samples = list( islice( self.inference_dl, 5 ) )
+            self.inference_samples = list( islice( self.inference_dl, 10 ) )
             bad_words = ["<|rst|>","<|ta|>",r"\n" ] 
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
@@ -2204,7 +2216,7 @@ class TrainingModule(pl.LightningModule):
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len',
-                    'frst_version']} )
+                    'frst_version','scale_grad_by_freq']} )
             
             else:
                 print("param files not found utilsing default or user entered params\n")
@@ -2256,7 +2268,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=6,
+            patience=8,
             verbose=False,
             mode='min'
         )
@@ -2282,7 +2294,7 @@ class TrainingModule(pl.LightningModule):
                         accelerator=accelerator,
                         #limit_train_batches =10,
                         #limit_val_batches = 10,
-                        #val_check_interval=0.5,
+                        val_check_interval=0.4,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -2306,6 +2318,7 @@ class TrainingModule(pl.LightningModule):
                     #limit_train_batches = 0.4,
                     #val_check_interval=0.5,
                     #limit_val_batches = ,
+                    val_check_interval=0.4,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
@@ -2490,7 +2503,7 @@ class TrainingModule(pl.LightningModule):
                     utterance = encoded_input.pop('orig_utt')
                     #utterance = self.nlg_tokenizer.e2m_tokenizer.decode( 
                     
-                    datum = { 'epoch': -1,
+                    datum = { 'val_round': -1,
                                 'rst_rels': sum( rst_rels, ()),
                                 "topics": sum( topics, () ),
                                 "utterance":utterance[0] }
@@ -2514,7 +2527,7 @@ class TrainingModule(pl.LightningModule):
                 decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
                                     skip_special_tokens=False)
                 datum = {
-                    'epoch':self.trainer.current_epoch,
+                    'val_round':df['val_round'].max()+1,
                     'rst_rels': '',
                     'topics':'',
                     'utterance':json.dumps(decoded_text) }
@@ -2631,7 +2644,7 @@ class DataLoaderGenerator():
             train_dl = self.prepare_dataloader(self.dir_data, shuffle=True, split_name='train' )
             val_dl = self.prepare_dataloader(self.dir_data, shuffle=False,split_name='val'  )
             test_dl = self.prepare_dataloader(self.dir_data, shuffle=False,split_name='test'  )
-            inference_dl = self.prepare_dataloader(self.dir_data, shuffle=False, split_name="inference")
+            inference_dl = self.prepare_dataloader(self.dir_data, shuffle=True, split_name="inference")
         
         elif self.mode in ['test']:
             train_dl= None
@@ -2729,14 +2742,23 @@ class SingleDataset(torch.utils.data.Dataset):
             
                 self.data = pd.read_csv(file_path, sep=',', header=0, 
                     skiprows=skiprows, nrows=(self.line_end-self.line_start) )
-            
+
             else: 
                 names = open(file_path,"r").readline().strip().split(',')
                             
                 self.data = pd.read_csv(file_path, sep=',', 
                     names=names, skiprows=skiprows,
                     nrows=(self.line_end-self.line_start) )
-                    
+        
+        #A quick patch to handle case where annotated_fixed dataset is used
+        # some utterance entries are empty and cause errors
+        if "large_annotated_fixed" in self.fp:
+            self.data = self.data.dropna()
+            self.data = self.data[self.data['txt_preproc'].map(lambda x: len(str(x)) > 10)]
+            self.line_end = self.line_start + len(self.data.index)
+
+            
+
     def __len__(self):
         return (self.line_end - self.line_start)
     
@@ -2887,7 +2909,8 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 1 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 11 --precision 16 --mode train_new -lr 1e-5 -me 60 -mil 160 --tag "no freezing full rst, lower learning rate" --base_model_name "distilgpt2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
-
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
@@ -2896,6 +2919,8 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 2 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 1660 --tag "no freezing partial rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
 
-# version 3 - Freezing, Full RSTa
+# version 3 - Freezing, Full RST
 # CUDA_VISIBLE_DEVICES=1,2 python3 train_nlg.py -bs 40 -agb 2 --gpus 2 -fda 0 -fp 1 -frstv 1 --workers 8 --version 3 --precision 16 --mode train_new -lr 1e-5 -me 80 -mil 160 --tag "freezing, full rst" --base_model_name "distilgpt2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 1 -frstv 1 --workers 8 --version 31 --precision 16 --mode train_new -lr 1e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, dataset with sentences with two sections" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 1 -frstv 1 -sgbf 0 --workers 4 --version 32 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 1 -frstv 1 -sgbf 1 --workers 4 --version 33 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset, inverse_freq_grad to embedding" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"

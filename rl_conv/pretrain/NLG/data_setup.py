@@ -206,8 +206,8 @@ def main(danet_vname,
                 start_batch = 0
             
             else:
-                start_batch = df_records.loc[ subreddit, 'last_batch' ] + 1
-                batch_process_size = df_records.loc[subreddit, 'batch_process_size']
+                start_batch = int( df_records.loc[ subreddit, 'last_batch' ] ) + 1
+                batch_process_size = int( df_records.loc[subreddit, 'batch_process_size'] )
         
     # selecting sub batch to operate on if applicable
     if end_batch != 0:
@@ -702,7 +702,8 @@ def _tree_to_rst_code(_tree):
         
         # sublist of rst relation and nuclearity tag
         subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
-        subli_rels_ns = [ [_li[0],''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
+        subli_rels_ns = [ [ _li[0], ''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
+
         li_rels_ns.extend(subli_rels_ns)
 
     # Getting List 3
@@ -884,7 +885,7 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
             df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
             df_records.index.names = ['subreddit']
 
-        df_records = df_records.append(new_record, ignore_index=True)
+        #df_records = df_records.append(new_record, ignore_index=True)
 
         for k,v in new_record.items():
             df_records.loc[ subreddit, [k] ] =  v
@@ -980,13 +981,16 @@ if __name__ == '__main__':
             dict_args['start_batch'] = batches_completed + 1
             
         finally :
-            cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
-            os.system(cmd)
-            time.sleep(3)
-            os.system(cmd)
-            time.sleep(3)
+            # cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
+            # os.system(cmd)
+            # time.sleep(3)
+            # os.system(cmd)
+            # time.sleep(3)
+            pass
 
 
 #python3 data_setup.py -bps 60 -ad 0 -rdv CasualConversation -sb -1 --mp_count 6 
 
 # python3 data_setup.py -bps 60 -ad 0 -rdv changemyview -sb 0 --mp_count 2
+#python3 data_setup.py -bps 60 -ad 0 -rdv PoliticalDiscussion -sb 0 --mp_count 2
+
