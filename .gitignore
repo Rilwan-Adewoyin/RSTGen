@@ -21,6 +21,7 @@ rl_conv/pretrain/NLG/Evaluation/*
 rl_conv/pretrain/NLG/dataset_opensubs
 rl_conv/pretrain/NLG/models
 rl_conv/pretrain/NLG/models/*
+rl_conv/pretrain/NLG/RST_sampler/*
 
 rl_conv/pretrain/.ipynb_checkpoints
 *bash.exe.stackdump
