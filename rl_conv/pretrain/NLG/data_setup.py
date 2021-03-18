@@ -45,6 +45,7 @@ import pickle
 import time
 import torch
 
+from filelock import Timeout, FileLock
 
 
 from utils import get_best_ckpt_path
@@ -74,6 +75,8 @@ pattern_toremove = re.compile("(\[deleted\]|\[removed\]|EDIT:|Edit:)")
 
 pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoutes 
 pattern_subreddits = re.compile(r"(/??r/)([^/]+)")
+
+pattern_writingprompts_prefix = re.compile(r"(\[[A-Z]{2}\] )(.+)")
 
 
 # &
@@ -109,6 +112,7 @@ def main(danet_vname,
             annotate_da=True,
             annotate_topic= True,
             reddit_dataset_version='small',
+            title_only=False,
             **kwargs):
     """[summary]
 
@@ -121,7 +125,8 @@ def main(danet_vname,
     #region  Setup    
     # setting up model for Da prediction
     
-    if annotate_da == True:
+    if annotate_da == True and title_only==False: 
+            #title_only forces only one line per reddit conversation, so dialogue act can not be calcualted
         model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
         checkpoint_dir = f'{model_dir}/logs'
 
@@ -215,10 +220,9 @@ def main(danet_vname,
     if start_batch != 0:
         li_id_dictconv = li_id_dictconv[ start_batch*batch_process_size: ]
 
-
     # endregion
-    
     timer = Timer()
+
     #region operating in batches
     global batches_completed
     batches_completed = start_batch
@@ -244,6 +248,9 @@ def main(danet_vname,
                 'speaker_id':utt.speaker.id
                 } for utt in dictconv.get_chronological_utterance_list()]
             
+            if title_only == True:
+                li_thread_utterances = li_thread_utterances[:1]
+
             # Preprocess each utterance -> txt_preproc
             [
                 _dict.update({'txt_preproc':_preprocess(_dict['text'])}) for _dict in 
@@ -261,8 +268,10 @@ def main(danet_vname,
                 if _select_utt_by_reply(_dict['reply_to'], li_thread_utterances) == '' :
                     _dict['reply_to'] = None
 
-            # Only append if more than ten comments in the conversation
-            if len(li_thread_utterances)>=5:
+            # Only append if more than five comments in the conversation. In title only mode adjust this to 1
+            min_conv_comment_count = 1 if title_only else 5
+
+            if len(li_thread_utterances)>=min_conv_comment_count:
                 batch_li_li_thread_utterances.append(li_thread_utterances)
 
         timer.end("preprocessing")
@@ -284,7 +293,7 @@ def main(danet_vname,
 
         #region DA assignment
         timer.start()
-        if annotate_da == True and annotate_rst == True:
+        if annotate_da == True and annotate_rst == True and title_only==False:
             for i, _ in enumerate(batch_li_li_thread_utterances):
             
                 li_thread_utterances = batch_li_li_thread_utterances[i]
@@ -462,6 +471,9 @@ def _preprocess(text):
 
     # replacing hyperlinks with [link token]
     text = re.sub(pattern_hlinks,r"\1", text)
+
+    # removing prompt - for writing prompt dataset titles
+    text = re.sub(pattern_writingprompts_prefix,r"\2",text)
 
     # remove general hyperlinks
     text = re.sub(pattern_hlinks2,"", text)
@@ -825,7 +837,7 @@ def _textrank_extractor(str_utterance, lowest_score=0.0):
 
     return li_ranked_kws
         
-def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120):
+def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_process_size=120, title_only=False):
     
     # Split list of utterances by the subreddit name
     # Then for each sublist
@@ -839,58 +851,63 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
         #a list of tuples; elem0: subreddit name elem1: list of convos for that subreddit
     
     for subreddit, _li_utterances in grouped_li_utterances:
+        _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
+
         subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
         
-        _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]        
-        #_li_utterances = [ { str(k):v for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
+        if title_only == True:
+            subreddit_dir = subreddit_dir + "title_only"
+                   
+        lock_path = os.path.join(subreddit_dir,"lock") 
+        lock = FileLock(lock_path, timeout=60)
 
-        #unlimited batch_size
-    
-        files_ = os.listdir(subreddit_dir)
-        if len(files_)>0:
-            fn = files_[0]
-        else:
-            fn = "0000_0000000000"           
-            with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
-                dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
-                dict_writer.writeheader()
-                pass
-        
-        curr_len = int(fn[-10:])
-        new_len = curr_len + len(_li_utterances)
+        with lock:
+            #unlimited batch_siz
+            files_ = os.listdir(subreddit_dir)
+            if len(files_)>0:
+                fn = files_[0]
+            else:
+                fn = "0000_0000000000"           
+                with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
+                    dict_writer = csv.DictWriter(_f,fieldnames=list(_li_utterances[0].keys() ) )
+                    dict_writer.writeheader()
+                    pass
+            
+            curr_len = int(fn[-10:])
+            new_len = curr_len + len(_li_utterances)
 
-        old_fp = os.path.join(subreddit_dir,fn)
-        new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
-        
-        keys = _li_utterances[0].keys()
+            old_fp = os.path.join(subreddit_dir,fn)
+            new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
+            
+            keys = _li_utterances[0].keys()
 
-        # with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
-        #     dict_writer = csv.DictWriter(fn, keys, quoting=csv.QUOTE_MINIMAL,
-        #         doublequote=False )
-        #     dict_writer.writerows(_li_utterances)
+            # with open(old_fp,"a+", newline=None,encoding='utf-8') as fn:
+            #     dict_writer = csv.DictWriter(fn, keys, quoting=csv.QUOTE_MINIMAL,
+            #         doublequote=False )
+            #     dict_writer.writerows(_li_utterances)
 
-        df_ = pd.read_csv(old_fp)
-        df_ = df_.append( _li_utterances, ignore_index=True, sort=False)
-        df_.to_csv( new_fp, index=False)
+            df_ = pd.read_csv(old_fp)
+            df_ = df_.append( _li_utterances, ignore_index=True, sort=False)
+            df_.to_csv( new_fp, index=False)
 
-        if os.path.exists(old_fp) and old_fp!=new_fp:
-            os.remove(old_fp)
-        
+            if os.path.exists(old_fp) and old_fp!=new_fp:
+                os.remove(old_fp)
+            
 
-        # Updating record of last batch operated on for each subreddit
-        new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
-        if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
-            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
-        else:
-            df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
-            df_records.index.names = ['subreddit']
+            # Updating record of last batch operated on for each subreddit
+            new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
+            if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
+                df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+            else:
+                df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
+                df_records.index.names = ['subreddit']
 
-        #df_records = df_records.append(new_record, ignore_index=True)
+            #df_records = df_records.append(new_record, ignore_index=True)
 
-        for k,v in new_record.items():
-            df_records.loc[ subreddit, [k] ] =  v
+            for k,v in new_record.items():
+                df_records.loc[ subreddit, [k] ] =  v
 
-        df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
+            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
 
             
 class Timer():
@@ -952,6 +969,8 @@ if __name__ == '__main__':
                                                                         "TrueGaming",
                                                                         "Relationships",
 
+                                                                        "writing_prompts"
+
                                                                         "Music",
                                                                         "worldnews",
                                                                         "todayilearned",
@@ -964,6 +983,7 @@ if __name__ == '__main__':
                                                                         "sports",
                                                                         "anime",
                                                                         "IamA"])
+    parser.add_argument('-to','--title_only', default=False, type=lambda x: bool(int(x)) )
 
     args = parser.parse_args()
     

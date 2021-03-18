@@ -1,0 +1,18 @@
+SyntaxParser cmd: ['java', '-Xmx1000m', '-cp', '/home/u1862646/01_Mcv/mastering-conversation/rl_conv/pretrain/DockerImages/feng_hirst_rst_parser/tools/stanford-parser-full-2014-01-04/*', 'ParserDemo']
+Added classifier classifier1 to segmenter gCRF
+Added classifier classifier2 to segmenter gCRF
+Finished initialization in 0.81 seconds.
+
+Processing 1 utterances
+Parsing utterance 0 out of 1)
+[(b'"If there are people in the middle who want to purchase higher quality but not highend luxury goods and services, and businesses are not catering to them, then there\'s a gap for other businesses to offer things suitable to their budget, and make money due to the lack of competition."', True)]
+Processing segment 0 out of 1
+Finished preprocessing in 1.23 seconds.
+
+Finished segmentation in 0.35 seconds.
+Segmented into 6 EDUs.
+ 
+===================================================
+Successfully unloaded syntax parser
+Successfully unloaded gCRF
+Successfully unloaded gCRF_global_features

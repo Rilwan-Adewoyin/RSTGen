@@ -93,3 +93,9 @@ tree_order = {
     (1,1,0,0):27, (1,1,0,1):28, (1,1,1,0):29, (1,1,1,1):30,
     
     }
+
+rst_rel_li = ['Attribution',
+                'Background','Cause','Comparison','Condition',
+                'Contrast','Elaboration','Enablement','Evaluation',
+                'Explanation','Joint','Manner-Means','Topic-Comment',
+                'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config

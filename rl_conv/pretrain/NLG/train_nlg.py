@@ -85,7 +85,7 @@ def _monitor_candidates(self, trainer):
     return ckpt_name_metrics
 
 
-#Monkey patching the forward on distill bert
+#Monkey patching the forward on gpt
 def forward(
     self,
     input_ids=None,
@@ -252,7 +252,12 @@ def forward(
     if not return_dict:
         return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
     else:
-        raise NotImplementedError
+        return {
+             k:v for k,v in zip(
+                 ['hidden_states', 'presents', 'all_hidden_states', 'all_self_attentions'],
+                 [hidden_states, presents, all_hidden_states, all_self_attentions]
+             ) if v is not None
+        }
 
 def top_k_top_p_filtering(
     logits: torch.FloatTensor,
@@ -1322,7 +1327,7 @@ class NLG(nn.Module):
         return mparams
 
 
-    def forward(self, input_, skip_embed1=False):
+    def forward(self, input_, skip_embed1=False, output_attentions=False):
         """[summary]
 
             Args:
@@ -1343,6 +1348,7 @@ class NLG(nn.Module):
                                     position_embeds = input_['position_embeds'],
                                     token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
                                                             # Further we handle token_type embedding in forward_embedding layer
+                                    output_attentions=output_attentions,
                                     return_dict=False)
         hidden_states = outputs[0]
 
@@ -1658,7 +1664,9 @@ class NLG_tokenizer():
             rst_rel_li = [ rel for rel in self.rst_rel_li if ( rel in relations) or relations=="all" ]
 
             if version == "independent":
-                rst_rel_encoded = [[rel] for rel in rst_rel_li]
+                rst_names = [[rel] for rel in rst_rel_li]
+
+                rst_rel_encoded = [ self.rst_rel_labeler.transform(rel) for rel in rst_names]
             
             
             if version=="combinations":
@@ -1666,34 +1674,37 @@ class NLG_tokenizer():
                 combination_count = kwargs.get('combinatoric_count',3)
                 iter_rst_comb = combinations( rst_rel_li, combination_count )
                 li_rst_comb =  list(iter_rst_comb)
-                li_rst_comb = random(li_rst_comb)
+                random.shuffle(li_rst_comb)
                 li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
-
-                rst_rel_encoded = self.rst_rel_labeler.transform( li_rst_comb ) #list of list of each relation
+                
+                rst_names = li_rst_comb
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_comb) for rst_comb in li_rst_comb] #list of list of each relation
             
             elif version=="permutations":
                 
                 combination_count = kwargs.get('combinatoric_count',3)
                 iter_rst_perm = permutations( rst_rel_li, combination_count )
-                li_rst_perm =  list(iter_rst_perm)
-                li_rst_perm = random(li_rst_perm)
+                li_rst_perm =  iter_rst_perm.tolist()
+                random.shuffle(li_rst_perm)
 
-                li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]           
-                rst_rel_encoded = self.rst_rel_labeler.transform( li_rst_perm ) #list of list of each relation
+                li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]   
+                
+                rst_names = li_rst_perm
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_perm) for rst_perm in li_rst_perm] #list of list of each relation
 
             elif version=="combinations_with_replacement":
                 
                 combination_count = kwargs.get('combinatoric_count',3)
                 iter_rst_combwr = combinations_with_replacement( rst_rel_li, combination_count )
                 li_rst_combwr =  list(iter_rst_combwr)
-                li_rst_combwr = random(li_rst_combwr)
+                random.shuffle(li_rst_combwr)
 
                 li_rst_combwr = li_rst_combwr[: kwargs.get("return_count",10) ]           
+                rst_names = li_rst_combwr
 
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_combwr) for rst_combwr in li_rst_combwr] #list of list of each relation
 
-                rst_rel_encoded = self.rst_rel_labeler.transform( li_rst_perm ) #list of list of each relation
-
-            return rst_rel_encoded
+            return rst_rel_encoded, rst_names
 
     def encode_v2( self, das ,rst_rels, rst_ns, rst_pos, topics, topics_score,
              utterance, pad_utterance,generate_mode):
@@ -2216,7 +2227,12 @@ class TrainingModule(pl.LightningModule):
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len',
-                    'frst_version','scale_grad_by_freq']} )
+                    'frst_version','scale_grad_by_freq','freeze_pretrained']} )
+                
+                mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
+                    'context_len'] }
+        
+                mparams =  {**mparams, **mparams_json}
             
             else:
                 print("param files not found utilsing default or user entered params\n")
@@ -2429,6 +2445,48 @@ class TrainingModule(pl.LightningModule):
             training_module.eval() 
             training_module.freeze() 
             raise NotImplementedError   
+    
+    @staticmethod
+    def load_nlgmodel(model_name="NLG_rt", model_version=11,max_input_len=None):
+        # Loading in NLG model
+        checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
+
+        # Getting tparams
+        tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+            'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type',
+            'tag']}
+
+        tparams['mode'] = 'inference'
+
+        mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
+            'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len',
+            'freeze_pretrained','frst_version','scale_grad_by_freq']}
+        
+        if model_version in [14,15]:
+            mparams_json = {'context_len': {'rst':16, 'topics':30} }
+        else:
+            mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
+            'context_len'] }
+
+        mparams =  {**mparams, **mparams_json}
+        
+        if max_input_len != None:
+            mparams['max_input_len'] = max_input_len
+            
+        # Loading Training Module
+        training_module = TrainingModule(**tparams, model_params=mparams )
+        training_module.load_state_dict(checkpoint['state_dict'])
+        nlg_model = training_module.model
+
+        # Deleting checkpoints to free up GPU space
+        del checkpoint
+        torch.cuda.empty_cache()
+          
+        if torch.cuda.is_available():
+            nlg_model =nlg_model.cuda()
+        
+        return nlg_model
+
 
     @auto_move_data
     def forward(self, input_):
@@ -2534,9 +2592,7 @@ class TrainingModule(pl.LightningModule):
                 df = df.append(datum, ignore_index=True)
                 df.to_csv( fp, index=False)
                 # Saving to file
-            
-
-            
+                   
     def create_data_loaders(self, shuffle=False, **kwargs):
        
         dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.model.nlg_tokenizer, 
@@ -2768,12 +2824,13 @@ class SingleDataset(torch.utils.data.Dataset):
         
         if self.inference_context_utt != 0:
             utterance_context = ' '.join( utterance.split(' ')[:self.inference_context_utt] )
-            #utterance_context = ' '.join( utterance.split(' ')[:0] )
+            
             encoded = self.getitem_tokenize(das, rst_rels,rst_ns, rst_pos,
                                          topics, 
                                         topics_score, utterance_context,
                                         pad_utterance=False,
                                         generate_mode=True )
+
             encoded['orig_rst_rels'] = rst_rels
             encoded['orig_utt'] = utterance
             encoded['orig_topics'] = topics
@@ -2911,6 +2968,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 50 -agb 7 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
