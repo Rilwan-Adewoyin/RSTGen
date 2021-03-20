@@ -160,16 +160,16 @@ def main(danet_vname,
             os.system('chmod o=rwx var/run/docker.sock')
             client = docker.from_env(timeout=int(60*60))
         
-        image_name = 'akanni96/feng-hirst-rst-parser'
-        image_li = client.images.list('akanni96/feng-hirst-rst-parser')
+        image_name = 'akanni96/feng_hirst_rst_parser'
+        image_li = client.images.list('akanni96/feng_hirst_rst_parser')
         
             # (building)docker image
         if len(image_li)==0: 
             #Use this method during develomment
-            dir_dockferfile =  utils_nlg.get_path("../DockerImages/feng-hirst-rst-parser",_dir=True)
+            dir_dockferfile =  utils_nlg.get_path("../DockerImages/feng_hirst_rst_parser",_dir=True)
             image = client.images.build(path=dir_dockferfile,
                 nocache=True, pull=False, rm=True,forcerm=True,
-                tag="akanni96/feng-hirst-rst-parser")[0]
+                tag="akanni96/feng_hirst_rst_parser")[0]
             
         else:
             image = client.images.get(image_name)
@@ -228,7 +228,7 @@ def main(danet_vname,
     batches_completed = start_batch
 
     while len(li_id_dictconv) > 0 :
-        time.sleep(3)
+        
         batch_li_id_dictconv =  li_id_dictconv[:batch_process_size]
         batch_li_li_thread_utterances = []
         print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
@@ -253,7 +253,7 @@ def main(danet_vname,
 
             # Preprocess each utterance -> txt_preproc
             [
-                _dict.update({'txt_preproc':_preprocess(_dict['text'])}) for _dict in 
+                _dict.update({'txt_preproc':_preprocess(_dict['text'],_dict['subreddit'])}) for _dict in 
                 li_thread_utterances]
             
 
@@ -283,11 +283,16 @@ def main(danet_vname,
             mp_count_rst = mp_count
             contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
             contaier_ids = sum(contaier_ids, [])
+
             with mp.Pool(mp_count_rst) as pool:
                 res = pool.starmap( _rst_v2, zip( _chunks(batch_li_li_thread_utterances, batch_process_size//mp_count_rst ) , contaier_ids  ) )
+            
             batch_li_li_thread_utterances = list( res ) 
             batch_li_li_thread_utterances = sum(batch_li_li_thread_utterances, [])
+            
             batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
+            
+            assert len(batch_li_li_thread_utterances ) != 0
         timer.end("RST")
         #endregion
 
@@ -396,7 +401,7 @@ def main(danet_vname,
         timer.start()
             # format = subreddit/convo_code
         li_utterances = list(itertools.chain.from_iterable(batch_li_li_thread_utterances))
-        _save_data(li_utterances, dir_save_dataset, batches_completed, batch_process_size )
+        _save_data(li_utterances, dir_save_dataset, batches_completed, batch_process_size, title_only )
 
         li_id_dictconv = li_id_dictconv[batch_process_size:]
         batches_completed += 1
@@ -417,7 +422,11 @@ def _load_data(reddit_dataset_version):
     os.makedirs(_dir_path, exist_ok=True)
 
     if reddit_dataset_version == 'small':
-        use_local = os.path.exists(_dir_path)
+
+        full_path = os.path.join(_dir_path,"reddit-corpus-small")
+
+        use_local = os.path.exists( full_path)
+
         corpus = Corpus(filename=download("reddit-corpus-small", data_dir=_dir_path, use_local=use_local), merge_lines=True)
     
     else:
@@ -462,7 +471,7 @@ def _load_data(reddit_dataset_version):
 
     return corpus
 
-def _preprocess(text):
+def _preprocess(text,subreddit):
     # removing leading and trailing whitespace characters
     text = text.strip()
 
@@ -472,8 +481,15 @@ def _preprocess(text):
     # replacing hyperlinks with [link token]
     text = re.sub(pattern_hlinks,r"\1", text)
 
-    # removing prompt - for writing prompt dataset titles
-    text = re.sub(pattern_writingprompts_prefix,r"\2",text)
+    
+    if subreddit == "WritingPrompts":
+        # checking that the start of prompt is valid 
+        pattern_promptatstart = re.compile(r"\A\[[A-Z]{2}\]")
+        valid_start = bool( re.match(pattern_promptatstart, text) )
+        if valid_start == False: text = ""
+
+        # removing prompt - for writing prompt dataset titles
+        text = re.sub(pattern_writingprompts_prefix,r"\2",text)
 
     # remove general hyperlinks
     text = re.sub(pattern_hlinks2,"", text)
@@ -546,7 +562,7 @@ def _valid_utterance(txt):
 
     # checking
 
-    return (not txt.isspace()) and any( c.isalpha() for c in txt) 
+    return (not txt.isspace()) and any( c.isalpha() for c in txt) and txt!='"Thank you for your submission! Unfortunately, it has been removed for the following reason: ^If ^you ^have ^any ^questions, ^we ^ask ^that ^you ^message ^the ^moderators submission was removed&message=I have a question regarding the removal of this submission ^directly ^for ^appeals. ^Please ^refer ^to ^our ^detailed ^rules. (CasualConversation/w/rules) ^Take ^a ^look ^at ^our ^subreddits ^directory."'
 
 def _select_utt_by_reply(reply_to_id, li_thread_utterances ):
     try:
@@ -570,15 +586,29 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
     json_li_li_utterance = json.dumps(li_li_utterances)
 
-    cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance]
+    cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance, '--redirect_output', "2"]
     exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
                         demux=True)
     stdout, stderr = output
     
     try:
-        li_strtree = json.loads(stdout)
+        if type(stdout) is bytes:
+            stdout = str(stdout,"utf-8")
+
+        #print("\n\n\n",stdout,"\n\n\n")
+        li_strtree = json.loads( stdout )
+        #li_strtree = stdout
+            
+        #print(len(li_strtree), "\n\n\n")
+
     except (TypeError, json.JSONDecodeError) as e:
-        print(e)
+        # print(f"\nError", e)
+        # print("\n\n\n stderr\n", str(stderr,"utf-8"))
+        # print("\n\n\nStdout\n", str(stderr,"utf-8"))
+        # raise Exception
+        # print(e)
+        # print("here")
+        # raise Exception
         return new_li_li_thread_utterances
     
     for idx, str_tree in enumerate(li_strtree):
@@ -853,17 +883,18 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
     for subreddit, _li_utterances in grouped_li_utterances:
         _li_utterances = [ { str(k):json.dumps(v) for k,v in dict_thread.items() } for dict_thread in _li_utterances ]
 
-        subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
-        
         if title_only == True:
-            subreddit_dir = subreddit_dir + "title_only"
-                   
+            subreddit = subreddit+ "_title_only"
+        
+            
+        subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
+               
         lock_path = os.path.join(subreddit_dir,"lock") 
         lock = FileLock(lock_path, timeout=60)
 
         with lock:
             #unlimited batch_siz
-            files_ = os.listdir(subreddit_dir)
+            files_ = [ fp for fp in os.listdir(subreddit_dir) if os.path.split(fp)[1] != "lock" ]
             if len(files_)>0:
                 fn = files_[0]
             else:
@@ -899,7 +930,7 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
             if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
                 df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
             else:
-                df_records = pd.DataFrame( columns=['last_batch_record','batch_process_size'] )
+                df_records = pd.DataFrame( columns=['last_batch','batch_process_size'] )
                 df_records.index.names = ['subreddit']
 
             #df_records = df_records.append(new_record, ignore_index=True)
@@ -957,7 +988,9 @@ if __name__ == '__main__':
 
     parser.add_argument('-at','--annotate_topic',default=True, type=lambda x: bool(int(x)) )
 
-    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=["CasualConversation",
+    parser.add_argument('-rdv','--reddit_dataset_version',default='small', type=str, choices=[
+                                                                        "small",
+                                                                        "CasualConversation",
                                                                         "relationship_advice",
                                                                         "interestingasfuck",
                                                                         "science",
@@ -969,7 +1002,7 @@ if __name__ == '__main__':
                                                                         "TrueGaming",
                                                                         "Relationships",
 
-                                                                        "writing_prompts"
+                                                                        "WritingPrompts",
 
                                                                         "Music",
                                                                         "worldnews",
@@ -1002,6 +1035,8 @@ if __name__ == '__main__':
             
         finally :
             # cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
+            
+            #cmd = docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & yes | docker image prune  & docker rmi $(docker images -a -q
             # os.system(cmd)
             # time.sleep(3)
             # os.system(cmd)
@@ -1014,3 +1049,6 @@ if __name__ == '__main__':
 # python3 data_setup.py -bps 60 -ad 0 -rdv changemyview -sb 0 --mp_count 2
 #python3 data_setup.py -bps 60 -ad 0 -rdv PoliticalDiscussion -sb 0 --mp_count 2
 
+# python3 data_setup.py -bps 10 -ad 0 -rdv small -sb -1 --mp_count 6 
+
+# python3 data_setup.py -bps 10 -ad 0 -rdv WritingPrompts -sb 1 --mp_count 6 -to 1

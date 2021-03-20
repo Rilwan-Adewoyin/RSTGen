@@ -2726,7 +2726,7 @@ class DataLoaderGenerator():
         """
         #getting all files from all different subreddits/types of conversation
         fns = glob.glob(  os.path.join( utils.get_path(dir_data),"*","*") )
-        
+        fns = [fn for fn in fns if os.path.split[-1]!="lock"]
         #getting number of utterances records in each file
         files_sizes = [ int(fn[-10:]) for fn in fns]
 
