@@ -12,4 +12,4 @@
 
 [submodule "rl_conv/pretrain/DockerImages/feng_hirst_rst_parser"]
 	path = rl_conv/pretrain/DockerImages/feng_hirst_rst_parser
-	url = https://github.com/Akanni96/feng-hirst-rst-parser
+	url = git@github.com:Akanni96/feng-hirst-rst-parser.git
