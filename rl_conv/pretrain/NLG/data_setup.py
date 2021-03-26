@@ -1,6 +1,12 @@
 import sys, os
 #sys.stdout = codecs.getwriter(encoding)(sys.stdout)
 import traceback
+# os.environ['CURL_CA_BUNDLE']=""
+# os.environ['REQUESTS_CA_BUNDLE'] = '' 
+# os.environ['PYTHONHTTPSVERIFY'] = "0"
+import ssl
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import convokit
 from convokit.model import ConvoKitMeta
@@ -77,11 +83,52 @@ pattern_qoutes = re.compile("(&gt;|>)[^(\\n)]*(\\n){1,}") #removing reddit qoute
 pattern_subreddits = re.compile(r"(/??r/)([^/]+)")
 
 pattern_writingprompts_prefix = re.compile(r"(\[[A-Z]{2}\] )(.+)")
+pattern_promptatstart = re.compile(r"\A\[[A-Z]{2}\] ")
 
-
+invalidtxt1 = "**Off-Topic Discussion**: All top-level comments must be a story or poem. Reply here for other comments.\n\n#####Reminder for Writers and Readers:\n* Prompts are meant to inspire new writing.  Responses don't have to fulfill every detail.\n\n* Please remember to [be civil](https://www.reddit.com/r/WritingPrompts/wiki/rules#wiki_rule_10.3A_be_civil) in any feedback.\n\n---\n\n[](#icon-help)[^(What Is This?)](https://www.reddit.com/r/WritingPrompts/wiki/off_topic)\n[](#icon-information)[^(First Time Here?)](https://www.reddit.com/r/WritingPrompts/wiki/user_guide)\n[](#icon-exclamation)[^(Special Announcements)](https://www.reddit.com/r/WritingPrompts/wiki/announcements)\n[](#icon-comments)[^(Click For Our Chatrooms)](https://www.reddit.com/r/WritingPrompts/wiki/chat)\n"
+invalidtxt2 = "Thank you for your submission! Unfortunately, it has been removed for the following reason: ^If ^you ^have ^any ^questions, ^we ^ask ^that ^you ^message ^the ^moderators submission was removed&message=I have a question regarding the removal of this submission ^directly ^for ^appeals. ^Please ^refer ^to ^our ^detailed ^rules. (CasualConversation/w/rules) ^Take ^a ^look ^at ^our ^subreddits ^directory."
 # &
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
+
+import warnings
+import contextlib
+
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+
+
+old_merge_environment_settings = requests.Session.merge_environment_settings
+
+# @contextlib.contextmanager
+# def no_ssl_verification():
+#     opened_adapters = set()
+
+#     def merge_environment_settings(self, url, proxies, stream, verify, cert):
+#         # Verification happens only once per connection so we need to close
+#         # all the opened adapters once we're done. Otherwise, the effects of
+#         # verify=False persist beyond the end of this context manager.
+#         opened_adapters.add(self.get_adapter(url))
+
+#         settings = old_merge_environment_settings(self, url, proxies, stream, verify, cert)
+#         settings['verify'] = False
+
+#         return settings
+
+#     requests.Session.merge_environment_settings = merge_environment_settings
+
+#     try:
+#         with warnings.catch_warnings():
+#             warnings.simplefilter('ignore', InsecureRequestWarning)
+#             yield
+#     finally:
+#         requests.Session.merge_environment_settings = old_merge_environment_settings
+
+#         for adapter in opened_adapters:
+#             try:
+#                 adapter.close()
+#             except:
+#                 pass
 
 # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
@@ -186,7 +233,9 @@ def main(danet_vname,
         dir_save_dataset = utils_nlg.get_path("./dataset_v2/reddit_large_annotated",_dir=True)
 
     # setting up corpus data
+    #with no_ssl_verification():
     corpus = _load_data(reddit_dataset_version)
+    
     li_id_dictconv  = list(corpus.conversations.items())
     total_batch_count = math.ceil(len(li_id_dictconv)/batch_process_size)
 
@@ -241,19 +290,29 @@ def main(danet_vname,
             tree_conv_paths = dictconv.get_root_to_leaf_paths() 
             #paths_count = len(tree_conv_paths)
 
-            # Gathering utterances in thread
-            li_thread_utterances = [
-                {'text': utt.text, 'subreddit':utt.meta['subreddit'],
-                'reply_to':utt.reply_to, 'id_utt':utt.id,
-                'speaker_id':utt.speaker.id
-                } for utt in dictconv.get_chronological_utterance_list()]
+                        
+            # Gathering title for conversation
+            thread_utterance_title = {
+                'text':dictconv.meta['title'] , 'subreddit':dictconv.meta['subreddit'],
+                'reply_to':None, 'id_utt':"000",'speaker_id': 'OriginalPoster'
+            } 
+            li_thread_utterances = [thread_utterance_title]
+
+
+            if title_only == False:
+                # Gathering utterances in thread
+                li_thread_replies = [
+                        {'text': utt.text, 'subreddit':utt.meta['subreddit'],
+                        'reply_to':(utt.reply_to or thread_utterance_title['id_utt']),
+                        'id_utt':utt.id,
+                        'speaker_id':utt.speaker.id}
+                    for utt in dictconv.get_chronological_utterance_list()]
             
-            if title_only == True:
-                li_thread_utterances = li_thread_utterances[:1]
+                li_thread_utterances = li_thread_utterances + li_thread_replies
 
             # Preprocess each utterance -> txt_preproc
             [
-                _dict.update({'txt_preproc':_preprocess(_dict['text'],_dict['subreddit'])}) for _dict in 
+                _dict.update({'txt_preproc':_preprocess(_dict['text'], title_only, _dict['subreddit'] )}) for _dict in 
                 li_thread_utterances]
             
 
@@ -279,7 +338,7 @@ def main(danet_vname,
         
         #region Predicting the RST Tag
         timer.start()
-        if annotate_rst == True:
+        if annotate_rst == True and len(batch_li_li_thread_utterances)>0:
             mp_count_rst = mp_count
             contaier_ids =  [ li_fh_container_id for idx in range(int( (len(batch_li_li_thread_utterances)//mp_count_rst) + 1)) ]
             contaier_ids = sum(contaier_ids, [])
@@ -293,6 +352,7 @@ def main(danet_vname,
             batch_li_li_thread_utterances = [ li for li in batch_li_li_thread_utterances if li !=[] ]
             
             assert len(batch_li_li_thread_utterances ) != 0
+
         timer.end("RST")
         #endregion
 
@@ -373,11 +433,9 @@ def main(danet_vname,
         timer.end("DA")   
         #endregion
 
-        
-
         #region Topic extraction
         timer.start()
-        if annotate_topic == True:
+        if annotate_topic == True and len(batch_li_li_thread_utterances)>0:
             with mp.Pool(mp_count) as pool:
                 res = pool.map( _topic, _chunks(batch_li_li_thread_utterances,batch_process_size//mp_count) )
             batch_li_li_thread_utterances = list( res ) 
@@ -462,6 +520,7 @@ def _load_data(reddit_dataset_version):
         use_local = os.path.exists(full_path)
         print(full_path)
 
+        #with no_ssl_verification():
         corpus = Corpus(filename=download(subdir,
                             data_dir=full_path,use_local=use_local),
                             disable_type_check=True,
@@ -471,7 +530,12 @@ def _load_data(reddit_dataset_version):
 
     return corpus
 
-def _preprocess(text,subreddit):
+def _preprocess(text,title_only,subreddit):
+    # removing invalid texts
+    
+    if text in [invalidtxt1, invalidtxt2]:
+        text = ""
+
     # removing leading and trailing whitespace characters
     text = text.strip()
 
@@ -481,15 +545,16 @@ def _preprocess(text,subreddit):
     # replacing hyperlinks with [link token]
     text = re.sub(pattern_hlinks,r"\1", text)
 
-    
-    if subreddit == "WritingPrompts":
+    if subreddit=="WritingPrompts":
         # checking that the start of prompt is valid 
-        pattern_promptatstart = re.compile(r"\A\[[A-Z]{2}\]")
         valid_start = bool( re.match(pattern_promptatstart, text) )
-        if valid_start == False: text = ""
-
-        # removing prompt - for writing prompt dataset titles
-        text = re.sub(pattern_writingprompts_prefix,r"\2",text)
+        
+        if title_only == True:
+            if valid_start == False:
+                text = ""
+        
+        if valid_start == True:    
+            text = re.sub(pattern_writingprompts_prefix,r"\2",text)
 
     # remove general hyperlinks
     text = re.sub(pattern_hlinks2,"", text)
@@ -714,7 +779,7 @@ def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
 
     new_li_li_thread_utterances.append(li_thread_utterances)
     
-    return new_li_thread_utterance
+    return new_li_li_thread_utterances
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -940,7 +1005,7 @@ def _save_data(li_utterances, dir_save_dataset, last_batch_operated_on=0, batch_
 
             df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
 
-            
+          
 class Timer():
     def __init__(self):
         self.start_time = None
@@ -1036,7 +1101,7 @@ if __name__ == '__main__':
         finally :
             # cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
             
-            #cmd = docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & yes | docker image prune  & docker rmi $(docker images -a -q
+            # cmd = docker stop $(docker ps -aq) & docker rm $(docker ps -aq) & yes | docker image prune  & docker rmi $(docker images -a -q)
             # os.system(cmd)
             # time.sleep(3)
             # os.system(cmd)
