@@ -1886,15 +1886,18 @@ class NLG_tokenizer():
 
         #Creating labels/targets for GPT Language Model Head
         try:
-            labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
+            
+            labels = -100* torch.ones( size=[1, utt_dim], dtype = torch.long  ) 
+
             labels[0][rt_dim:utt_dim-utt_pad_count] =  tknzd_utt[ : utt_dim-utt_pad_count-rt_dim ]
+        
         except Exception:
             labels = None
         
         # Creating Positional Emebeddings
             # ALL words in drt get a positional encoding of 0 -> No positional meaning
             # utterance has normal positional encoding        
-        position_ids_utt =  torch.arange( 0, utt_dim-rt_dim   , dtype=torch.long)
+        position_ids_utt =  torch.arange( 0, utt_dim-rt_dim, dtype=torch.long)
         position_ids = position_ids_utt
 
         # Creating Token Type Ids
@@ -2462,7 +2465,7 @@ class TrainingModule(pl.LightningModule):
             'base_model_name','loss_type','model_name','fda','frst','ftopic','max_input_len',
             'freeze_pretrained','frst_version','scale_grad_by_freq']}
         
-        if model_version in [14,15]:
+        if model_version in [14,15,16]:
             mparams_json = {'context_len': {'rst':16, 'topics':30} }
         else:
             mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
@@ -2806,15 +2809,6 @@ class SingleDataset(torch.utils.data.Dataset):
                     names=names, skiprows=skiprows,
                     nrows=(self.line_end-self.line_start) )
         
-        #A quick patch to handle case where annotated_fixed dataset is used
-        # some utterance entries are empty and cause errors
-        if "large_annotated_fixed" in self.fp:
-            self.data = self.data.dropna()
-            self.data = self.data[self.data['txt_preproc'].map(lambda x: len(str(x)) > 10)]
-            self.line_end = self.line_start + len(self.data.index)
-
-            
-
     def __len__(self):
         return (self.line_end - self.line_start)
     
