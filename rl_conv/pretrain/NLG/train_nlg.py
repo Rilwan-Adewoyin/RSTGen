@@ -4,7 +4,8 @@ import os
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
 #os.environ["NCCL_P2P_LEVEL"] = "3"
 #os.environ['NCCL_P2P_DISABLE'] = '1'
-os.environ['NCCL_SOCKET_IFNAME'] =  'lo' #'enp3s0'
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
+#os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
 #os.environ['CUDA_LAUNCH_BLOCKING']="1"
 
 import torch
@@ -1509,11 +1510,14 @@ class NLG(nn.Module):
         json_params = {
             k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.__dict__.keys()
         }
+        json_params = {
+            k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.nlg_tokenizer.__dict__.keys()
+        }
 
-        params = {**params, **json_params}
+        params_ = {**params, **json_params}
         
 
-        return params
+        return params_
 
     def get_predicted_utterance(self, encoded_input, generation_params):
         """Given an encoded input, outputs predictions up until an <EOS> is emmitted
@@ -2284,7 +2288,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=8,
+            patience=10,
             verbose=False,
             mode='min'
         )
@@ -2310,7 +2314,8 @@ class TrainingModule(pl.LightningModule):
                         accelerator=accelerator,
                         #limit_train_batches =10,
                         #limit_val_batches = 10,
-                        val_check_interval=0.4,
+                        val_check_interval=0.2,
+                        num_sanity_val_steps=0, 
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -2334,7 +2339,8 @@ class TrainingModule(pl.LightningModule):
                     #limit_train_batches = 0.4,
                     #val_check_interval=0.5,
                     #limit_val_batches = ,
-                    val_check_interval=0.4,
+                    val_check_interval=0.2,
+                    num_sanity_val_steps=0,
                     #track_grad_norm = True,
                     #overfit_batches=5
                     #,fast_dev_run=2, 
@@ -2541,57 +2547,57 @@ class TrainingModule(pl.LightningModule):
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
         
-        if step_name == "val" and rank_zero_only.rank == 0 :
-            
-            # Making directory if it doesnt exist
-            dir_infer = os.path.join(self.trainer.log_dir,"inference")
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer,exist_ok=True)
+        # if step_name == "val" and rank_zero_only.rank == 0 :
+             
+        #     # Making directory if it doesnt exist
+        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
+        #     if not os.path.exists(dir_infer):
+        #         os.makedirs(dir_infer,exist_ok=True)
 
-            # Adding true values and making csv files if thy dont already exists
-            for idx, encoded_input in enumerate(self.inference_samples):
-                fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
+        #     # Adding true values and making csv files if thy dont already exists
+        #     for idx, encoded_input in enumerate(self.inference_samples):
+        #         fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
 
-                # If there file does not exists we add the true observed records
-                if not os.path.exists(fp):
+        #         # If there file does not exists we add the true observed records
+        #         if not os.path.exists(fp):
                     
-                    df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
-                    rst_rels = encoded_input.pop('orig_rst_rels')
-                    topics = encoded_input.pop('orig_topics')
-                    utterance = encoded_input.pop('orig_utt')
-                    #utterance = self.nlg_tokenizer.e2m_tokenizer.decode( 
+        #             df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
+        #             rst_rels = encoded_input.pop('orig_rst_rels')
+        #             topics = encoded_input.pop('orig_topics')
+        #             utterance = encoded_input.pop('orig_utt')
+        #             #utterance = self.nlg_tokenizer.e2m_tokenizer.decode( 
                     
-                    datum = { 'val_round': -1,
-                                'rst_rels': sum( rst_rels, ()),
-                                "topics": sum( topics, () ),
-                                "utterance":utterance[0] }
+        #             datum = { 'val_round': -1,
+        #                         'rst_rels': sum( rst_rels, ()),
+        #                         "topics": sum( topics, () ),
+        #                         "utterance":utterance[0] }
                 
-                    df = df.append(datum, ignore_index=True)
-                    df.to_csv( fp, index=False)
+        #             df = df.append(datum, ignore_index=True)
+        #             df.to_csv( fp, index=False)
                 
-                # Loading in dataframe of previous predictions
-                df = pd.read_csv(fp)    
+        #         # Loading in dataframe of previous predictions
+        #         df = pd.read_csv(fp)    
 
-                # creating predition andding to existing results
-                encoded_input.pop('orig_rst_rels', None)
-                encoded_input.pop('orig_topics', None)
-                encoded_input.pop('orig_utt', None)
+        #         # creating predition andding to existing results
+        #         encoded_input.pop('orig_rst_rels', None)
+        #         encoded_input.pop('orig_topics', None)
+        #         encoded_input.pop('orig_utt', None)
 
-                for k in encoded_input.keys():
-                    encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
+        #         for k in encoded_input.keys():
+        #             encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
 
-                output = self.model.generate(encoded_input, **self.inference_generation_params)
-                output = output[0].detach().to('cpu')
-                decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
-                                    skip_special_tokens=False)
-                datum = {
-                    'val_round':df['val_round'].max()+1,
-                    'rst_rels': '',
-                    'topics':'',
-                    'utterance':json.dumps(decoded_text) }
-                df = df.append(datum, ignore_index=True)
-                df.to_csv( fp, index=False)
-                # Saving to file
+        #         output = self.model.generate(encoded_input, **self.inference_generation_params)
+        #         output = output[0].detach().to('cpu')
+        #         decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
+        #                             skip_special_tokens=False)
+        #         datum = {
+        #             'val_round':df['val_round'].max()+1,
+        #             'rst_rels': '',
+        #             'topics':'',
+        #             'utterance':json.dumps(decoded_text) }
+        #         df = df.append(datum, ignore_index=True)
+        #         df.to_csv( fp, index=False)
+        #         # Saving to file
                    
     def create_data_loaders(self, shuffle=False, **kwargs):
        
@@ -2726,7 +2732,7 @@ class DataLoaderGenerator():
         """
         #getting all files from all different subreddits/types of conversation
         fns = glob.glob(  os.path.join( utils.get_path(dir_data),"*","*") )
-        fns = [fn for fn in fns if os.path.split[-1]!="lock"]
+        fns = [fn for fn in fns if os.path.split(fn)[-1]!="lock"]
         #getting number of utterances records in each file
         files_sizes = [ int(fn[-10:]) for fn in fns]
 
@@ -2968,7 +2974,9 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 86 -agb 3 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 16 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
