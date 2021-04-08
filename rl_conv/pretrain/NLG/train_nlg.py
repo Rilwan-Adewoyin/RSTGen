@@ -1,4 +1,6 @@
 import os
+from typing import Optional, Tuple
+
 #os.environ["NCCL_DEBUG"]="INFO"
 #os.environ["NCCL_DEBUG_SUBSYS"]="ALL"
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -102,7 +104,8 @@ def forward(
     use_cache=None,
     output_attentions=None,
     output_hidden_states=None,
-    return_dict=None):
+    return_dict=None,
+    **kwargs):
     
     input_ids = None if input_ids is not None else input_ids # Our model should ignore any input_ids entered into the model
 
@@ -396,7 +399,8 @@ class NLG(nn.Module):
 
         # Retreive/Instantiate base transformer
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']    
-        self._use_cache = False
+        # self._use_cache = False
+
 
         self.nlg_tokenizer = NLG_tokenizer(base_model_name,
                                 os.path.join( ("./models"), f"{model_name}_tokenizer"),
@@ -497,7 +501,7 @@ class NLG(nn.Module):
         input_ = self.forward_embedding(input_) 
         
         input_embeds = input_['input_embeds']
-        attention_mask = input_['attn_mask']
+        attention_mask = input_['attention_mask']
         position_embeds = input_['position_embeds']
         token_type_ids = None
         # Need to get the input ids (tknzd_utterance)
@@ -809,15 +813,21 @@ class NLG(nn.Module):
 
         #TODO: Add inteoperatability with past for quicker generation
         past = (encoder_outputs, None) if encoder_outputs is not None else None
+        try:
+            print(past.shape)
+        except Exception as e:
+            pass
 
         while cur_len < max_length:
+
             model_inputs = self.prepare_inputs_for_generation(
                 input_ids, input_embeds, past=past, attention_mask=attention_mask,
                 position_embeds=position_embeds , 
                 token_type_ids = token_type_ids, use_cache=use_cache, **model_specific_kwargs
             )
-
-            lm_logits = self(input_= model_inputs, skip_embed1=True )         
+           
+            outputs = self(input_= model_inputs, skip_embed1=True )         
+            lm_logits = outputs[0]
 
             next_token_logits = lm_logits[:, -1, :]
 
@@ -836,9 +846,11 @@ class NLG(nn.Module):
             )
 
             # if model has past, then set the past variable to speed up decoding
-            #if self._use_cache(outputs, use_cache):
-            if False:
+            if self._use_cache(outputs, use_cache):
+            #if True:
+            #if False: #Added by me: debugging
                 past = outputs[1]
+                #raise Exception(f'{past.shape}')
 
             if do_sample:
                 # Temperature (higher temperature => more likely to sample low probability tokens)
@@ -914,10 +926,10 @@ class NLG(nn.Module):
                 break
 
             # extend attention_mask for new generated input if only decoder
-            if False: #self.config.is_encoder_decoder is False:
-                attention_mask = torch.cat(
-                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
-                )
+            # if False: #self.config.is_encoder_decoder is False:
+            #     attention_mask = torch.cat(
+            #         [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            #     )
 
         return input_ids
 
@@ -969,9 +981,9 @@ class NLG(nn.Module):
         beam_scores = beam_scores.view(-1)  # shape (batch_size * num_beams,)
 
         # cache compute states
-        #past = (encoder_outputs, None) if encoder_outputs is not None else None
-        past = None
-        use_cache = False #Added by me: debugging
+        past = (encoder_outputs, None) if encoder_outputs is not None else None
+        #past = None #Added by me: debugging
+        #use_cache = False #Added by me: debugging
         # done sentences
         done = [False for _ in range(batch_size)]
 
@@ -985,16 +997,18 @@ class NLG(nn.Module):
                 position_embeds=position_embeds , 
                 token_type_ids = token_type_ids, use_cache=use_cache, **model_specific_kwargs
             )
-            lm_logits = self(input_=model_inputs, skip_embed1 = True )  # (batch_size * num_beams, cur_len, vocab_size)
+            outputs = self(input_=model_inputs, skip_embed1 = True )  # (batch_size * num_beams, cur_len, vocab_size)
+            lm_logits = outputs[0]
             next_token_logits = lm_logits[:, -1, :]  # (batch_size * num_beams, vocab_size)
 
             # if model has past, then set the past variable to speed up decoding
-            if False: #self._use_cache(outputs, use_cache):
+            if self._use_cache(outputs, use_cache): 
+            #if False: #Added by me: debugging
                 past = outputs[1]
             if self.config.is_encoder_decoder and do_sample is False:
                 # TODO (PVP) still a bit hacky here - there might be a better solution
                 next_token_logits = self.adjust_logits_during_generation(
-                    next_token_logits, cur_len=cur_len, max_length=max_length
+                    next_token_logits, cur_len=cur_len, max_length=max_length   
                 )
 
             scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
@@ -1289,6 +1303,25 @@ class NLG(nn.Module):
 
         return scores
 
+    def _use_cache(self, outputs, use_cache):
+        """During generation, decide whether to pass the `past` variable to the next forward pass."""
+        if len(outputs) <= 1 or use_cache is False:
+            return False
+        if hasattr(self.transformer.config, "mem_len") and self.transformer.config.mem_len == 0:
+            return False
+        return True
+
+    @staticmethod
+    def _reorder_cache(past: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
+        """
+        This function is used to re-order the :obj:`past_key_values` cache if
+        :meth:`~transformers.PretrainedModel.beam_search` or :meth:`~transformers.PretrainedModel.beam_sample` is
+        called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
+        """
+        return tuple(
+            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
+            for layer_past in past
+        )
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
@@ -1344,14 +1377,17 @@ class NLG(nn.Module):
 
         #print(input_.keys())
         #outputs = self.transformer( input_embeds=input_['input_embeds'],
-        outputs = self.transformer.transformer.forward( input_embeds=input_['input_embeds'],
-                                    attention_mask = input_['attn_mask'],
-                                    position_embeds = input_['position_embeds'],
-                                    token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
-                                                            # Further we handle token_type embedding in forward_embedding layer
+        transformer_outputs = self.transformer.transformer.forward( 
+                                    # input_embeds=input_['input_embeds'],
+                                    # attention_mask = input_['attention_mask'],
+                                    # position_embeds = input_['position_embeds'],
+                                    # token_type_ids = None, #token type embedding new (This gpt implementation incorrectly uses same embedding layer as for input)
+                                    #                         # Further we handle token_type embedding in forward_embedding layer
                                     output_attentions=output_attentions,
-                                    return_dict=False)
-        hidden_states = outputs[0]
+                                    return_dict=False,
+                                    **input_,
+                                    )
+        hidden_states = transformer_outputs[0]
 
         lm_logits = self.transformer.lm_head( hidden_states )
 
@@ -1366,7 +1402,9 @@ class NLG(nn.Module):
             return (lm_logits, loss) 
 
         else:
-            return lm_logits
+            output = (lm_logits,) + transformer_outputs[1:]
+
+            return output
 
     def forward_embedding(self, input_):
         #Partially does the emebddign for our new inputs to the transformer
@@ -1452,6 +1490,9 @@ class NLG(nn.Module):
                 Note: logic for token_type_ids embedding is usually performed in transformer, but has been moved here
                     since gpt-2 code indicates that 
         """
+        new_input = {}
+        new_input['attention_mask'] = input_['attention_mask']
+        new_input['labels'] = input_['labels']
 
         # rst token emebedding
         rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ) 
@@ -1485,7 +1526,8 @@ class NLG(nn.Module):
         token_type_embedding = self.token_type_embeddings( input_['token_type_ids'] )
         input_embeds[ :, :self.nlg_tokenizer.context_len_pre_utterance, :] += token_type_embedding
 
-        input_['input_embeds'] = input_embeds
+        #input_['input_embeds'] = input_embeds
+        new_input['input_embeds'] = input_embeds
 
         # position embedding
         utt_position_embeds = self.transformer.transformer.wpe(input_['position_ids']) 
@@ -1493,9 +1535,11 @@ class NLG(nn.Module):
         _ = utt_position_embeds.shape
         shape = [_[0], self.nlg_tokenizer.context_len_pre_utterance ,_[2]]
         ctx_position_embeds = utt_position_embeds.new_zeros(  shape  ) #ctx has no position embedding 
-        input_['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
-       
-        return input_
+        #input_['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
+        new_input['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
+        
+
+        return new_input
 
     def return_params(self):
         keys = ['base_model_name','freeze_pretrained','max_input_len',
@@ -1510,8 +1554,9 @@ class NLG(nn.Module):
         json_params = {
             k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.__dict__.keys()
         }
+
         json_params = {
-            k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.nlg_tokenizer.__dict__.keys()
+            k:json.dumps(self.nlg_tokenizer.__dict__[k]) for k in json_keys if k in self.nlg_tokenizer.__dict__.keys()
         }
 
         params_ = {**params, **json_params}
@@ -1519,7 +1564,10 @@ class NLG(nn.Module):
 
         return params_
 
-    def get_predicted_utterance(self, encoded_input, generation_params):
+
+    def get_predicted_utterance(self, rst_rels, rst_ns,
+            rst_pos, topics, topics_score, 
+            prompt, generation_params={}):
         """Given an encoded input, outputs predictions up until an <EOS> is emmitted
                 The input will have been encoded using nlg_tokenizer
                 
@@ -1529,24 +1577,79 @@ class NLG(nn.Module):
             Returns:
                 [type]: [description]
         """
-        output = self.generate(encoded_input, **generation_params)
-        decoded_text = self.nlg_tokenizer.e2m_tokenizer.decode(output[0],skip_special_tokens=False)
 
-        return decoded_text
+
+        # output = self.generate(encoded_input, **generation_params)
+        # decoded_text = self.nlg_tokenizer.e2m_tokenizer.decode(output[0],skip_special_tokens=True)
+        
+        # Example 
+        # rst_rels = ['Contrast','Temporal']
+        # rst_ns = ['NS','NS']
+        # rst_pos = [0,1]
+        # topics = ('Bitcoin','a new watch')
+        # topics_score = (1.20, 1.501)
+        # prompt = ""
+
+        #type checks
+        if type(topics) == list:
+            topics = tuple(topics)
+        
+        if type(topics_score) == list:
+            topics_score = tuple(topics_score)       
+
+        # default generation params
+            #TODO: add these to config so they are automatically done
+        if 'bad_words_ids' not in generation_params:
+            bad_words = ["<|rst|>","<|ta|>",r"\n", "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|"]
+            bad_words_ids = [model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
+            bad_words_ids = [model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
+            bad_words_ids = bad_words_ids + [[526], [55],[8172], [3467], [59], [6852], [7479],[7879],[13426],[17405],[91],[8614],[930],[10],[9],[12],[1303],[2],[4242], [2235],[46424]]
+            generation_params['bad_words_ids'] = bad_words_ids
+        else:
+            bad_words_ids = None
+
+        default_generation_params = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':2.0, 
+                            'early_stopping':True, 'do_sample':False, 'no_repeat_ngram_size':3, 'bad_words_ids':bad_words_ids, 'max_length':300 } #,'min_length':4
+
+        for key,value in default_generation_params.items():
+            if key not in generation_params:
+                generation_params[key] = value
+
+
+        encoded_input = self.nlg_tokenizer.encode_v2_exda(rst_rels, rst_ns, rst_pos ,
+                                                    topics, topics_score, prompt,
+                                                    pad_utterance=False, generate_mode=True)
+
+            # Add batch dimension to data and moving to GPU
+        device = next(self.parameters()).device
+        for key in ['tnsr_rst_rels', 'tnsr_rst_ns', 'tnsr_rst_pos',
+                    'tnsr_topics_phrase','tnsr_topics_score','tknzd_utt',
+                    'position_ids','token_type_ids',
+                        'attention_mask','rst_start_token']:
+            encoded_input[key] = torch.unsqueeze( encoded_input[key],axis=0).to(device)
+
+            # Generating Text
+        output = self.generate(encoded_input, **generation_params)
+        gen_text = self.nlg_tokenizer.e2m_tokenizer.decode(output[0],skip_special_tokens=True)
+
+        return gen_text
 
     def prepare_inputs_for_generation(self, input_ids, input_embeds, position_embeds,
             attention_mask,token_type_ids ,past=None, **kwargs):
         
         # only last token for input_ids if past is defined in kwargs
-        if past:
+        if past != None:
             #input_ids = input_ids[:, -1].unsqueeze(-1)
             input_embeds = input_embeds[:, -1, :].unsqueeze(-2)
+            position_embeds = position_embeds[:, -1, :].unsqueeze(-2)
+            attention_mask = attention_mask[ :, -1, :].unsqueeze(-2)
+
             #TODO: may also have to crop the input_embeds and attneiton_mask
         
         return {
             #"input_ids": input_ids,
             'input_embeds':input_embeds,
-            "attn_mask": attention_mask,
+            "attention_mask": attention_mask,
             'position_embeds': position_embeds,
             "past_key_values": past,
             "token_type_ids": None,
@@ -1815,7 +1918,7 @@ class NLG_tokenizer():
                  'tnsr_topics_phrase':tnsr_topics_phrase.contiguous(),
                   'tnsr_topics_score': tnsr_topics_score,
                  'tknzd_utt':tknzd_utt.contiguous(),
-                 'attn_mask':attn_mask.contiguous(),
+                 'attention_mask':attn_mask.contiguous(),
                  'labels':labels,
                  'position_ids':position_ids.contiguous(),
                  'token_type_ids':token_type_ids.contiguous()
@@ -1923,7 +2026,7 @@ class NLG_tokenizer():
                  'tnsr_topics_phrase':tnsr_topics_phrase.contiguous(),
                   'tnsr_topics_score': tnsr_topics_score,
                  'tknzd_utt':tknzd_utt.contiguous(),
-                 'attn_mask':attn_mask.contiguous(),
+                 'attention_mask':attn_mask.contiguous(),
                  'labels':labels,
                  'position_ids':position_ids.contiguous(),
                  'token_type_ids':token_type_ids.contiguous()
@@ -2971,6 +3074,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 
 # CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 86 -agb 3 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 16 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
+# CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 24 -agb 10 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 17 --precision 16 --mode train_new -lr 18e-4 -me 70 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2-medium" --dir_data "./dataset_v2/reddit_large_annotated"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 

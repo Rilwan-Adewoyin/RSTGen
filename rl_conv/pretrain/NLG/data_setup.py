@@ -603,7 +603,25 @@ def _preprocess(text,title_only,subreddit):
     li_format_txt = [ question_punctuation(subtxt) for subtxt in li_segmented_txt]
     text_new = ' '.join(li_format_txt)
 
+    #Correcting any non capitalized text
+    text_new = capitalize(text_new)
+
     return text_new
+
+def capitalize(text):
+    punc_filter = re.compile('([.!?;]\s+)')
+    
+    split_with_punctuation = punc_filter.split(text)
+        
+    for i,j in enumerate(split_with_punctuation):
+        if len(j) > 0:
+        #if True:
+            split_with_punctuation[i] = j[0].upper()
+            if len(j) > 1:
+                split_with_punctuation[i] += j[1:]
+            
+    text = ''.join(split_with_punctuation)
+    return text
 
 def question_punctuation(utt):
     """Add question punctuation"""
@@ -651,8 +669,8 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
     json_li_li_utterance = json.dumps(li_li_utterances)
 
-    cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance, '--redirect_output', "2"]
-    exit_code,output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
+    cmd = ['python','parser_wrapper3.py','--json_li_li_utterances', json_li_li_utterance, '--redirect_output', "False"]
+    exit_code, output = fh_container.exec_run( cmd, stdout=True, stderr=True, stdin=False, 
                         demux=True)
     stdout, stderr = output
     
@@ -676,6 +694,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         # raise Exception
         return new_li_li_thread_utterances
     
+    # parsing encoded tree
     for idx, str_tree in enumerate(li_strtree):
         li_thread_utterances = li_li_thread_utterances[idx]
         li_subtrees = []
@@ -692,7 +711,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
         
-        # A list of strings
+        # A list of strings - the text in a discourse unit
         li_dus = [ _tree_to_li_du(_tree) if _tree != None else None for _tree in li_subtrees ]
 
         # Keeping non erroneous utterances within a conversation - bad trees were assigned None
