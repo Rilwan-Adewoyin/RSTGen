@@ -378,6 +378,7 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
 
             if os.path.exists(old_fp) and old_fp!=new_fp:
                 os.remove(old_fp)
+                
             
 
             # Updating record of last batch operated on for each subreddit
