@@ -2416,7 +2416,6 @@ class TrainingModule(pl.LightningModule):
                         check_val_every_n_epoch=1, logger=tb_logger,
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
-                        #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator=accelerator,
                         #limit_train_batches =10,
                         #limit_val_batches = 10,
@@ -2440,7 +2439,6 @@ class TrainingModule(pl.LightningModule):
                     log_every_n_steps=20,   
                     precision=tparams['precision'],
                     callbacks=callbacks,
-                    #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
                     #limit_train_batches = 0.4,
                     #val_check_interval=0.5,
@@ -2993,7 +2991,7 @@ class SingleDataset(torch.utils.data.Dataset):
             topics_score = None
         
         #Utterance
-        utterance = datum['txt_preproc'].values[0]
+        utterance = json.loads( datum['txt_preproc'].values[0] )
         
         
         return das, rst_rels, rst_ns, rst_pos, topics, topics_score, utterance
@@ -3070,10 +3068,12 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 11 --precision 16 --mode train_new -lr 1e-5 -me 60 -mil 160 --tag "no freezing full rst, lower learning rate" --base_model_name "distilgpt2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 44 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 
 # CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 86 -agb 3 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 16 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 48 -agb 4 --gpus 2 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 161 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics, amended issue where txt_preproc was not being josn parsed so qoutation marks existed around text " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
 # CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 24 -agb 10 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 17 --precision 16 --mode train_new -lr 18e-4 -me 70 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2-medium" --dir_data "./dataset_v2/reddit_large_annotated"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
