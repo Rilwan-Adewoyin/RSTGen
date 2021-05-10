@@ -17,6 +17,7 @@ rl_conv/pretrain/DialogueAct/cachedata
 #NLG
 rl_conv/pretrain/NLG/dataset/*
 rl_conv/pretrain/NLG/dataset_v2/*
+rl_conv/pretrain/NLG/dataset*
 rl_conv/pretrain/NLG/Evaluation/*
 rl_conv/pretrain/NLG/dataset_opensubs
 rl_conv/pretrain/NLG/dataset_*
