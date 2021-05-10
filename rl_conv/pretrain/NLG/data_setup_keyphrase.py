@@ -102,7 +102,7 @@ def main(   batch_process_size=20,
         print(f"\nOperating on Subreddit: {subreddit}. {li_subreddit_fp.index((subreddit,li_fp))} of {len(li_subreddit_fp)}")
         
         #Should only be one file in li_fp
-        assert len(li_fp) == 1
+        #assert len(li_fp) == 1
         fp = li_fp[0]
 
         dset_source = pd.read_csv( fp, usecols=['rst','txt_preproc','subreddit'] )
@@ -124,8 +124,8 @@ def main(   batch_process_size=20,
                 auto_fnd_failed()
                 
             else: #if file does not exists
-                df_records = pd.from_csv( fn, index_col = "subreddit" )
-                _bool_record_check = reddit_dataset_version in df_records.index.tolist()
+                df_records = pd.read_csv( fn, index_col = "subreddit" )
+                _bool_record_check = subreddit in df_records.index.tolist()
 
                 if not _bool_record_check:
                     start_batch = 0
@@ -134,6 +134,9 @@ def main(   batch_process_size=20,
                     start_batch = int( df_records.loc[ subreddit, 'last_batch' ] ) + 1
                     batch_process_size = int( df_records.loc[subreddit, 'batch_process_size'] )
         
+                print(f"Skipping forwards {start_batch} batches")
+                dset_source = dset_source[start_batch*batch_process_size:]
+
         else:
             start_batch = 0
         # endregion
@@ -148,46 +151,54 @@ def main(   batch_process_size=20,
             
             batch_li_dict_utt =  dset_source.iloc[:batch_process_size].to_dict('records')
             
-            # decoding json encoded text
+            # decoding json encoded text and # removing entries which don't have have rst of length over 1 
+            _batch_li_dict_utt = []
             for idx in range(len(batch_li_dict_utt)):
-                batch_li_dict_utt[idx]['txt_preproc'] = ujson.loads(batch_li_dict_utt[idx]['txt_preproc'])                 
-                batch_li_dict_utt[idx]['subreddit'] = ujson.loads(batch_li_dict_utt[idx]['subreddit'])                 
-
-            print(f"\n\tOperating on batch {batches_completed} of {total_batch_count}")
-
-            #region Segmentating the text into EDUs
-            timer.start()
-            
-            with mp.Pool(mp_count) as pool:
-                # res = pool.starmap( edu_segmenter, 
-                #             _chunks(batch_li_dict_utt, math.ceil(batch_process_size/mp_count) )  )
                 
-                res = pool.map(edu_segmenter, _chunks(batch_li_dict_utt, math.ceil(batch_process_size/mp_count)), chunksize=1 )
-            
-            
-            batch_li_li_edusegment = sum(res, [])
-                        
-            assert len( batch_li_li_edusegment) == len(batch_li_dict_utt)
-             
-            for dict_ , li_edusegments in zip(batch_li_dict_utt, batch_li_li_edusegment ):
-                dict_['li_edus'] = li_edusegments
+                rst_ = ujson.loads(batch_li_dict_utt[idx]['rst'])  
+                
+                if len(rst_)>1:
+                    # batch_li_dict_utt[idx]['rst'] = rst_
+                    # batch_li_dict_utt[idx]['txt_preproc'] = ujson.loads(batch_li_dict_utt[idx]['txt_preproc'])                 
+                    # batch_li_dict_utt[idx]['subreddit'] = ujson.loads(batch_li_dict_utt[idx]['subreddit'])  
 
-            timer.end("\t\tEDU Segmentation")
-            #endregion
+                    _batch_li_dict_utt.append( {'rst':rst_, 'txt_preproc':ujson.loads(batch_li_dict_utt[idx]['txt_preproc']),
+                         'subreddit':ujson.loads(batch_li_dict_utt[idx]['subreddit']) } )
+                else:
+                    pass
+            
+            batch_li_dict_utt =  _batch_li_dict_utt
 
-            #region  Key phrase for Each EDU
+                
+            print(f"\n\tOperating on batch {batches_completed+1} of {total_batch_count}")
+
+            #region mp.imap EDU and Key Phrase Extraction
             timer.start()
+            
             with mp.Pool(mp_count) as pool:
-                #res = pool.map( _key_phrase, _chunks(batch_li_li_edusegment, batch_process_size//mp_count) )
-                res = pool.map( _key_phrase, _chunks(batch_li_li_edusegment, math.ceil(batch_process_size/mp_count)), chunksize=1 )
+                
+                #res = pool.map(edu_segmenter, _chunks(batch_li_dict_utt, math.ceil(batch_process_size/mp_count)), chunksize=1 )
 
-            batch_li_li_kp_score = list( res ) 
-            batch_li_li_kp_score = sum(batch_li_li_kp_score, [])
+                cs =  math.ceil(batch_process_size/ (mp_count*3) )
+                res = pool.imap(edu_segmenter, _chunks(batch_li_dict_utt, cs) )
+                                        
+                res = pool.imap( _key_phrase, res )
 
-            for dict_ , li_kp_score in zip(batch_li_dict_utt, batch_li_li_kp_score ):
-                dict_['li_kp_score'] = li_kp_score
+                try:
+                    batch_li_dict_posname_likpscore, batch_li_li_edusegment = zip(*list(res))
+                
+                except TypeError as e:
+                    batch_li_dict_posname_likpscore = []
+                    batch_li_li_edusegment = []
 
-            timer.end("\t\tKey Phrase Extraction")
+            batch_li_dict_posname_likpscore = sum(batch_li_dict_posname_likpscore, [])
+            batch_li_li_edusegment = sum(batch_li_li_edusegment, [])
+
+            timer.end("\t\tEDU parsing and Key Phrase Extraction")
+
+            for dict_ , li_edusegments, li_kp_score in zip(batch_li_dict_utt, batch_li_li_edusegment, batch_li_dict_posname_likpscore ):
+                dict_['li_edus'] = li_edusegments
+                dict_['li_dict_posname_likpscore'] = li_kp_score
             #endregion
 
             #region Saving Batches
@@ -226,6 +237,8 @@ def edu_segmenter( li_dict_rsttext ):
     # for each utterance, merge list of words into one text
     li_li_edus = [ [ ' '.join( edus ) for edus in li_edus ] for li_edus in li_li_edus ]
     
+    li_li_edus = [ [edutxt.replace(" n't", "n't").replace(" / ", "/").replace(" '", "'") if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_text) ]
+
     return li_li_edus
 
 
@@ -268,96 +281,59 @@ def _key_phrase(li_li_edusegment):
         # Our system has four possible sugesstions for each EDU s1,s2,s3,s4
         # s_i is accepted if it is below a certain length relative to the original text, otherwise we consider s_(i+1)
     
-    li_li_kp_score = []
+    #making spacy model #spedding up textrank processing
+    spacy_kwargs = {'disable': ['ner', 'textcat', 'parser']}
+    spacy_model = spacy.load('en_core_web_sm', **spacy_kwargs)
+    spacy_model.add_pipe('sentencizer')
+    extractor = pke.unsupervised.TextRank()
+
+    # Defining Pos tags for each EDU. We prefer to use results from pos3 to pos0 in that order
+    pos0 = {'NOUN',  'PROPN' ,'ADJ','VERB','PRON', 'SYM','ADV','DET',        'PART','X'}
+    pos1 = {'NOUN',  'PROPN' ,'ADJ', 'VERB',     'SYM','ADP','AUX',        'PART','X'}
+    dict_pos = { 'pos1': pos1, 'pos0':pos0}
+
+    li_dict_posname_likpscore = []
 
     for i in range(len(li_li_edusegment)):
 
         li_edusegment = li_li_edusegment[i]
 
-        #TODO: here evaluate different ways to extract 'key phrase' from short chunks
-        li_kp_score = [ _key_phrase_extractor(edusegment)             
+        dict_posname_likpscore = [ _key_phrase_extractor(edusegment, extractor=extractor, spacy_model=spacy_model, dict_pos=dict_pos)             
                             for edusegment in li_edusegment ]
         
         
-        li_li_kp_score.append( li_kp_score )
+        li_dict_posname_likpscore.append( dict_posname_likpscore )
         
-    return li_li_kp_score
+    return li_dict_posname_likpscore, li_li_edusegment
 
 
-def _key_phrase_extractor(str_utterance, lowest_score=0.0):
-    #pke pytext rank extractor incorrectly seperates words with apostrophes into two chunks.
-        # e.g. You're -> You are. 
-    # as such we seperate these words into their non contractiosn form 
-    #str_utterance = 
+def _key_phrase_extractor(str_utterance, extractor, spacy_model=None, dict_pos=[]):
+    #returns the first key phrase that is under half the original text length
+    
+    dict_posname_likpscore = {}
 
-    # Defining Pos tags for each EDU
-    pos0 = {'NOUN',  'PROPN' ,'ADJ', 'VERB','AUX',                               'ADV', 'DET'}
-    pos1 = {'NOUN',  'PROPN' ,'ADJ', 'VERB','AUX',                       'PART','ADV', 'DET'}
-    pos2 =  {'NOUN', 'PROPN', 'ADJ', 'VERB','AUX',     'NUM','SYM','PRON','PART','ADV'}
-    pos3 = {'NOUN', 'PROPN', 'ADJ', 'VERB','AUX','ADP','NUM','SYM','PRON','PART','ADV' ,'INTJ'} 
-    li_pos = [pos3, pos2, pos1, pos0]
+    for pos_name, pos in dict_pos.items():
 
-    for pos in li_pos:
-
-        kp_score = _textrank_model( str_utterance, pos )
+        # extracting kp and score
+        extractor.reset()
+        extractor.load_document(input=str_utterance, language='en',normalization=None, spacy_model=spacy_model)
+        extractor.candidate_selection(pos=pos)
+        extractor.candidate_weighting(window=2, normalized=True, pos=pos)
         
-        # testing length of suggestion is not over 50% of original utterance
-        if len( kp_score[0].split(' ') )*2 <= len( str_utterance.split(' ') ):
-            break
-    
-    return kp_score
-
-def _textrank_model( str_utterance, pos):
-
-    extractor = pke.unsupervised.TextRank()
-
-    extractor.load_document(input=str_utterance, language='en',normalization=None)
-    extractor.candidate_selection(pos=pos)
-    extractor.candidate_weighting(window=2, normalized=True, pos=pos)
-    
-    
-    li_kp_score = extractor.get_n_best(n=1, redundancy_removal=True)
-    li_kp_score = key_phrase_fixer(li_kp_score, str_utterance)
-
-    # converting from list of tuples to list of list
-    li_kp_score = [ list(kp_score) for kp_score in li_kp_score]
-
-    if len(li_kp_score) == 0:
-        li_kp_score = [["",0.0]]
-    
-    kp_score = li_kp_score[0]
-    return kp_score
-
-def key_phrase_fixer(li_kp_score, orig_text):
-    
-    for idx in range(len(li_kp_score)):
-        kp = li_kp_score[idx][0]
+        li_kp_score = extractor.get_n_best(n=2, redundancy_removal=False)
         
-        if kp not in orig_text:
-            # capitalize
-            #kp_capitalized = kp.capitalize()
-            kp_fix = kp.replace(" '", "'") #fixing single qoute
-            kp_fix = kp_fix.replace(" / ", "/") #fixing slash with spaces around it 
-            kp_fix = kp_fix.replace(" n't", "n't") # fixing seperated n't
-            
-            
-            # if kp_capitalized in orig_text:
-            #     kp_corrected = kp_capitalized
-            
-            # correct single qoute mark error
-            if  kp_fix in orig_text:
-                kp_corrected = kp_fix
-            
-            # elif kp_capitalized_singleqoute in orig_text:
-            #     kp_corrected = kp_capitalized_singleqoute
-            
-            else:
-                kp_corrected = kp
-        
-            li_kp_score[idx] = ( kp_corrected, li_kp_score[idx][1] )
-    
-    return li_kp_score
+        li_kp_score = [ [kp_score[0].replace(" n't", "n't").replace(" / ", "/").replace(" '", "'") if kp_score[0] not in str_utterance else kp_score[0], kp_score[1] ] for kp_score in li_kp_score ]
 
+        # converting from list of tuples to list of list
+        #li_kp_score = [ list(kp_score) for kp_score in li_kp_score]
+        
+        if len(li_kp_score) == 0:
+            li_kp_score = [["",0.0]]
+        
+                
+        dict_posname_likpscore[pos_name] = li_kp_score
+    
+    return dict_posname_likpscore
 
 def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
                 batch_process_size=120):
@@ -441,10 +417,10 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=40,
+    parser.add_argument('-bps','--batch_process_size', default=12,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=4, type=int)
+    parser.add_argument('--mp_count', default=3, type=int)
     
     parser.add_argument('-rp','--resume_progress', default=0, type=lambda x: bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
@@ -464,6 +440,7 @@ if __name__ == '__main__':
             print(e)
             print(traceback.format_exc())
             dict_args['start_batch'] = batches_completed + 1
+            dict_args['resume_progress'] = True
             
         finally :
             # cmd = "docker stop $(docker ps -aq) > /dev/null 2>&1 & docker rm $(docker ps -aq) > /dev/null 2>&1 & docker rmi $(docker images -a -q) > /dev/null 2>&1"
