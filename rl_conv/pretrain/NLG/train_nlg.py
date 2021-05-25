@@ -2262,7 +2262,10 @@ class TrainingModule(pl.LightningModule):
             train_params_to_save = self.return_params()
             model_params_to_save = self.model.return_params()
 
-            self.hparams = { **train_params_to_save, **model_params_to_save}
+            try:
+                self.hparams = { **train_params_to_save, **model_params_to_save}
+            except Exception as e:
+                self.hparams.update({ **train_params_to_save, **model_params_to_save})
 
             self.inference_samples = list( islice( self.inference_dl, 10 ) )
             bad_words = ["<|rst|>","<|ta|>",r"\n" ] 
@@ -2274,8 +2277,8 @@ class TrainingModule(pl.LightningModule):
             generation_params = {'num_beams':1, 'temperature':1.1, 'repitition_penalty':1.2, 
                                 'top_k': 50, 'top_p':0.85,
                                 'length_penalty':1.5, 'early_stopping':True,
-                                'do_sample':True, 'bad_words_ids':bad_words_ids, 'no_repeat_ngram_size':3
-                                ,'min_length':5, 'max_length':80  } 
+                                'do_sample':True, 'bad_words_ids':bad_words_ids, 'no_repeat_ngram_size':3,
+                                'min_length':5, 'max_length':80  } 
                                 
                                 # 'max_length':self.model.nlg_tokenizer.max_input_len  } 
             

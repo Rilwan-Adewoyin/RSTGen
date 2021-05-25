@@ -20,6 +20,8 @@ import csv
 import pickle
 import time
 
+import copy 
+
 from filelock import Timeout, FileLock
 
 import regex as re
@@ -48,7 +50,8 @@ import spacy
 
 import ujson
 
-def main(   batch_process_size=20,
+def main(   dsetname,
+            batch_process_size=20,
             mp_count=5,
             start_batch=-1,
             end_batch = 0,
@@ -65,102 +68,97 @@ def main(   batch_process_size=20,
     #Creating Save directory
     dir_save_dataset = utils_nlg.get_path("./dataset_atomic2020/",_dir=True)
     
-    dset_names = [ "train", "dev", "test" ]
-    dict_dsetname_fp = {
-        dset_name: os.path.join( dir_save_dataset,dset_name+".tsv" ) for dset_name in dset_names
-    }
+    fp = os.path.join( dir_save_dataset,dsetname+".tsv" )
 
-    for dsetname, fp in dict_dsetname_fp.items():
-        print(f"Preprocessing {dsetname} dataset")
+    print(f"Preprocessing {dsetname} dataset")
 
-        df_data = pd.read_csv( fp, names=['head','relation','tail'], sep="\t" )
+    df_data = pd.read_csv( fp, names=['head','relation','tail'], sep="\t" )
 
-        total_batch_count = math.ceil(len(df_data)/batch_process_size)
+    total_batch_count = math.ceil(len(df_data)/batch_process_size)
 
-        # Optionally auto-resuming from last completed batch
-        if start_batch == -1:
+    #region Optionally auto-resuming from last completed batch
+    if start_batch == -1:
 
-            # checking if df_records exists and if a column for this dataset exists
-            fn = os.path.join(dir_save_dataset,'last_batch_record')
-            _bool_file_check = os.path.exists( fn )
+        # checking if df_records exists and if a column for this dataset exists
+        fn = os.path.join(dir_save_dataset,'last_batch_record')
+        _bool_file_check = os.path.exists( fn )
+        
+        if not _bool_file_check: #s if file does exist
+            start_batch = 0
+            print("User choose auto-resume from last recorded batch.\
+                    But no last records file exists, so initialising from batch 0")
             
-            if not _bool_file_check: #s if file does exist
+        else: #if file does exists
+            df_records = pd.read_csv( fn, index_col='dsetname' )
+            
+            _bool_record_check = dsetname in df_records.index.tolist()
+
+            if not _bool_record_check:
+                print(f"User choose auto-resume from last recorded batch.\
+                        Last records file exists, but there is not record for {dsetname}.tsv, \
+                        so initialising from 0")
                 start_batch = 0
-                print("User choose auto-resume from last recorded batch.\
-                        But no last records file exists, so initialising from batch 0")
-                
-            else: #if file does exists
-                df_records = pd.read_csv( fn, index='dsetname' )
-                
-                _bool_record_check = dsetname in df_records.index.tolist()
-
-                if not _bool_record_check:
-                    print(f"User choose auto-resume from last recorded batch.\
-                            Last records file exists, but there is not record for {dsetname}.tsv, \
-                            so initialising from 0")
-                    start_batch = 0
-                
-                else:
-                    start_batch = int( df_records.loc[ dsetname, 'last_batch' ] ) + 1
-                    batch_process_size = int( df_records.loc[dsetname, 'batch_process_size'] )
             
-        # selecting sub batch to operate on if applicable
-        if end_batch != 0:
-            df_data = df_data.iloc[ : end_batch*batch_process_size] 
-        if start_batch != 0:
-            df_data = df_data.iloc[ start_batch*batch_process_size: ]
+            else:
+                start_batch = int( df_records.loc[ dsetname, 'last_batch' ] ) + 1
+                batch_process_size = int( df_records.loc[dsetname, 'batch_process_size'] )
+        
+    # selecting sub batch to operate on if applicable
+    if end_batch != 0:
+        df_data = df_data.iloc[ : end_batch*batch_process_size] 
+    if start_batch != 0:
+        df_data = df_data.iloc[ start_batch*batch_process_size: ]
 
-        # endregion
-        timer = Timer()
+    # endregion
+    timer = Timer()
 
-        #region operating on batches
-        global batches_completed
-        batches_completed = start_batch
+    global batches_completed
+    batches_completed = start_batch
 
-        while len(df_data) > 0 :
-            
-            batch_li_kgtriple =  df_data.iloc[:batch_process_size].to_dict('records')
-            
-            print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
+    while len(df_data) > 0 :
+        
+        batch_li_kgtriple =  df_data.iloc[:batch_process_size].to_dict('records')
+        
+        print(f"\nOperating on batch {batches_completed} of {total_batch_count}")
 
-            #region Filtering out invalid datums
-            timer.start()
-            
-            with mp.Pool(mp_count) as pool:
-                res = pool.map( kgtriplet_filter, _chunks(batch_li_kgtriple, batch_process_size//mp_count )  )
-            
+        #region Filtering out invalid datums
+        timer.start()
+        
+        with mp.Pool(mp_count) as pool:
+            res = pool.map( kgtriplet_filter, _chunks(batch_li_kgtriple, batch_process_size//mp_count )  )
+        
             batch_li_kgtriple = list( res ) 
             batch_li_kgtriple = sum(batch_li_kgtriple, [])
-                                     
-            timer.end("Filtering triplets")
-            #endregion
+                                    
+        timer.end("Filtering triplets")
+        #endregion
 
-            #region  Editing the remaining datums
-            timer.start()
-            with mp.Pool(mp_count) as pool:
-                res = pool.map( kgtriplet_fixer , _chunks(batch_li_kgtriple, batch_process_size//mp_count) )
+        #region  Editing the remaining datums
+        timer.start()
+        with mp.Pool(mp_count) as pool:
+            res = pool.map( kgtriplet_fixer , _chunks(batch_li_kgtriple, batch_process_size//mp_count) )
 
             batch_li_kgtriple = list( res ) 
             batch_li_kgtriple = sum(batch_li_kgtriple, [])
 
-            timer.end("Fixing remaining triplets")
-            #endregion
+        timer.end("Fixing remaining triplets")
+        #endregion
 
-            #region Saving Batches
-            timer.start()
+        #region Saving Batches
+        timer.start()
 
-                # format = subreddit/convo_code
-            if len(batch_li_kgtriple)>0:
-                _save_data(batch_li_kgtriple, dir_save_dataset, dsetname , batches_completed, batch_process_size)
+            # format = subreddit/convo_code
+        if len(batch_li_kgtriple)>0:
+            _save_data(batch_li_kgtriple, dir_save_dataset, dsetname , batches_completed, batch_process_size)
 
-            df_data = df_data[batch_process_size:]
-            batches_completed += 1
-            timer.end("Saving")
+        df_data = df_data[batch_process_size:]
+        batches_completed += 1
+        timer.end("Saving")
 
-            #end region    
+        #end region    
 
-        print(f"Completed {dset_name}: Finished at batch {batches_completed}")        
-    
+    print(f"Completed {dsetname}: Finished at batch {batches_completed}")        
+
 
 def kgtriplet_filter( li_kgtriple ):
     """[summary]
@@ -176,38 +174,6 @@ def kgtriplet_filter( li_kgtriple ):
     # Each filter check returns True for valid entries.
     # We remove values which return False
 
-    bad_heads = ["PersonX makes PersonY's laws","PersonX makes PersonY's mom"]
-    
-    def check(head, rel, tail):
-        
-        # filter: tail less than two letters
-        bool_2ltr = len(tail)>2
-        if bool_2ltr == False:
-            return False
-        
-        # filter: checking the value of tail
-        bool_illegal_words = tail.lower() not in ["none"]
-        if bool_illegal_words == False:
-            return False
-        
-        # filter: remove triplet where tail only has punctuation :[check any is alphanumeric]
-        bool_any_alphanum = any( i.isalnum() for i in iter(tail) )
-        if bool_any_alphanum == False:
-            return False
-        
-        # filter: remove lines that have _{1,5} in head/tail if the relation is not IsFilledBy
-        bool_check_gap = (rel == "isFilledBy") or ("__" not in head + " " + tail) 
-        if bool_check_gap == False:
-            return False
-
-        # filter: remove silly heads. These heads are only a problem for the relations that begin with o or x
-        bool_check_good_head = (rel in ['isAfter', 'isBefore', 'HinderedBy']) or  (head not in bad_heads)
-        if bool_check_good_head== False:
-            return False
-        
-        return True
-
-
     for idx in range(len(li_kgtriple)-1,-1,-1):
 
         head = li_kgtriple[idx]['head']
@@ -221,6 +187,37 @@ def kgtriplet_filter( li_kgtriple ):
     
     return li_kgtriple
 
+    
+def check(head, rel, tail):
+    bad_heads = ["PersonX makes PersonY's laws","PersonX makes PersonY's mom"]
+    
+    # filter: checking the value of tail
+    bool_illegal_vals = type(tail)==str and ( tail.lower() not in ["none"] )
+    if bool_illegal_vals == False:
+        return False
+    
+    # filter: tail less than two letters
+    bool_2ltr = len(tail)>2
+    if bool_2ltr == False:
+        return False
+            
+    # filter: remove triplet where tail only has punctuation :[check any is alphanumeric]
+    bool_any_alphanum = any( i.isalnum() for i in iter(tail) )
+    if bool_any_alphanum == False:
+        return False
+    
+    # filter: remove lines that have _{1,5} in head/tail if the relation is not IsFilledBy
+    bool_check_gap = (rel == "isFilledBy") or ("__" not in head + " " + tail) 
+    if bool_check_gap == False:
+        return False
+
+    # filter: remove silly heads. These heads are only a problem for the relations that begin with o or x
+    bool_check_good_head = (rel in ['isAfter', 'isBefore', 'HinderedBy']) or  (head not in bad_heads)
+    if bool_check_good_head== False:
+        return False
+    
+    return True
+
 
 def kgtriplet_fixer(li_kgtriple):
     """[Removes triplets according to the following scheme]
@@ -228,14 +225,6 @@ def kgtriplet_fixer(li_kgtriple):
     Args:
         li_kgtriple ([type]): [description]
     """
-    def fullstop_remove(text):
-        text = text[:-1] if text[-1] == "." else text 
-        return text
-
-    def insert_mask_token(text):
-        text =  ' '.join( [ "<mask>" if "_" in word else word for word in text.split(' ')] )
-        return text
-
 
     for idx in range(len(li_kgtriple)):
 
@@ -262,9 +251,15 @@ def kgtriplet_fixer(li_kgtriple):
             head = insert_mask_token(head)
             tail = insert_mask_token(tail)
 
-
     return li_kgtriple
 
+def fullstop_remove(text):
+    text = text[:-1] if text[-1] == "." else text 
+    return text
+
+def insert_mask_token(text):
+    text =  ' '.join( [ "<mask>" if "_" in word else word for word in text.split(' ')] )
+    return text
 
 def split(sequence, sep):
     chunk = []
@@ -280,7 +275,6 @@ def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
         
 def _save_data(li_kgtriple, dir_save_dataset, dsetname ,last_batch_operated_on=0,
                 batch_process_size=120 ) :
@@ -327,8 +321,7 @@ def _save_data(li_kgtriple, dir_save_dataset, dsetname ,last_batch_operated_on=0
             df_records.loc[ dsetname, [k] ] =  v
 
         df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), )
-
-          
+      
 class Timer():
     def __init__(self):
         self.start_time = None
@@ -346,14 +339,15 @@ class Timer():
         print(f"\t{segment_name} segment: {time_taken} secs")
             
 if __name__ == '__main__':
+    #region parser
     parent_parser = argparse.ArgumentParser(add_help=False) 
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=120,
+    parser.add_argument('-bps','--batch_process_size', default=700,
         help='',type=int)        
    
-    parser.add_argument('--mp_count', default=1, type=int)
+    parser.add_argument('--mp_count', default=7, type=int)
     
     parser.add_argument('-sb','--start_batch', default=-1, type=int, help="batch of data to start from. Pass \
                                     in -1 for this batch to be autodetermined from records" )
@@ -364,19 +358,22 @@ if __name__ == '__main__':
     
     dict_args = vars(args)
 
-    completed = False
-    
-    while completed == False:
-        try:
-            main( **dict_args )
-            completed = True
-        except Exception as e:
-            print(e)
-            print(traceback.format_exc())
-            dict_args['start_batch'] = batches_completed + 1
-            time.sleep(5)
-        finally:
-            pass
+
+    #endregion 
+    for dsetname in [ "train", "dev", "test" ]:
+        completed = False
+        dict_args_1 = copy.deepcopy(dict_args)
+        while completed == False:
+            try:
+                main( dsetname, **dict_args_1 )
+                completed = True
+            except Exception as e:
+                print(e)
+                print(traceback.format_exc())
+                dict_args_1['start_batch'] = batches_completed + 1
+                time.sleep(5)
+            finally:
+                pass
 
 
-#python3 data_setup_cskg.py -bps 60 -sb -1 --mp_count 6
+#python3 data_setup_cskg.py -bps 600 -sb -1 --mp_count 6
