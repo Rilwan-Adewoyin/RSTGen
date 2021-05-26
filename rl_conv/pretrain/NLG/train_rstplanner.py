@@ -345,6 +345,9 @@ class RSTPlanner():
         if cond_rstlength != None:
             assert sampling_method != "greedy"
 
+        if cond_subreddit not in self.dict_subreddit_markovdistr:
+            self.create_markovian_distr(cond_subreddit, data_filters={} , smoothing_method=None)
+
         markov_distribution = self.dict_subreddit_markovdistr[cond_subreddit]
 
         rst_seq = copy.deepcopy( cond_parentnodes )
@@ -549,7 +552,6 @@ class RSTPlanner():
 
         return ujson.loads(next_rst_chunk)
 
-
     def sample_length_enforcer( self, cond_distr, cond_rstlength, rst_chunk, rst_seq, child_node_pos):
 
         #markov_distribution1 = copy.deepcopy(markov_distribution)
@@ -639,7 +641,7 @@ class RSTPlanner():
         parser.add_argument('-mcnp', '--maximum_child_node_pos', default=30)
         parser.add_argument('-df','--data_filters', default="{}" )
         parser.add_argument('-sm','--sampling_params',
-                                default= "{ \"sampling_params\":\"random\", \"cond_subreddit\":\"aggregated\", \"cond_rstlength\":7, \"reduce_rel_space\":True }")
+                                default= "{ \"sampling_method\":\"random\", \"cond_subreddit\":\"aggregated\", \"cond_rstlength\":7, \"reduce_rel_space\":True }")
         
         mparams = parser.parse_known_args( )[0]
 

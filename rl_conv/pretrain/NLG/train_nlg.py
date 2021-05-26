@@ -66,7 +66,7 @@ from transformers.generation_logits_process import (
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
-def monkey_save_model(self, filepath: str, trainer, pl_module):
+def monkey_save_model(self, trainer, filepath: str):
     # in debugging, track when we save checkpoints
     trainer.dev_debugger.track_checkpointing_history(filepath)
 
@@ -2392,7 +2392,7 @@ class TrainingModule(pl.LightningModule):
             filename='{epoch:03d}_{val_loss:.5f}')
         
         checkpoint_callback._save_model  = types.MethodType(monkey_save_model,checkpoint_callback) #monkey patch
-        checkpoint_callback._monitor_candidates = types.MethodType(_monitor_candidates, checkpoint_callback) # monkey patch
+        #checkpoint_callback._monitor_candidates = types.MethodType(_monitor_candidates, checkpoint_callback) # monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
@@ -2509,6 +2509,10 @@ class TrainingModule(pl.LightningModule):
             checkpoint_yaml_file = os.path.join( _dir_checkpoint,"best_k_models.yaml" )
             scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
+            
+            if os.path.exists(best_ckpt_path) == False:
+                root_dir = Path(__file__).resolve().parents[4]
+                best_ckpt_path = os.path.join( root_dir._str, best_ckpt_path[ best_ckpt_path.index('mastering-conversation'): ] )
 
             if torch.cuda.is_available():
                 #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage) )

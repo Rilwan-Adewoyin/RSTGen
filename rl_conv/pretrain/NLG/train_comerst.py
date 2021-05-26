@@ -17,6 +17,7 @@ import transformers
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from pytorch_lightning.trainer.supporters import CombinedLoader
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -68,6 +69,7 @@ import ujson
 from torch.nn import CrossEntropyLoss
 from torch.utils.data._utils.collate import default_convert, default_collate
 from torch.nn.utils.rnn import pad_sequence
+from pathlib import Path
 
 
 import names
@@ -103,6 +105,7 @@ class COMERST(nn.Module):
         self.scale_grad_by_freq = scale_grad_by_freq
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
+        self.transformer.comerst = lambda : self
         
         self.tokenizer = COMERST_tokenizer(self.base_model_name,
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
@@ -154,49 +157,84 @@ class COMERST(nn.Module):
         self.transformer.model.forward = types.MethodType(utils.BART_forward, 
                                                     self.transformer.model )
         
+        self.transformer.prepare_inputs_for_generation = types.MethodType(
+            utils.prepare_inputs_for_generation, self.transformer
+        )
+
+        self.transformer.greedy_search = types.MethodType(utils.greedy_search, 
+                                                    self.transformer)
+        
+        self.generate = self.transformer.generate
+        self.config = self.transformer.config
+        self.get_encoder = self.transformer.get_encoder
+        self.get_decoder = self.transformer.get_decoder
+
+        self.pad_values = {'head_ids':self.transformer.model.shared.padding_idx , 
+                        'head_treepos_ids':self.embedding_rst_pos.padding_idx, 
+                        
+                        'rst_rel_ids': self.embedding_rst_rels.padding_idx, 
+                        'rst_treepos_ids': self.embedding_rst_pos.padding_idx,
+                        'rst_ns_ids': self.embedding_rst_ns.padding_idx, 
+
+                        'tail_ids': self.transformer.model.shared.padding_idx , 
+                        'tail_treepos_ids':self.embedding_rst_pos.padding_idx ,
+                        'tail_kp_score': 0,
+
+                        'attention_mask': 0, 
+                        'attention_mask_head': 0, 
+                        'attention_mask_rel': 0, 
+                        #'token_type_ids':self.model.embedding_tokentype.padding_idx , 
+                        'token_type_ids_head':self.embedding_tokentype.padding_idx ,
+                        'token_type_ids_rel':self.embedding_tokentype.padding_idx ,
+                        'labels': self.loss_fct.ignore_index,
+
+                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
+                                        self.transformer.model.encoder.embed_positions.padding_idx else 0  
+                        }
+
     def forward(self, input_, return_dict=None):
 
         return_dict = return_dict if return_dict is not None else self.transformer.config.use_return_dict
 
-        
+        lm_logits_rst = None
+        lm_logits_comet = None
+        output_rst = []
+        output_comet = []
+
         #region forward pass
+        if 'rst' in input_:
+            input_rst = self.forward_embed_rst(**input_['rst'])
+            labels_rst = input_rst.pop('labels')
+            output_rst = self.transformer.model.forward(
+                            **input_rst)
+            lm_logits_rst = self.transformer.lm_head(output_rst[0]) + self.transformer.final_logits_bias
+
+        if 'comet' in input_:
+            input_comet = self.forward_embed_comet(**input_['comet'])
+            labels_comet = input_comet.pop('labels')
+            output_comet = self.transformer.model.forward(
+                            **input_comet)
+            lm_logits_comet = self.transformer.lm_head(output_comet[0]) + self.transformer.final_logits_bias
         
-        input_rst = self.forward_embed_rst(**input_['rst'])
-        input_comet = self.forward_embed_comet(**input_['comet'])
-    
-    
-        # extracting labels
-        labels_rst = input_rst.pop('labels')
-        labels_comet = input_comet.pop('labels')
-
-        output_rst = self.transformer.model.forward(
-            **input_rst
-        )
-        lm_logits_rst = self.transformer.lm_head(output_rst[0]) + self.transformer.final_logits_bias
-
-        output_comet = self.transformer.model.forward(
-            **input_comet,
-        )
-        lm_logits_comet = self.transformer.lm_head(output_comet[0]) + self.transformer.final_logits_bias
-        #endregion
-
-        lm_loss = None
+        # endregion
         lm_loss_rst= None
         lm_loss_comet =None
 
-        if labels_rst is not None and  labels_comet is not None:
+        #region Calculation Losses
+        if labels_rst is not None:
             #the labels are automatically aligned as per the GPT2 code
             #TODO: reevaluate whether bos or eos is the best method to use as start of output
                 # right now we use the edu token to start sentences. The EDU token is just the bos token
-            
             shift_logits_comet = lm_logits_comet[..., :-1, :].contiguous()
             shift_labels_comet = labels_comet[..., 1:].contiguous() 
             lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
 
+        if  labels_comet is not None:
             shift_logits_rst = lm_logits_rst[..., :-1, :].contiguous()
             shift_labels_rst = labels_rst[..., 1:].contiguous() 
             lm_loss_rst = self.loss_fct(shift_logits_rst.view(-1, self.transformer.config.vocab_size), shift_labels_rst.view(-1))
-                       
+        #endregion
+
         if not return_dict:
             lm_loss = [lm_loss_rst, lm_loss_comet]
             _rst = (lm_logits_rst,) + output_rst[1:]
@@ -204,27 +242,38 @@ class COMERST(nn.Module):
             return ((lm_loss,) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
         
         else:
-            
-            # return Seq2SeqLMOutput(
-            #     loss=masked_lm_loss,
-            #     logits=lm_logits,
-            #     past_key_values=outputs.past_key_values,
-            #     decoder_hidden_states=outputs.decoder_hidden_states,
-            #     decoder_attentions=outputs.decoder_attentions,
-            #     cross_attentions=outputs.cross_attentions,
-            #     encoder_last_hidden_state=outputs.encoder_last_hidden_state,
-            #     encoder_hidden_states=outputs.encoder_hidden_states,
-            #     encoder_attentions=outputs.encoder_attentions,
-            #     )
-            output = { 
-                'lm_loss_rst':lm_loss_rst,
-                'lm_loss_comet':lm_loss_comet,
-                'lm_logits_rst':lm_logits_rst,
-                        'lm_logits_comet':lm_logits_comet,
-                        'rst_output':output_rst,
-                        'comet_otuput':output_comet}
+            s1s_output = {}
 
-            return output
+            if lm_logits_rst is not None:
+                s1s_output_rst =  Seq2SeqLMOutput(
+                    loss=lm_loss_rst,
+                    logits=lm_logits_rst,
+                    past_key_values=output_rst.past_key_values,
+                    decoder_hidden_states=output_rst.decoder_hidden_states,
+                    decoder_attentions=output_rst.decoder_attentions,
+                    cross_attentions=output_rst.cross_attentions,
+                    encoder_last_hidden_state=output_rst.encoder_last_hidden_state,
+                    encoder_hidden_states=output_rst.encoder_hidden_states,
+                    encoder_attentions=output_rst.encoder_attentions,
+                    )
+                s1s_output['rst'] = s1s_output_rst
+
+            if lm_logits_rst is not None:
+                s1s_output_comet =  Seq2SeqLMOutput(
+                    loss=lm_loss_comet,
+                    logits=lm_logits_comet,
+                    past_key_values=output_comet.past_key_values,
+                    decoder_hidden_states=output_comet.decoder_hidden_states,
+                    decoder_attentions=output_comet.decoder_attentions,
+                    cross_attentions=output_comet.cross_attentions,
+                    encoder_last_hidden_state=output_comet.encoder_last_hidden_state,
+                    encoder_hidden_states=output_comet.encoder_hidden_states,
+                    encoder_attentions=output_comet.encoder_attentions,
+                    )
+                s1s_output['comet'] = s1s_output_comet
+            
+            return s1s_output 
+
 
     def forward_embed_rst(self,  
                             head_ids,
@@ -396,8 +445,10 @@ class COMERST(nn.Module):
             for batch in list(self.chunks(examples, self.batch_size)):
 
                 batch = self.tokenizer(batch, return_tensors="pt", truncation=True, padding="max_length").to(self.device)
-                input_ids, attention_mask = trim_batch(**batch, pad_token_id=self.tokenizer.pad_token_id)
+                input_ids, attention_mask = utils.trim_batch(**batch, pad_token_id=self.tokenizer.pad_token_id)
 
+
+                 
                 summaries = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -410,6 +461,83 @@ class COMERST(nn.Module):
                 decs.append(dec)
 
             return decs
+
+    def generate_from_dloaderbatch(
+            self, 
+            batch,
+            comet_or_rst="comet",
+            device='cuda:0',
+            generation_kwargs = {}
+            ):
+
+        """[summary]
+
+        
+            [generation_kwargs]: {
+                     do_sample: Optional[bool] = None,
+                    diversity_penalty: Optional[float] = None
+                    early_stopping: Optional[bool] = None,
+                    num_beams: Optional[int] = None,
+                    temperature: Optional[float] = None,
+                    top_k: Optional[int] = None,
+                    top_p: Optional[float] = None,
+                    repetition_penalty: Optional[float] = None,
+                    bad_words_ids: Optional[Iterable[int]] = None,
+                    bos_token_id: Optional[int] = None,
+                    pad_token_id: Optional[int] = None,
+                    eos_token_id: Optional[int] = None,
+                    length_penalty: Optional[float] = None,
+                    no_repeat_ngram_size: Optional[int] = None,
+                    encoder_no_repeat_ngram_size: Optional[int] = None,
+                    num_return_sequences: Optional[int] = None,
+            }
+            Returns:
+        """
+        for key in batch:
+            batch[key] = batch[key].to(device)
+
+        with torch.no_grad():
+            #examples = queries
+            tail_treepos_ids = batch['tail_treepos_ids'][:,:1]
+
+            if comet_or_rst == "comet":
+                input_ = self.forward_embed_comet( **batch )
+            
+            elif comet_or_rst == "rst":
+                input_ = self.forward_embed_rst( **batch )
+
+            # removing labels and decoder_inputs_embeds
+            labels = input_.pop('labels')
+            __ = input_.pop('decoder_inputs_embeds')
+
+            #inserting decoder_input_ids
+            decoder_start_token_id = self.config.eos_token_id
+            bos_token_id = self.config.bos_token_id
+            decoder_start_token_id = self.transformer._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+            decoder_input_ids = (
+                torch.ones(( input_['inputs_embeds'].shape[0], 1), dtype=torch.long, device=input_['inputs_embeds'].device) * decoder_start_token_id
+                )
+            input_['decoder_input_ids'] = decoder_input_ids
+
+            
+            #for batch in list(self.chunks(examples, self.batch_size)):
+            #for batch in examples:
+                #batch = self.tokenizer(batch, return_tensors="pt", truncation=True, padding="max_length").to(self.device)
+                #input_ids, attention_mask = trim_batch(**batch, pad_token_id=self.tokenizer.pad_token_id)
+
+            summaries = self.transformer.generate(
+                decoder_start_token_id=decoder_start_token_id,
+                comet_or_rst = comet_or_rst,
+                tail_treepos_ids= tail_treepos_ids,
+                **generation_kwargs,
+                **input_,
+                )
+
+            decs = self.tokenizer.base_tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            refs = self.tokenizer.base_tokenizer.batch_decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            
+
+        return decs,refs
     
     def chunks(self, lst, n):
         """Yield successive n-sized chunks from lst."""
@@ -490,6 +618,7 @@ class COMERST_tokenizer():
                  dir_tokenizer='./models/bart_tokenizer',
                  max_len_encoder=60,
                  max_len_decoder=60,
+                 randomize_comet_pronouns=True,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -545,6 +674,7 @@ class COMERST_tokenizer():
         # endregion 
 
         #region properties and methods to be used when randomly swapping PersonX/PersonY for name/pronoun
+        self.randomize_comet_pronouns = True
         self.pattern_personx = re.compile("person[ ]*x", re.IGNORECASE)
         self.pattern_persony = re.compile("person[ ]*y", re.IGNORECASE)
         
@@ -629,7 +759,7 @@ class COMERST_tokenizer():
         #region tail
         # Encoded tail information. Adding special tokens
         # line beow list indicesq
-        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt' ).squeeze()
+        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt', truncation=True, max_length=10 ).squeeze()
         #tail_treepos_id = torch.tensor( [ target_edu_pos ]*tail_ids.shape[-1] , type=torch.long )
         tail_treepos_ids = tail_ids.new_full( tail_ids.shape , target_edu_pos )
         tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
@@ -639,7 +769,7 @@ class COMERST_tokenizer():
             #    encode list of keyphrases and scores that are input to encoder
             # append edu token to start of each head
         li_head = li_edu_kp #adding prefix space since we use phrases not start of sequences
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True ) for head in li_head ]
+        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True,truncation=True, max_length=7  ) for head in li_head ]
         li_head_treepos_ids = [ [pos]*len(ids) for pos, ids in zip( li_edukp_pos, li_head_ids ) ] #creating a li of li of graph pos indexes for each keyphrase
         #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
 
@@ -747,7 +877,9 @@ class COMERST_tokenizer():
     def tokenize_comet( self, head, rel, tail ):
         
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
-        head, rel, tail = self.tokenize_comet_person_randomizer(head, rel, tail)
+            #Do this at random, so model can still predict for PersonX PersonY in dset
+        if random.random() < 0.33 and self.randomize_comet_pronouns:
+            head, rel, tail = self.tokenize_comet_person_randomizer(head, rel, tail)
         # endregion
 
         # region head tail rel
@@ -1142,6 +1274,8 @@ class TrainingModule(pl.LightningModule):
                     lr_schedule='hard_restarts',
                     mode = 'train_new',
                     data_splits = {'train':0.6,'val':0.2,'test':0.2},
+                    loss_weight_rst = 0.5,
+                    loss_weight_comet = 0.5,
                     #dset_blend={'ATOMIC2020':0.5 , 'RST':0.5 },
                     tag='',
                     *args,
@@ -1154,6 +1288,8 @@ class TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.data_splits = data_splits
+        self.loss_weight_rst = loss_weight_rst
+        self.loss_weight_comet = loss_weight_comet
         #self.dset_blend = dset_blend
         
         if self.mode in ['train_new','train_cont','test']:
@@ -1199,6 +1335,8 @@ class TrainingModule(pl.LightningModule):
         #parser.add_argument('--dset_blend', default={'ATOMIC2020':0.5, 'RST':0.5}, type=lambda _str: ast.literal_eval(_str), required=False)
         parser.add_argument('--version', default=0,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
+        parser.add_argument( '-lwr','--loss_weight_rst',default=0.5, required=False, type=float)
+        parser.add_argument( '-lwc','--loss_weight_comet',default=0.5, required=False, type=float)
         parser.add_argument('--tag', default='default model', required=False, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
             #TODO: check --version of required type None actually works
@@ -1226,7 +1364,7 @@ class TrainingModule(pl.LightningModule):
             #restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'learning_rate','precision','splits','tag']} )
+                    'learning_rate','precision','splits','tag','loss_weight_rst','loss_weight_comet']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_tokenizer_name','model_name','max_len_encoder','max_len_decoder'
@@ -1251,7 +1389,7 @@ class TrainingModule(pl.LightningModule):
             #restore/update param files from the checkpoint
             try:
                 tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'learning_rate','precision','splits']} )
+                    'learning_rate','precision','splits','loss_weight_rst','loss_weight_comet']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_tokenizer_name','loss_type','model_name','max_len_encoder','max_len_decoder']} )
@@ -1405,6 +1543,10 @@ class TrainingModule(pl.LightningModule):
             scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
+            if os.path.exists(best_ckpt_path) == False:
+                root_dir = Path(__file__).resolve().parents[4]
+                best_ckpt_path = os.path.join( str(root_dir), best_ckpt_path[ best_ckpt_path.index('mastering-conversation'): ] )
+
             if torch.cuda.is_available():
                 #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage) )
                 #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage.cuda())  
@@ -1455,14 +1597,14 @@ class TrainingModule(pl.LightningModule):
             raise NotImplementedError   
     
     @staticmethod
-    def load_comerst(model_name="COMERST", model_version=0, max_input_len=None):
+    def load_comerst(model_name="COMERST", model_version=0 ):
         # Loading in NLG model
         checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
 
         # Getting tparams
         tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'batch_size', 'learning_rate','precision','splits',
-            'tag']}
+            'tag','loss_weight_rst','loss_weight_comet']}
 
         tparams['mode'] = 'inference'
 
@@ -1473,10 +1615,7 @@ class TrainingModule(pl.LightningModule):
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 
         mparams =  {**mparams, **mparams_json}
-        
-        if max_input_len != None:
-            mparams['max_input_len'] = max_input_len
-            
+                    
         # Loading Training Module
         training_module = TrainingModule(**tparams, model_params=mparams )
         training_module.load_state_dict(checkpoint['state_dict'])
@@ -1504,14 +1643,25 @@ class TrainingModule(pl.LightningModule):
         input_ = batch
 
         model_output = self.forward(input_) #(lm_logits and loss)
-        lm_loss_rst = model_output['lm_loss_rst']
-        lm_loss_comet = model_output['lm_loss_comet']
         
-        #TODO: add scheme to change the weight of each loss as the model predicts more
-        #v1
-        #loss = lm_loss_rst/2 + lm_loss_comet/2
-        #v2
-        loss = lm_loss_rst*3/4 + lm_loss_comet/4
+        loss = None
+
+        if 'rst' in model_output:
+            lm_loss_rst = model_output['rst']['lm_loss_rst']
+            if loss == None:
+                loss = lm_loss_rst
+            else:
+                loss = loss + lm_loss_rst*self.loss_weight_rst
+        
+        if 'comet' in model_output:
+            lm_loss_comet = model_output['comet']['lm_loss_comet']
+            
+            loss = loss + lm_loss_comet*self.loss_weight_comet
+            if loss == None:
+                loss = lm_loss_rst
+            else:
+                loss = loss + lm_loss_rst*self.loss_weight_rst
+        
         loss_key = f"{step_name}_loss"
         
         output = {}
@@ -1520,12 +1670,14 @@ class TrainingModule(pl.LightningModule):
 
         else:       
             self.log( loss_key, loss)
-            output[loss_key]=loss
-        
-        self.log( loss_key+"_rst", lm_loss_rst )
-        self.log( loss_key+"_comet", lm_loss_comet )
-            
-        #here output dictionary instead
+            output[ loss_key ]=loss
+
+
+        if 'rst' in model_output:
+            self.log( loss_key+"_rst", lm_loss_rst )
+        elif 'comet' in model_output:
+            self.log( loss_key+"_comet", lm_loss_comet )
+            # here output dictionary instead
         return  output 
         
     def training_step(self, batch, batch_idx):
@@ -1560,31 +1712,8 @@ class TrainingModule(pl.LightningModule):
                             
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
-        pad_values = {'head_ids':self.model.transformer.model.shared.padding_idx , 
-                        'head_treepos_ids':self.model.embedding_rst_pos.padding_idx, 
-                        
-                        'rst_rel_ids': self.model.embedding_rst_rels.padding_idx, 
-                        'rst_treepos_ids': self.model.embedding_rst_pos.padding_idx,
-                        'rst_ns_ids': self.model.embedding_rst_ns.padding_idx, 
-
-                        'tail_ids': self.model.transformer.model.shared.padding_idx , 
-                        'tail_treepos_ids':self.model.embedding_rst_pos.padding_idx ,
-                        'tail_kp_score': 0,
-
-                        'attention_mask': 0, 
-                        'attention_mask_head': 0, 
-                        'attention_mask_rel': 0, 
-                        #'token_type_ids':self.model.embedding_tokentype.padding_idx , 
-                        'token_type_ids_head':self.model.embedding_tokentype.padding_idx ,
-                        'token_type_ids_rel':self.model.embedding_tokentype.padding_idx ,
-                        'labels': self.model.loss_fct.ignore_index,
-
-                        'position_ids_head':self.model.transformer.model.encoder.embed_positions.padding_idx if 
-                                        self.model.transformer.model.encoder.embed_positions.padding_idx else 0  
-                        }
-
         dg = DataLoaderGenerator(self.dir_data_rst, self.dir_data_atomic2020,
-                self.batch_size, pad_values,
+                self.batch_size, self.model.pad_values,
                 self.model.tokenizer, 
                 workers=self.workers, mode=self.mode, split=self.data_splits
                 #dset_blend=self.dset_blend
@@ -1631,7 +1760,7 @@ class TrainingModule(pl.LightningModule):
         params = {}
         keys = ['batch_size','accumulate_grad_batches','learning_rate','max_epochs',
             'dir_data_rst','dir_data_atomic2020',
-            'warmup_proportion','tag','version']
+            'warmup_proportion','tag','version','loss_weight_rst','loss_weight_comet']
         
         params = {
             k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
@@ -1816,7 +1945,7 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         if 'li_edus' in self.data.columns:
             #cls.data = cls.data[0:0]
             self.valid = True
-            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 250 ) & (~ self.data['li_edus'].isnull()) ]
+            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 200 ) & (~ self.data['li_edus'].isnull()) ]
         else:
             self.valid = False
 
@@ -1992,5 +2121,6 @@ if __name__ == '__main__':
 
     main(vars(tparams), vars(mparams))
 
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -bs 130 -agb 3 --gpus 2 --workers 12 --version 2 --precision 16 --mode train_new -lr 3e-4 -me 15 --tag "weighting the rst loss at 3/4 and the comet at 1/4"
+    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
+    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.75 -lwc 0.25 -bs 130 -agb 3 --gpus 2 --workers 12 --version 2 --precision 16 --mode train_new -lr 3e-4 -me 15 --tag "weighting the rst loss at 3/4 and the comet at 1/4"
+    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 1.0 -lwc 0.00 -bs 130 -agb 3 --gpus 2 --workers 12 --version 3 --precision 16 --mode train_new -lr 3e-4 -me 15 --tag "weighting the rst loss at 3/4 and the comet at 1/4"
