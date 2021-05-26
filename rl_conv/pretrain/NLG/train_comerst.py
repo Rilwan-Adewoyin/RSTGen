@@ -162,25 +162,26 @@ class COMERST(nn.Module):
         #region forward pass
         
         input_rst = self.forward_embed_rst(**input_['rst'])
-        input_comet = self.forward_embed_comet(**input_['comet'])
+        #input_comet = self.forward_embed_comet(**input_['comet'])
     
     
         # extracting labels
         labels_rst = input_rst.pop('labels')
-        labels_comet = input_comet.pop('labels')
+        #labels_comet = input_comet.pop('labels')
+        labels_comet=True
 
         output_rst = self.transformer.model.forward(
             **input_rst
         )
         lm_logits_rst = self.transformer.lm_head(output_rst[0]) + self.transformer.final_logits_bias
 
-        output_comet = self.transformer.model.forward(
-            **input_comet,
-        )
-        lm_logits_comet = self.transformer.lm_head(output_comet[0]) + self.transformer.final_logits_bias
+        # output_comet = self.transformer.model.forward(
+        #     **input_comet,
+        # )
+        #lm_logits_comet = self.transformer.lm_head(output_comet[0]) + self.transformer.final_logits_bias
         #endregion
 
-        lm_loss = None
+        #lm_loss = None
         lm_loss_rst= None
         lm_loss_comet =None
 
@@ -188,20 +189,22 @@ class COMERST(nn.Module):
             #the labels are automatically aligned as per the GPT2 code
             #TODO: reevaluate whether bos or eos is the best method to use as start of output
                 # right now we use the edu token to start sentences. The EDU token is just the bos token
-            
-            shift_logits_comet = lm_logits_comet[..., :-1, :].contiguous()
-            shift_labels_comet = labels_comet[..., 1:].contiguous() 
-            lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
-
             shift_logits_rst = lm_logits_rst[..., :-1, :].contiguous()
             shift_labels_rst = labels_rst[..., 1:].contiguous() 
             lm_loss_rst = self.loss_fct(shift_logits_rst.view(-1, self.transformer.config.vocab_size), shift_labels_rst.view(-1))
-                       
+            #lm_loss_rst = self.loss_fct( lm_logits_rst[..., :-1, :].contiguous().view(-1, self.transformer.config.vocab_size), labels_rst[..., 1:].contiguous() .view(-1))
+
+            # shift_logits_comet = lm_logits_comet[..., :-1, :].contiguous()
+            # shift_labels_comet = labels_comet[..., 1:].contiguous() 
+            # lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
+            lm_loss_comet = torch.zeros_like(lm_loss_rst)
         if not return_dict:
-            lm_loss = [lm_loss_rst, lm_loss_comet]
-            _rst = (lm_logits_rst,) + output_rst[1:]
-            _comet = (lm_logits_comet,) + output_comet[1:]
-            return ((lm_loss,) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
+            raise Exception
+            return False
+            # _rst = (lm_logits_rst,) + output_rst[1:]
+            # _comet = (lm_logits_comet,) + output_comet[1:]
+            # return (([lm_loss_rst, lm_loss_comet],) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
+            
         
         else:
             
@@ -219,10 +222,11 @@ class COMERST(nn.Module):
             output = { 
                 'lm_loss_rst':lm_loss_rst,
                 'lm_loss_comet':lm_loss_comet,
-                'lm_logits_rst':lm_logits_rst,
-                        'lm_logits_comet':lm_logits_comet,
-                        'rst_output':output_rst,
-                        'comet_otuput':output_comet}
+                #'lm_logits_rst':lm_logits_rst,
+                 #       'lm_logits_comet':lm_logits_comet,
+                        #'rst_output':output_rst,
+                        #'comet_otuput':output_comet
+                        }
 
             return output
 
@@ -629,7 +633,7 @@ class COMERST_tokenizer():
         #region tail
         # Encoded tail information. Adding special tokens
         # line beow list indicesq
-        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt' ).squeeze()
+        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt', truncation=True, max_length=10 ).squeeze()
         #tail_treepos_id = torch.tensor( [ target_edu_pos ]*tail_ids.shape[-1] , type=torch.long )
         tail_treepos_ids = tail_ids.new_full( tail_ids.shape , target_edu_pos )
         tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
@@ -639,7 +643,7 @@ class COMERST_tokenizer():
             #    encode list of keyphrases and scores that are input to encoder
             # append edu token to start of each head
         li_head = li_edu_kp #adding prefix space since we use phrases not start of sequences
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True ) for head in li_head ]
+        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True,truncation=True, max_length=7  ) for head in li_head ]
         li_head_treepos_ids = [ [pos]*len(ids) for pos, ids in zip( li_edukp_pos, li_head_ids ) ] #creating a li of li of graph pos indexes for each keyphrase
         #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
 
@@ -1302,6 +1306,9 @@ class TrainingModule(pl.LightningModule):
         
         if tparams['mode'] in ["train_new"]:
             
+            # profiler = pl.profiler.PyTorchProfiler( filename = "profiler",
+            #     export_to_chrome=True )
+
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
@@ -1311,17 +1318,19 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator=accelerator,
-                        #limit_train_batches =10,
+                        #limit_train_batches =100,
                         #limit_val_batches = 10,
                         #val_check_interval=0.25,
                         val_check_interval=0.3,
+                        #val_check_interval=1.0,
                         num_sanity_val_steps=0, 
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True,
                         reload_dataloaders_every_epoch=False,
-                        multiple_trainloader_mode='max_size_cycle'
+                        multiple_trainloader_mode='max_size_cycle',
+                        #profiler=profiler,
                         )
 
         elif tparams['mode'] in ["train_cont","inference"]:
@@ -1346,7 +1355,7 @@ class TrainingModule(pl.LightningModule):
                     #overfit_batches=5
                     #,fast_dev_run=2, 
                     #log_gpu_memory=True,
-                    reload_dataloaders_every_epoch=True,
+                    reload_dataloaders_every_epoch=False,
                     multiple_trainloader_mode='max_size_cycle'
                     )
 
@@ -1511,7 +1520,10 @@ class TrainingModule(pl.LightningModule):
         #v1
         #loss = lm_loss_rst/2 + lm_loss_comet/2
         #v2
-        loss = lm_loss_rst*3/4 + lm_loss_comet/4
+        #loss = lm_loss_rst*3/4 + lm_loss_comet/4
+        #v3
+        loss = lm_loss_rst #*3/4 + lm_loss_comet/4
+
         loss_key = f"{step_name}_loss"
         
         output = {}
@@ -1816,7 +1828,7 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         if 'li_edus' in self.data.columns:
             #cls.data = cls.data[0:0]
             self.valid = True
-            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 250 ) & (~ self.data['li_edus'].isnull()) ]
+            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 200 ) & (~ self.data['li_edus'].isnull()) ]
         else:
             self.valid = False
 
