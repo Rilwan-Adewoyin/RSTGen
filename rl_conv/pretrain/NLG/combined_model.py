@@ -16,6 +16,10 @@ class Combined_model():
     def generate(self):
         pass
     
-    def plan_rst(self):
+    def sample_rst(self):
 
-        self.train_rstplanner.sample_rst_chain( )
+        rst_chain = self.train_rstplanner.sample_rst_chain( )
+
+        rst_chain_decoded = self.train_rstplanner.deserialize_chain( )
+    
+    

@@ -18,6 +18,7 @@ from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from pytorch_lightning.trainer.supporters import CombinedLoader
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
+from sklearn.utils import shuffle as skl_shuffle
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -95,8 +96,8 @@ class COMERST(nn.Module):
     def __init__(self, 
                     base_model_name='bart_base', model_name="COMERST",
                     scale_grad_by_freq=False,
-                    max_len_encoder=80,
-                    max_len_decoder=20
+                    max_len_head=80,
+                    max_len_tail=20
                     ):
         super(COMERST, self).__init__()
 
@@ -109,7 +110,7 @@ class COMERST(nn.Module):
         
         self.tokenizer = COMERST_tokenizer(self.base_model_name,
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
-                                            max_len_encoder, max_len_decoder )
+                                            max_len_head, max_len_tail )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
@@ -409,7 +410,7 @@ class COMERST(nn.Module):
         }
 
     def return_params(self):
-        keys = ['base_model_name','max_len_encoder', 'max_len_decoder'
+        keys = ['base_model_name','max_len_head', 'max_len_tail'
                         'scale_grad_by_freq','model_name']
 
         json_keys = []
@@ -534,10 +535,9 @@ class COMERST(nn.Module):
                 )
 
             decs = self.tokenizer.base_tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            refs = self.tokenizer.base_tokenizer.batch_decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            #refs = self.tokenizer.base_tokenizer.batch_decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             
-
-        return decs,refs
+        return decs
     
     def chunks(self, lst, n):
         """Yield successive n-sized chunks from lst."""
@@ -594,8 +594,8 @@ class COMERST(nn.Module):
         parser.add_argument('--model_name', default='COMERST', required=False)
         
         #TODO: this is not implemented yet - the maximum lengths
-        parser.add_argument('-el','--max_len_encoder', type= int, default=300 )
-        parser.add_argument('-dl','--max_len_decoder', type= int, default=200 )
+        parser.add_argument('-mlh','--max_len_head', type= int, default=20 )
+        parser.add_argument('-mlt','--max_len_tail', type= int, default=20 )
                       
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -616,15 +616,16 @@ class COMERST_tokenizer():
     def __init__(self,
                  base_tokenizer_name='bart_base',
                  dir_tokenizer='./models/bart_tokenizer',
-                 max_len_encoder=60,
-                 max_len_decoder=60,
+                 max_len_head=20,
+                 max_len_tail=20,
                  randomize_comet_pronouns=True,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
 
         self.base_tokenizer_name = base_tokenizer_name
-        
+        self.max_len_head = max_len_head
+        self.max_len_tail = max_len_tail
         # region Setting up RST relation encoding
 
         self.rst_rel_li = ['Attribution',
@@ -674,7 +675,7 @@ class COMERST_tokenizer():
         # endregion 
 
         #region properties and methods to be used when randomly swapping PersonX/PersonY for name/pronoun
-        self.randomize_comet_pronouns = True
+        self.randomize_comet_pronouns = randomize_comet_pronouns
         self.pattern_personx = re.compile("person[ ]*x", re.IGNORECASE)
         self.pattern_persony = re.compile("person[ ]*y", re.IGNORECASE)
         
@@ -723,7 +724,7 @@ class COMERST_tokenizer():
         li_edukp_pos = sum( li_edukp_pos, [] )
         #endregion
 
-        # Need to correct for mismatch between edu key phrase positions and rst tree 
+        # region correct for mismatch between edu key phrase positions and rst tree 
             # edu keyphrases have unlimited node position length, whereas the rst tree was only defined up to node 32
             # so any  key phrase sequesnce with a node position > 64 can not be directly mapped to our rst trees
             # then after aligning key phrased and edu_node positions, we remove all over 64
@@ -736,12 +737,29 @@ class COMERST_tokenizer():
 
             np_edukp_pos = np.array(li_edukp_pos)
 
-            bool_filter1 = np.where( np_edukp_pos<self.rst_pos_maxidx )
+            bool_filter1 = np.where( np_edukp_pos<=self.rst_pos_maxidx )
             li_edukp_pos = np_edukp_pos[bool_filter1].tolist()
             li_edu_kp = np.array(li_edu_kp)[bool_filter1].tolist()
    
         elif len(li_edukp_pos) > len(li_edu_kp):
             raise ValueError
+        
+        #region - Selecting a subtree from the  RST tree to focus on
+            
+            #select a span of edu nodes at random
+            # span length randomly selected from between 2 to max_length
+------------    # Then edu node with the lowest number position = anchor
+                # Find this achor's parent and check if each other edu in
+                #  span is a child of achor's parent node... If not then do the same with the grandparent.
+                #  Once a n-level parent node is found that connects, this is the new ROOT node....
+                #  Now retrieve all intermediate parent nodes between ROOT node and edus in span ------
+            
+        max_edu_nodes_to_select = len( li_edukp_pos )
+        edu_count_to_select = random.randit()
+
+
+        #endregion
+
 
         # region select target edu
             # optionally: randomly selecting a edu keyphrase node to be the target node for prediction
@@ -759,17 +777,22 @@ class COMERST_tokenizer():
         #region tail
         # Encoded tail information. Adding special tokens
         # line beow list indicesq
-        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt', truncation=True, max_length=10 ).squeeze()
+        tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
         #tail_treepos_id = torch.tensor( [ target_edu_pos ]*tail_ids.shape[-1] , type=torch.long )
         tail_treepos_ids = tail_ids.new_full( tail_ids.shape , target_edu_pos )
         tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
         #endregion
+
+        #endregion
+
         
+
+
         # region head
             #    encode list of keyphrases and scores that are input to encoder
             # append edu token to start of each head
         li_head = li_edu_kp #adding prefix space since we use phrases not start of sequences
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True,truncation=True, max_length=7  ) for head in li_head ]
+        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True,truncation=True, max_length=self.max_len_head  ) for head in li_head ]
         li_head_treepos_ids = [ [pos]*len(ids) for pos, ids in zip( li_edukp_pos, li_head_ids ) ] #creating a li of li of graph pos indexes for each keyphrase
         #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
 
@@ -791,8 +814,7 @@ class COMERST_tokenizer():
                                     # each keyphrase chunk can not attend directly to other keyphrase chunks
             #                   2) all encoder inputs can attend to rst relation tree info
 
-        enc_input_dim = head_ids.shape[-1] + rst_rel_ids.shape[-1]
-
+        
         #attention_mask = torch.zeros( [enc_input_dim, enc_input_dim], dtype=torch.long  )
         attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
 
@@ -883,12 +905,12 @@ class COMERST_tokenizer():
         # endregion
 
         # region head tail rel
-        head_ids = self.base_tokenizer.encode( head, add_prefix_space=True, return_tensors='pt')
+        head_ids = self.base_tokenizer.encode( head, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_head)
 
         rels_ids = torch.tensor( self.atomic_rel_labeler.transform( [rel] ), dtype=torch.long )
 
         #tail_ids = self.base_tokenizer.encode( self.token_edu + " " + tail + " " + self.token_eos , add_prefix_space=False, return_tensor='pt')
-        tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt' )
+        tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
         #endregion 
 
         #region treepos_ids
@@ -1367,7 +1389,7 @@ class TrainingModule(pl.LightningModule):
                     'learning_rate','precision','splits','tag','loss_weight_rst','loss_weight_comet']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_tokenizer_name','model_name','max_len_encoder','max_len_decoder'
+                    'base_tokenizer_name','model_name','max_len_head','max_len_tail'
                     ,'scale_grad_by_freq' ]} )
                 
                 mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
@@ -1392,7 +1414,7 @@ class TrainingModule(pl.LightningModule):
                     'learning_rate','precision','splits','loss_weight_rst','loss_weight_comet']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_tokenizer_name','loss_type','model_name','max_len_encoder','max_len_decoder']} )
+                    'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail']} )
             except KeyError:
                 pass
             
@@ -1609,7 +1631,7 @@ class TrainingModule(pl.LightningModule):
         tparams['mode'] = 'inference'
 
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'base_tokenizer_name','loss_type','model_name','max_len_encoder','max_len_decoder',
+            'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
             'frst_version','scale_grad_by_freq']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
@@ -2032,15 +2054,20 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
     """
     #TODO: think of way to balance ATOMIC and RST contribution
     #TODO: find research on multi task learning well
-    def __init__(self, file_path, tokenizer ):
+    def __init__(self, file_path, tokenizer, drop_duplicates=False ):
         self.fp = file_path
         self.tokenizer = tokenizer
+        self.drop_duplicates = True #used for test set. In the case our model uses greedy decoding. Filters on duplicate head and tails
 
-        #with open(self.fp, 'r') as f:
         #TODO: remove nrows
         self.data = pd.read_csv(self.fp 
             #,nrows=100
             )
+        
+        if self.drop_duplicates:
+            self.data = skl_shuffle(self.data)
+            self.data = self.data.drop_duplicates(subset=['head','relation'],keep='first',ignore_index=True)
+
         
     def __len__(self):
         return len(self.data)
@@ -2121,6 +2148,5 @@ if __name__ == '__main__':
 
     main(vars(tparams), vars(mparams))
 
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.75 -lwc 0.25 -bs 130 -agb 3 --gpus 2 --workers 12 --version 2 --precision 16 --mode train_new -lr 3e-4 -me 15 --tag "weighting the rst loss at 3/4 and the comet at 1/4"
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 1.0 -lwc 0.00 -bs 130 -agb 3 --gpus 2 --workers 12 --version 3 --precision 16 --mode train_new -lr 3e-4 -me 15 --tag "weighting the rst loss at 3/4 and the comet at 1/4"
+    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
+    
