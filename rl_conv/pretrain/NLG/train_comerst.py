@@ -98,7 +98,8 @@ class COMERST(nn.Module):
                     base_model_name='bart_base', model_name="COMERST",
                     scale_grad_by_freq=False,
                     max_len_head=80,
-                    max_len_tail=20
+                    max_len_tail=20,
+                    max_edu_nodes_to_select,
                     ):
         super(COMERST, self).__init__()
 
@@ -111,7 +112,7 @@ class COMERST(nn.Module):
         
         self.tokenizer = COMERST_tokenizer(self.base_model_name,
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
-                                            max_len_head, max_len_tail )
+                                            max_len_head, max_len_tail, max_edu_nodes_to_select )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
@@ -120,9 +121,10 @@ class COMERST(nn.Module):
                                     padding_idx=len(self.tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
         self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.005)
 
-            #+2 here because are node data is 0 indexed with node 30 as maximum node
-        self.embedding_rst_pos = torch.nn.Embedding( self.tokenizer.rst_pos_maxidx + 1 +1 , self.transformer.config.d_model, 
-                                    padding_idx=self.tokenizer.rst_pos_maxidx + 1 , scale_grad_by_freq=self.scale_grad_by_freq )
+        # The rst_parent_nodes can go up to 30, but the edu_positions can then go up to 30*2 +2
+            #+1+1 here because max_node =30, but our node data is 0 indexed  padding index is final node
+        self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
+                                    padding_idx=(2*self.tokenizer.rst_pos_maxidx +2 ) + 1   , scale_grad_by_freq=self.scale_grad_by_freq )
         self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
@@ -597,6 +599,7 @@ class COMERST(nn.Module):
         #TODO: this is not implemented yet - the maximum lengths
         parser.add_argument('-mlh','--max_len_head', type= int, default=20 )
         parser.add_argument('-mlt','--max_len_tail', type= int, default=20 )
+        parser.add_argument('-ments','--max_edu_nodes_to_select', type=int, default=-1, )
                       
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -620,6 +623,7 @@ class COMERST_tokenizer():
                  max_len_head=20,
                  max_len_tail=20,
                  randomize_comet_pronouns=True,
+                 max_edu_nodes_to_select=-1,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -627,6 +631,8 @@ class COMERST_tokenizer():
         self.base_tokenizer_name = base_tokenizer_name
         self.max_len_head = max_len_head
         self.max_len_tail = max_len_tail
+        self.max_edu_nodes_to_select = max_edu_nodes_to_select
+
         # region Setting up RST relation encoding
 
         self.rst_rel_li = ['Attribution',
@@ -646,7 +652,8 @@ class COMERST_tokenizer():
 
         # rst_pos
         #self.rst_pos_maxidx = 2*30 + 2  #original
-        self.rst_pos_maxidx =2*( 2*30 + 2 )  #original
+        #self.rst_pos_maxidx =2*( 2*30 + 2 )  #original
+        self.rst_pos_maxidx = 30  #same as in train_nlg. Our model can only, model sentences with 5 rst tree depth
         
         #endregion
 
@@ -714,10 +721,11 @@ class COMERST_tokenizer():
         li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
 
             #removing rst tree information for nodes that are too deep
-        bool_filter =[pos <= self.rst_pos_maxidx for pos in li_rst_pos]
-        li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_==True]
-        li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_==True]
-        li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_==True]
+            # Not needed since we only have positions lower than self.rst_pos_maxidx=30 based on restrictions in data_setup
+        # bool_filter =[pos <= self.rst_pos_maxidx for pos in li_rst_pos]
+        # li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_==True]
+        # li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_==True]
+        # li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_==True]
         
 
         # getting a list of all graph posiitons of edus in li_edus
@@ -742,8 +750,8 @@ class COMERST_tokenizer():
 
             np_edukp_pos = np.array(li_edukp_pos)
 
-            bool_filter1 = np.where( np_edukp_pos<=self.rst_pos_maxidx )
-            #TODO: need to reorder the edukp pos from left to right on a flattened binary tree
+            bool_filter1 = np.where( np_edukp_pos<= 2*self.rst_pos_maxidx + 2 )
+            
             li_edukp_pos = np_edukp_pos[bool_filter1].tolist()
             li_edu_kp = np.array(li_edu_kp)[bool_filter1].tolist()
    
@@ -752,19 +760,27 @@ class COMERST_tokenizer():
         
         #region - Selecting a subtree from the  RST tree to focus on
             
-            #select a span of edu nodes at random
-            # span length randomly selected from between 2 to max_length
-            # Then edu node with the lowest number position = anchor
+            # randomly select a span of edu nodes at random
+                # from between covering 2 edus' to covering maxspan edus
+                    #max span is a function of maximum tree node. i.e. max_idx=30 -> tree of 5 depth -> max edu count = 32
+                    # however a max_span of 32 is rather large, so instead we restrict it to a number between 4 and 10
+            # Then select smallest sub-tree that connects the edu nodes
+                # The edu node with the lowest number position = anchor
                 # Find this achor's parent and check if each other edu in
                 #  span is a child of achor's parent node... If not then do the same with the grandparent.
                 #  Once a n-level parent node is found that connects, this is the new ROOT node....
                 #  Now retrieve all intermediate parent nodes between ROOT node and edus in span ------
             
-        max_edu_nodes_to_select = len( li_edukp_pos )
-        edu_count_to_select = random.randint(2,max_edu_nodes_to_select)
-
+        max_edu_nodes_to_select = self.max_edu_nodes_to_select if self.max_edu_nodes_to_select!=-1 else len( li_edukp_pos )
+        edu_count_to_select = random.randint(2, max_edu_nodes_to_select)
         start_edu_node_idx = random.randint(0, max_edu_nodes_to_select-len(edu_count_to_select) )
-
+        
+        li_edu_kp = li_edu_kp[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
+        li_edukp_pos = li_edukp_pos[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
+        
+            # reduce the rst tree information
+                # to only include the smallest subtree of parent nodes that connect the edu nodes
+        li_rst_pos, li_rst_rel, li_rst_ns = self.smallest_spanning_subtree(li_edukp_pos, li_rst_pos, li_rst_rel, li_rst_ns  ) 
 
         #endregion
 
@@ -924,7 +940,7 @@ class COMERST_tokenizer():
         #region treepos_ids
             # we imagine the cskg to have the same structure as rst tree
             # so relation is at parent node. the head and tail entity are at sibling nodes
-        rels_treepos_ids = torch.randint(int( ( self.rst_pos_maxidx-2) /2 ), (1,), dtype=torch.long ) 
+        rels_treepos_ids = torch.randint( self.rst_pos_maxidx, (1,), dtype=torch.long ) 
         head_treepos_ids = (rels_treepos_ids*2 + 1).expand( [head_ids.shape[-1]] )
         tail_treepos_ids = (rels_treepos_ids*2 + 2).expand( [tail_ids.shape[-1]] )
         #endregion
@@ -1251,7 +1267,7 @@ class COMERST_tokenizer():
         if len(li_edukp_pos) < goal_length:
 
             # position of indexes which could have been incorrectly labelled as leaves
-            _bool_idxs = np.where( np.array(li_edukp_pos) > int( (self.rst_pos_maxidx-2)/2 ),  )[0]    
+            _bool_idxs = np.where( np.array(li_edukp_pos) > self.rst_pos_maxidx ,  )[0]    
             
             # if no idxs choosen then simply use all positions
             if len(_bool_idxs) != 0:
@@ -1297,7 +1313,7 @@ class COMERST_tokenizer():
 
         
     @lru_cache(maxsize=124)
-    def edukp_pos_sort_function(edukp_pos: int):
+    def edukp_pos_sort_function(self, edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
             # sort_function
             # from root pos find the sequence of left/rights down the tree to each edukp_pos
@@ -1331,10 +1347,68 @@ class COMERST_tokenizer():
         return flattened_pos
 
 
+    def smallest_spanning_subtree(self, li_edukp_pos, li_rst_pos, li_rst_rel, li_rst_ns  ):
+        """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
+            Then slice li_rst_pos, li_rst_rel, li_rst_ns to reflect this reduced tree
+        """
 
+        smallest_edukp_pos = min(li_edukp_pos)
 
+        # finding root node
+        #   check if each other edukkp_pos can be reached from the root node
+        
+        root_found = False
+        candidiate_root_node = self.parent_node_pos(smallest_edukp_pos)
 
+        while root_found==False:
+            root_found = all( self.node_x_reachable_from_node_y( pos,candidiate_root_node )[0] for pos in li_edukp_pos )
+            
+            if root_found == False:
+                candidiate_root_node = self.parent_node_pos(smallest_edukp_pos)
+            
+            elif root_found == True:
+                #find the nodes that
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( pos,candidiate_root_node )[1] for pos in li_edukp_pos   ]
+                nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
+                nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
 
+                bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
+                li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_ ] 
+                li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_]
+                li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_]
+        
+        return li_rst_pos, li_rst_rel, li_rst_ns
+        
+    @lru_cache(maxsize=62)
+    def parent_node_pos(self, node_pos):
+        """Gets the parent node position for any node_pos
+
+        Args:
+            node_pos ([type]): [description]
+
+        Returns:
+            [type]: [description]
+        """
+        parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )
+        return parent_node
+    
+    @lru_cache(maxsize=None)
+    def node_x_reachable_from_node_y(self, nodex, nodey):
+        """returns (bool, [sequence showing path from nodex to nodey])
+
+        Args:
+            nodex ([type]): [description]
+            nodey ([type]): [description]
+
+        Raises:
+            ValueError: [description]
+            NotImplementedError: [description]
+            NotImplementedError: [description]
+            Exception: [description]
+
+        Returns:
+            [type]: [description]
+        """
 
 
 class TrainingModule(pl.LightningModule):
@@ -1786,6 +1860,8 @@ class TrainingModule(pl.LightningModule):
             if len(outputs) > 0:
                 loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
+
+        #if step_name == "val" and rank_zero_only.rank == 0 :
                             
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
@@ -2022,7 +2098,7 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         if 'li_edus' in self.data.columns:
             #cls.data = cls.data[0:0]
             self.valid = True
-            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 200 ) & (~ self.data['li_edus'].isnull()) ]
+            self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 225 ) & (~ self.data['li_edus'].isnull()) ]
         else:
             self.valid = False
 
@@ -2203,5 +2279,6 @@ if __name__ == '__main__':
 
     main(vars(tparams), vars(mparams))
 
-    # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
-    
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
+
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20  -ments 2 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline" 
