@@ -237,10 +237,10 @@ class COMERST(nn.Module):
         #endregion
 
         if not return_dict:
-            lm_loss = [lm_loss_rst, lm_loss_comet]
             _rst = (lm_logits_rst,) + output_rst[1:]
             _comet = (lm_logits_comet,) + output_comet[1:]
-            return ((lm_loss,) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
+            return (([lm_loss_rst, lm_loss_comet],) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
+            
         
         else:
             s1s_output = {}
