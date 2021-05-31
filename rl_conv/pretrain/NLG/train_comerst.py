@@ -19,6 +19,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from pytorch_lightning.trainer.supporters import CombinedLoader
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
 from sklearn.utils import shuffle as skl_shuffle
+import math
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -722,6 +723,9 @@ class COMERST_tokenizer():
         # getting a list of all graph posiitons of edus in li_edus
         li_edukp_pos =  [ self.find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ]
         li_edukp_pos = sum( li_edukp_pos, [] )
+        #TODO: need to reorder the edukp pos from left to right on a flattened binary tree
+
+        li_edukp_pos.sort(key=self.edukp_pos_sort_function)
         #endregion
 
         # region correct for mismatch between edu key phrase positions and rst tree 
@@ -732,12 +736,14 @@ class COMERST_tokenizer():
             # li_edukp is missing tree positions of size 64 and over. 
                 # Based on this we can use a method to ensure the size 
                     # of li_edukp_pos and li_edu_kp is the same
+                
             li_edukp_pos = self.correct_child_edus( li_edukp_pos, len(li_edu_kp) )
-            li_edukp_pos.sort()
+            li_edukp_pos.sort(key=self.edukp_pos_sort_function)
 
             np_edukp_pos = np.array(li_edukp_pos)
 
             bool_filter1 = np.where( np_edukp_pos<=self.rst_pos_maxidx )
+            #TODO: need to reorder the edukp pos from left to right on a flattened binary tree
             li_edukp_pos = np_edukp_pos[bool_filter1].tolist()
             li_edu_kp = np.array(li_edu_kp)[bool_filter1].tolist()
    
@@ -748,14 +754,16 @@ class COMERST_tokenizer():
             
             #select a span of edu nodes at random
             # span length randomly selected from between 2 to max_length
-------------    # Then edu node with the lowest number position = anchor
+            # Then edu node with the lowest number position = anchor
                 # Find this achor's parent and check if each other edu in
                 #  span is a child of achor's parent node... If not then do the same with the grandparent.
                 #  Once a n-level parent node is found that connects, this is the new ROOT node....
                 #  Now retrieve all intermediate parent nodes between ROOT node and edus in span ------
             
         max_edu_nodes_to_select = len( li_edukp_pos )
-        edu_count_to_select = random.randit()
+        edu_count_to_select = random.randint(2,max_edu_nodes_to_select)
+
+        start_edu_node_idx = random.randint(0, max_edu_nodes_to_select-len(edu_count_to_select) )
 
 
         #endregion
@@ -1242,8 +1250,8 @@ class COMERST_tokenizer():
             # then we iteratively loop through 
         if len(li_edukp_pos) < goal_length:
 
-            # position of indexes could have been incorrectly labelled as leaves
-            _bool_idxs = np.where( np.array(li_edukp_pos) < int( (self.rst_pos_maxidx-2)/2 ),  )[0]    
+            # position of indexes which could have been incorrectly labelled as leaves
+            _bool_idxs = np.where( np.array(li_edukp_pos) > int( (self.rst_pos_maxidx-2)/2 ),  )[0]    
             
             # if no idxs choosen then simply use all positions
             if len(_bool_idxs) != 0:
@@ -1251,16 +1259,21 @@ class COMERST_tokenizer():
             else:
                 idxs = np.arange( len(li_edukp_pos) )
             
-            pos = li_edukp_pos.pop(idxs[-1])
+            # here we sample the edukp_pos, with more weight placed on the deeper edukp_pos
+            #pos = li_edukp_pos.pop(idxs[-1])
+            level_of_each_edukp_pos = [ math.floor( math.log( pos+1 , 2 ) ) for pos in li_edukp_pos]
+            maxl = max(level_of_each_edukp_pos)
+                #twice as likely to pick node from a level l+1 compared to node from level l
+            weights_for_each_edukp = [ 0.5**(maxl-level) for level in level_of_each_edukp_pos  ]
 
-            # Here we sample from positions, with more weight placed on larger positions
-            # TODO; improve to  more weight placed on the righthand most positions
-            #probs = list( np.arange(len(idxs), step=3 ) )
-        
+            idx = random.choices(idxs, weights=weights_for_each_edukp, k=1)[0]
+            pos = li_edukp_pos.pop(idx)
+
+            # extend tree by replacing selected node with child nodes
             new_child_nodes = self.find_child_edus( pos, li_edukp_pos )
             li_edukp_pos = new_child_nodes + li_edukp_pos
             
-            #li_edukp_pos = 
+            
             li_edukp_pos = self.correct_child_edus(li_edukp_pos, goal_length )
         
         return li_edukp_pos
@@ -1281,6 +1294,48 @@ class COMERST_tokenizer():
         return pronoun
 
 # endregion
+
+        
+    @lru_cache(maxsize=124)
+    def edukp_pos_sort_function(edukp_pos: int):
+        # We use a sorting function to know tree leftright order of edukp_pos
+            # sort_function
+            # from root pos find the sequence of left/rights down the tree to each edukp_pos
+            # Then use the 1/2, 1/4 method to calculate edukpos float representtion on flat line
+            # Then retun this float
+            # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
+
+
+        
+        parent_pos = edukp_pos
+        li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
+
+        while abs(parent_pos)!=0:
+            parent_pos = (edukp_pos-1 )/2
+            # child node is left child node if (child_node_pos-1 /2)==int
+            # child node is right child node if (child_node_pos-1 /2)=/int
+            if _.is_integer():
+                child_position_rel_to_parent = 'L'
+            else:
+                child_position_rel_to_parent = 'R'
+            
+            li_leftright_seq = li_leftright_seq + [child_position_rel_to_parent]
+
+            parent_pos = math.floor(parent_pos)
+        
+        # Now calculate the flattened position using the sequence of left and rights
+        _ = {'L':-1, 'R':+1}
+        li_flattened_pos_contributions = [  _[direction]*(0.5**idx) for idx,direction in enumerate(li_leftright_seq)  ]
+        flattened_pos = sum(li_leftright_seq)
+
+        return flattened_pos
+
+
+
+
+
+
+
 
 class TrainingModule(pl.LightningModule):
 
