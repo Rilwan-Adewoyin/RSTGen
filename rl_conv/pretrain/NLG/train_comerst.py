@@ -17,8 +17,10 @@ import transformers
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from pytorch_lightning.trainer.supporters import CombinedLoader
+from pytorch_lightning.utilities import _get_rank
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
 from sklearn.utils import shuffle as skl_shuffle
+from itertools import islice
 import math
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
@@ -99,7 +101,7 @@ class COMERST(nn.Module):
                     scale_grad_by_freq=False,
                     max_len_head=80,
                     max_len_tail=20,
-                    max_edu_nodes_to_select,
+                    max_edu_nodes_to_select=-1,
                     ):
         super(COMERST, self).__init__()
 
@@ -1461,8 +1463,8 @@ class TrainingModule(pl.LightningModule):
 
             self.hparams.update({ **train_params_to_save, **model_params_to_save})
 
-            #self.inference_samples = list( islice( self.inference_dl, 10 ) )
-            #del self.inference_dl
+            self.inference_samples = list( islice( self.inference_dl, 10 ) )
+            del self.inference_dl
 
         if self.mode in ['inference']:
             self.eval() 
@@ -1861,8 +1863,30 @@ class TrainingModule(pl.LightningModule):
                 loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
-        #if step_name == "val" and rank_zero_only.rank == 0 :
-                            
+        if step_name == "val" and _get_rank() == 0 :
+            # At end of validation loop produce some quantitative examples of model's performance
+
+            # Making directory for inference testing results
+            dir_infer = os.path.join(self.trainer.log_dir,"inference")
+            if not os.path.exists(dir_infer):
+                os.makedirs(dir_infer,exist_ok=True)
+        
+            # COMET testing
+
+            # RST Testing
+        # elif step_name == "test" and _get_rank() == 0 :
+        #     # At end of test loop - perform the COMET Evaluation and any RST evaluation
+            
+        #     # Making directory for inference testing results
+        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
+        #     if not os.path.exists(dir_infer):
+        #         os.makedirs(dir_infer,exist_ok=True)
+        
+        #     # COMET testing
+
+        #     # RST Testing
+        
+
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
         dg = DataLoaderGenerator(self.dir_data_rst, self.dir_data_atomic2020,
@@ -1877,7 +1901,7 @@ class TrainingModule(pl.LightningModule):
             self.train_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='train')
             self.val_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='val')
             self.test_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='test')
-            #self.inference_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='inference')
+            self.inference_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='inference')
         
         elif self.mode == "test":
             self.test_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='test')
@@ -1961,7 +1985,7 @@ class DataLoaderGenerator():
 
         output = {'comet':dataloader_atomic2020, 'rst':dataloder_rst }
 
-        if split_name in ["val","test"] :
+        if split_name in ["val","test","inference"] :
             output = CombinedLoader( output, "max_size_cycle")
         
         return output
@@ -2006,7 +2030,7 @@ class DataLoaderGenerator():
         li_dsets = [dset for dset in li_dsets if dset.valid==True]
 
         if split_name == 'inference':
-            random.sample(li_dsets,10)
+            #li_dsets = random.sample(li_dsets,20)
             bs = 1
         else:
             bs = self.bs #* self.dset_blend['rst']
