@@ -22,7 +22,7 @@ from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, S
 from sklearn.utils import shuffle as skl_shuffle
 from itertools import islice
 import math
-
+from itertools import groupby
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
@@ -133,15 +133,17 @@ class COMERST(nn.Module):
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
         self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.005)
 
-        self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
-        self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
+        # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
+        # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
         
         self.embedding_comet_rel = torch.nn.Embedding( len(self.tokenizer.atomic_rel_li ) + 1 , self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.atomic_rel_li ) , scale_grad_by_freq=self.scale_grad_by_freq )
         self.embedding_comet_rel.weight.data.normal_(mean=0.0, std=0.005)
 
-        self.embedding_tokentype = torch.nn.Embedding( 2, self.transformer.config.d_model, padding_idx=0 ) #0 is padding, 1 is rst relation
-        self.embedding_comet_rel.weight.data.normal_(mean=0.0, std=0.005)
+        rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
+        rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
+        self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
+        self.embedding_rels.weight.data.normal_(mean=0.0, std=0.005)
 
         # setting the pad token to 0 in posiiton_ids embedding and then freezing
         self.transformer.model.encoder.embed_positions.padding_idx = 0
@@ -189,9 +191,7 @@ class COMERST(nn.Module):
                         'attention_mask': 0, 
                         'attention_mask_head': 0, 
                         'attention_mask_rel': 0, 
-                        #'token_type_ids':self.model.embedding_tokentype.padding_idx , 
-                        'token_type_ids_head':self.embedding_tokentype.padding_idx ,
-                        'token_type_ids_rel':self.embedding_tokentype.padding_idx ,
+                        
                         'labels': self.loss_fct.ignore_index,
 
                         'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
@@ -293,8 +293,7 @@ class COMERST(nn.Module):
                             tail_kp_score,
                             attention_mask_head,
                             attention_mask_rel, 
-                            token_type_ids_head,
-                            token_type_ids_rel,
+
                             position_ids_head,
                             labels):
 
@@ -314,9 +313,6 @@ class COMERST(nn.Module):
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
 
         inputs_embeds = torch.cat( [ inputs_embed_head, inputs_embed_rel ], axis=-2)
-        
-        token_type_ids_enc = torch.cat( [token_type_ids_head, token_type_ids_rel], axis=1 )        
-        inputs_embeds += self.embedding_tokentype( token_type_ids_enc )
         
         inputs_embeds *= self.transformer.model.encoder.embed_scale
         #endregion
@@ -365,13 +361,11 @@ class COMERST(nn.Module):
                             tail_ids,tail_treepos_ids,
                                 rels_ids, rels_treepos_ids,
                                 attention_mask,
-                                token_type_ids_head,
-                                token_type_ids_rel,
                                 labels ):
         #region inputs_embeds
             # embed head_ids and 
             # emed rels_ids and tail_treepos_ids
-            # embed token_type_ids
+            
         inputs_embed_head = self.transformer.model.shared( head_ids )
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
@@ -382,9 +376,7 @@ class COMERST(nn.Module):
                                 fill_value=self.embedding_rst_ns.padding_idx  )  )
 
         inputs_embeds = torch.cat( [ inputs_embed_head, inputs_embed_rel], axis=-2 )
-        token_type_ids_enc = torch.cat( [token_type_ids_head, token_type_ids_rel], axis=-1 )        
-        inputs_embeds += self.embedding_tokentype( token_type_ids_enc )
-
+        
             # Here we trim data of all columns which just have padding value
             # Since heads_ids and rst_rel_ids are from a different space, we replace rst_rel_ids
             #   with a tensor of same shape that is filled with the value: 1+heads_ids.padding_value
@@ -886,12 +878,7 @@ class COMERST_tokenizer():
 
         #endregion
         
-        # region token type ids
-        token_type_ids_head = torch.zeros( [head_ids.shape[-1]], dtype=torch.long  )
-        token_type_ids_rel = torch.ones( [rst_rel_ids.shape[-1]], dtype=torch.long )
-                
-        #endregion 
-
+                        
         # region labels
         labels = tail_ids
         # endregion
@@ -914,9 +901,6 @@ class COMERST_tokenizer():
 
             'attention_mask_head': attention_mask_head,
             'attention_mask_rel': attention_mask_rel,
-            'token_type_ids_head': token_type_ids_head,
-            'token_type_ids_rel': token_type_ids_rel,
-
             'position_ids_head': position_ids_head,
 
             'labels':labels.squeeze()
@@ -926,7 +910,7 @@ class COMERST_tokenizer():
         
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
             #Do this at random, so model can still predict for PersonX PersonY in dset
-        if random.random() < 0.33 and self.randomize_comet_pronouns:
+        if random.random() > 0.33 and self.randomize_comet_pronouns:
             head, rel, tail = self.tokenize_comet_person_randomizer(head, rel, tail)
         # endregion
 
@@ -964,11 +948,6 @@ class COMERST_tokenizer():
         #attention_mask[ -rels_ids.shape[-1]:,  : head_ids.shape[-1]]  = _
         #endregion
 
-        #region token type ids
-        token_type_ids_head = torch.zeros( [head_ids.shape[-1]], dtype=torch.long  )
-        token_type_ids_rel = torch.ones( [rels_ids.shape[-1]], dtype=torch.long )
-        #endregion
-
         #region position_ids
         position_ids_head = new_ids = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
 
@@ -988,8 +967,6 @@ class COMERST_tokenizer():
             'rels_treepos_ids': rels_treepos_ids,
 
             'attention_mask': attention_mask,
-            'token_type_ids_head': token_type_ids_head,
-            'token_type_ids_rel': token_type_ids_rel,
             'labels':labels.squeeze()
         }
 
@@ -1464,6 +1441,7 @@ class TrainingModule(pl.LightningModule):
             self.hparams.update({ **train_params_to_save, **model_params_to_save})
 
             self.inference_samples = list( islice( self.inference_dl, 10 ) )
+            self.inference_samples_comet_raw_records = [ self.inference_dl.dataset['rst'].data ]
             del self.inference_dl
 
         if self.mode in ['inference']:
@@ -1871,8 +1849,132 @@ class TrainingModule(pl.LightningModule):
             if not os.path.exists(dir_infer):
                 os.makedirs(dir_infer,exist_ok=True)
         
-            # COMET testing
+            # data holders
+            li_comet_heads = []
+            li_comet_rels = []
+            li_comet_preds = []
+            li_comet_tails = []
 
+            li_rst_heads = []
+            li_rst_rels = []
+            li_rst_preds = []
+            li_rst_tails = []
+
+            for idx, batch in enumerate( self.inference_samples ):
+                
+                # COMET testing
+                batch_comet = batch['comet']
+                heads_comet = self.model.tokenizer.base_tokenizer.decode( batch_comet['head_ids'] ) 
+                rels_comet = self.model.tokenizer.atomic_rel_labeler.inverse_transform( batch_comet['rels_ids'] )
+                tails_comet =  self.model.tokenizer.base_tokenizer.decode( batch_comet['tail_ids'] ) 
+
+                preds = self.model.generate_from_dloaderbatch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )
+                
+                li_comet_heads.extend(heads_comet.strip())
+                li_comet_rels.extend(rels_comet)
+                li_comet_tails.append(tails_comet.strip())
+                li_comet_preds.extend(preds.strip())
+
+                # RST Testing
+                batch_rst = batch['rst']
+
+                preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs )
+                
+                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'],  skip_special_tokens=False ).split('<\s>') 
+                heads_treepos_rst = batch_rst['head_treepos_ids'] 
+                heads_treepos_rst = [ group[0] for key, group in groupby(heads_treepos_rst) ]
+
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rels_ids'] )
+                rels_treepos_rst = batch_rst['rst_treepos_ids'] 
+                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'])
+
+                tails_comet = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'] ) 
+                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'][0]
+
+                li_rst_heads.append( [ {'pos': pos, 'head':head.strip() } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
+                li_rst_rels.append( [ {'pos':pos, 'rel':rel, 'ns':ns} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
+                li_rst_tails.append( {'pos':tail_treepos_ids_rst[0], 'tail':tails_comet.strip()} )
+                li_rst_preds.append( {'pos':tail_treepos_ids_rst[0], 'pred':preds.strip() }  )
+
+
+            # Adding records from this epoch to files
+            for idx in range(len(self.inference_samples)):
+                fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
+                fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                
+                # comet- If file for example idx does not exists we add the true observed records
+                if not os.path.exists(fp_comet):
+                    
+                    df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                    
+                    head = li_comet_heads[idx]
+                    rels = li_comet_rels[idx]
+                    tail = li_comet_tails[idx]
+                    preds = li_comet_preds[idx]
+                                        
+                    datum = { 'round': -1,
+                                'head': head,
+                                "rels": rels,
+                                "tail":tail,
+                                "preds":preds }
+                
+                    df_comet = df_comet.append(datum, ignore_index=True)
+                    df_comet.to_csv( fp_comet, index=False)
+
+                # rst - If file for example idx does not exists we add the true observed records
+                if not os.path.exists(fp_rst):
+                    
+                    df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                    
+                    head = li_rst_heads[idx]
+                    rels = li_rst_rels[idx]
+                    tail = li_rst_tails[idx]
+                    preds = li_rst_preds[idx]
+                                        
+                    datum = { 'round': -1,
+                                'head': head,
+                                "rels": rels,
+                                "tail":tail,
+                                "preds":preds }
+                
+                    df_rst = df_rst.append(datum, ignore_index=True)
+                    df_rst.to_csv( fp_rst, index=False)
+
+                # comet - adding to preds
+
+                df_comet = pd.read_csv(fp_comet)    
+                datum_comet = {
+                    'round':df_comet['round'].max()+1,
+                    'head': '',
+                    'rels':'',
+                    'tails':'',
+                    'preds':li_comet_preds[idx] }
+
+                df_comet = df_comet.append(datum_comet, ignore_index=True)
+                df_comet.to_csv( fp_comet, index=False)
+
+
+                # rst - adding to preds
+                df_rst = pd.read_csv(fp_rst)    
+                datum_rst = {
+                    'round':df_rst['round'].max()+1,
+                    'head': '',
+                    'rels':'',
+                    'tails':'',
+                    'preds':li_rst_preds[idx] }
+
+                df_rst = df_rst.append(datum_rst, ignore_index=True)
+                df_rst.to_csv( fp_rst, index=False)
+
+
+
+
+                
+                
+
+
+                
+            
             # RST Testing
         # elif step_name == "test" and _get_rank() == 0 :
         #     # At end of test loop - perform the COMET Evaluation and any RST evaluation
@@ -1900,7 +2002,7 @@ class TrainingModule(pl.LightningModule):
         if "train" in self.mode:
             self.train_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='train')
             self.val_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='val')
-            self.test_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='test')
+            self.test_dl = dg.prepare_dataloader_combined(shuffle=False, split_name='test')
             self.inference_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='inference')
         
         elif self.mode == "test":
@@ -2030,7 +2132,7 @@ class DataLoaderGenerator():
         li_dsets = [dset for dset in li_dsets if dset.valid==True]
 
         if split_name == 'inference':
-            #li_dsets = random.sample(li_dsets,20)
+            li_dsets = random.sample(li_dsets,20)
             bs = 1
         else:
             bs = self.bs #* self.dset_blend['rst']
@@ -2060,20 +2162,24 @@ class DataLoaderGenerator():
         if split_name == 'train':
             shuffle = True
             fn = os.path.join( self.dir_data_atomic2020,"train_v2.csv" )
-        
+            drop_duplicates = False
+
         elif split_name == 'val':
             fn = os.path.join( self.dir_data_atomic2020,"dev_v2.csv" )
-            shuffle = False
-       
+            shuffle = True
+            drop_duplicates = False
+
         elif split_name == 'test':
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
             shuffle = False
+            drop_duplicates = False
 
         elif split_name == 'inference':
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
             shuffle = False
+            drop_duplicates = True
 
-        dset = SingleDataset_atomic2020(fn, self.tokenizer )
+        dset = SingleDataset_atomic2020(fn, self.tokenizer, drop_duplicates=drop_duplicates )
                 
         if split_name == 'inference':
             bs = 1
