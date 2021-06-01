@@ -1500,6 +1500,8 @@ class TrainingModule(pl.LightningModule):
             model_params_to_save = self.model.return_params()
 
             self.hparams.update({ **train_params_to_save, **model_params_to_save})
+            self.save_hyperparameters({ **train_params_to_save, **model_params_to_save})
+
             #self.save_hyperparameters()
             # save_hparams_to_yaml(f"{self.logger.log_dir}/hparams.yaml",
             #                   self.hparams)
@@ -1923,37 +1925,37 @@ class TrainingModule(pl.LightningModule):
                 # COMET testing
                 batch_comet = batch['comet']
                 heads_comet = self.model.tokenizer.base_tokenizer.decode( batch_comet['head_ids'][0], skip_special_tokens=True  ).strip() 
-                rels_comet = self.model.tokenizer.atomic_rel_labeler.inverse_transform( batch_comet['rels_ids'] )[0]
+                rels_comet = self.model.tokenizer.atomic_rel_labeler.inverse_transform( batch_comet['rels_ids'].cpu().numpy() )[0].tolist()
                 tails_comet =  self.model.tokenizer.base_tokenizer.decode( batch_comet['tail_ids'][0] , skip_special_tokens=True  ).strip() 
 
                 preds = self.model.generate_from_dloaderbatch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )[0]
                 
-                li_comet_heads.extend(heads_comet.strip())
-                li_comet_rels.extend(rels_comet)
+                li_comet_heads.append(heads_comet.strip())
+                li_comet_rels.append(rels_comet)
                 li_comet_tails.append(tails_comet.strip())
-                li_comet_preds.extend(preds)
+                li_comet_preds.append(preds)
 
                 # RST Testing
                 batch_rst = batch['rst']
 
-                preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs )
-                
-                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s> ') 
-                heads_rst = [ _.strip("<s>").strip("</") for _ in heads_rst ]
-                heads_treepos_rst = batch_rst['head_treepos_ids'][0]
+                preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
+                generation_kwargs=generation_kwargs )[0]
+                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
+                heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
+                heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
                 heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
 
-                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rel_ids'].cpu().squeeze() - len(self.model.tokenizer.atomic_rel_li ) ) 
-                rels_treepos_rst = batch_rst['rst_treepos_ids'][0] 
-                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu())
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0) - len(self.model.tokenizer.atomic_rel_li ) ).tolist()
+                rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
+                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
 
                 tails_comet = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
-                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0]
+                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
 
-                li_rst_heads.append( [ {'pos': pos, 'head':head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
-                li_rst_rels.append( [ {'pos':pos, 'rel':rel, 'ns':ns} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
-                li_rst_tails.append( {'pos':tail_treepos_ids_rst, 'tail':tails_comet.strip()} )
-                li_rst_preds.append( {'pos':tail_treepos_ids_rst, 'pred':preds.strip() }  )
+                li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
+                li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
+                li_rst_tails.append( {tail_treepos_ids_rst:tails_comet.strip()} )
+                li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
 
 
             # Adding records from this epoch to files
@@ -1971,7 +1973,7 @@ class TrainingModule(pl.LightningModule):
                     tail = li_comet_tails[idx]
                     preds = li_comet_preds[idx]
                                         
-                    datum = { 'round': -1,
+                    datum = { 'epoch': 0,
                                 'head': head,
                                 "rels": rels,
                                 "tail":tail,
@@ -1990,7 +1992,7 @@ class TrainingModule(pl.LightningModule):
                     tail = li_rst_tails[idx]
                     preds = li_rst_preds[idx]
                                         
-                    datum = { 'round': -1,
+                    datum = { 'epoch': 0,
                                 'head': head,
                                 "rels": rels,
                                 "tail":tail,
@@ -2003,10 +2005,10 @@ class TrainingModule(pl.LightningModule):
 
                 df_comet = pd.read_csv(fp_comet)    
                 datum_comet = {
-                    'round':df_comet['round'].max()+1,
+                    'epoch':df_comet['epoch'].max()+1,
                     'head': '',
                     'rels':'',
-                    'tails':'',
+                    'tail':'',
                     'preds':li_comet_preds[idx] }
 
                 df_comet = df_comet.append(datum_comet, ignore_index=True)
@@ -2016,10 +2018,10 @@ class TrainingModule(pl.LightningModule):
                 # rst - adding to preds
                 df_rst = pd.read_csv(fp_rst)    
                 datum_rst = {
-                    'round':df_rst['round'].max()+1,
+                    'epoch':df_rst['epoch'].max()+1,
                     'head': '',
                     'rels':'',
-                    'tails':'',
+                    'tail':'',
                     'preds':li_rst_preds[idx] }
 
                 df_rst = df_rst.append(datum_rst, ignore_index=True)
