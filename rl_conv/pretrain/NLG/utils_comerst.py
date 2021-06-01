@@ -65,6 +65,21 @@ np_str_obj_array_pattern = re.compile(r'[SaUO]')
 
 huggingface_names = {'bart_base': "facebook/bart-base"}
 
+def get_path(_path,_dir=False):
+
+    if os.path.isabs(_path) == False:
+        _path = os.path.join(dirname, _path)
+    
+    _path = os.path.realpath(_path)
+    
+    if _dir:
+        os.makedirs(_path, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
+
+    return _path
+
+
 def load_pretrained_transformer( model_name='bart', transformer=True, 
                                     tokenizer=False):
     _dir_transformer = os.path.join( get_path("./models"), model_name )
@@ -364,9 +379,7 @@ def prepare_inputs_for_generation(
         
         tti  = kwargs['tail_treepos_ids']
         decoder_inputs_embeds = self.model.shared( decoder_input_ids ) + \
-                                self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) + \
-                                    self.comerst().embedding_tokentype( torch.full_like( tti , 
-                                        fill_value=self.comerst().embedding_tokentype.padding_idx )                                         )
+                                self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
 
         decoder_inputs_embeds = decoder_inputs_embeds * self.model.decoder.embed_scale
 
@@ -504,7 +517,6 @@ def greedy_search(
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         
         # NOTE: new input_id willl have to be put through custom embedding layer
-        # coudl posibly add token_type_id in the below part
         model_kwargs = self._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
         )

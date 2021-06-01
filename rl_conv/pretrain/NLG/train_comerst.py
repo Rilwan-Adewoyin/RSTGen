@@ -17,12 +17,14 @@ import transformers
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from pytorch_lightning.trainer.supporters import CombinedLoader
-from pytorch_lightning.utilities import _get_rank
+from pytorch_lightning.utilities.distributed import _get_rank
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
 from sklearn.utils import shuffle as skl_shuffle
 from itertools import islice
 import math
 from itertools import groupby
+import copy
+
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
@@ -84,6 +86,7 @@ from typing import Optional, Callable, Union, Optional, List, Iterable
 
 from functools import lru_cache
 import spacy
+from pytorch_lightning.core.saving import save_hparams_to_yaml
 
 nlp = spacy.load("en_core_web_sm") 
 components = ["parser","ner"]
@@ -102,6 +105,7 @@ class COMERST(nn.Module):
                     max_len_head=80,
                     max_len_tail=20,
                     max_edu_nodes_to_select=-1,
+                    filter_atomic_rels=False
                     ):
         super(COMERST, self).__init__()
 
@@ -114,17 +118,17 @@ class COMERST(nn.Module):
         
         self.tokenizer = COMERST_tokenizer(self.base_model_name,
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
-                                            max_len_head, max_len_tail, max_edu_nodes_to_select )
+                                            max_len_head, max_len_tail,
+                                            max_edu_nodes_to_select,
+                                            filter_atomic_rels )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
         # region Extra embedding layers
-        self.embedding_rst_rels = torch.nn.Embedding( len(self.tokenizer.rst_rel_li )+1, self.transformer.config.d_model, 
-                                    padding_idx=len(self.tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.005)
+         
 
-        # The rst_parent_nodes can go up to 30, but the edu_positions can then go up to 30*2 +2
-            #+1+1 here because max_node =30, but our node data is 0 indexed  padding index is final node
+            # The rst_parent_nodes can go up to 30, but the edu_positions can then go up to 30*2 +2
+                #+1+1 here because max_node =30, but our node data is 0 indexed  padding index is final node
         self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
                                     padding_idx=(2*self.tokenizer.rst_pos_maxidx +2 ) + 1   , scale_grad_by_freq=self.scale_grad_by_freq )
         self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
@@ -135,15 +139,13 @@ class COMERST(nn.Module):
 
         # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
-        
-        self.embedding_comet_rel = torch.nn.Embedding( len(self.tokenizer.atomic_rel_li ) + 1 , self.transformer.config.d_model,
-                                    padding_idx=len(self.tokenizer.atomic_rel_li ) , scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_comet_rel.weight.data.normal_(mean=0.0, std=0.005)
 
+        # relations embedding
         rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
         rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
         self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
-        self.embedding_rels.weight.data.normal_(mean=0.0, std=0.005)
+        self.embedding_rels.weight.data.normal_(mean=0.0, std=0.005) 
+            # In this embedding comet takes the first set of embedding indices. RST takes the second set of embedding indices
 
         # setting the pad token to 0 in posiiton_ids embedding and then freezing
         self.transformer.model.encoder.embed_positions.padding_idx = 0
@@ -180,7 +182,7 @@ class COMERST(nn.Module):
         self.pad_values = {'head_ids':self.transformer.model.shared.padding_idx , 
                         'head_treepos_ids':self.embedding_rst_pos.padding_idx, 
                         
-                        'rst_rel_ids': self.embedding_rst_rels.padding_idx, 
+                        'rst_rel_ids': self.embedding_rels.padding_idx, 
                         'rst_treepos_ids': self.embedding_rst_pos.padding_idx,
                         'rst_ns_ids': self.embedding_rst_ns.padding_idx, 
 
@@ -242,9 +244,15 @@ class COMERST(nn.Module):
         #endregion
 
         if not return_dict:
+            lm_loss = {}
+            if lm_loss_comet is not None:
+                lm_loss['comet'] = lm_loss_comet 
+            if lm_loss_rst is not None:
+                lm_loss['rst'] =  lm_loss_rst
+
             _rst = (lm_logits_rst,) + output_rst[1:]
             _comet = (lm_logits_comet,) + output_comet[1:]
-            return (([lm_loss_rst, lm_loss_comet],) + _rst + _comet ) if lm_loss is not None else (_rst, _comet)
+            return ((lm_loss,) + _rst + _comet ) if len(lm_loss) != 0 else (_rst, _comet)
             
         
         else:
@@ -308,7 +316,7 @@ class COMERST(nn.Module):
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
         #inputs_embed_head += self.embedding_kp_score( head_kpscore )
 
-        inputs_embed_rel = self.embedding_rst_rels( rst_rel_ids )
+        inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
 
@@ -340,9 +348,8 @@ class COMERST(nn.Module):
             # adding a conditioning token at start of sequence to indicate 
             # note we don't add token type ids to output since, the tti for head and tail entities is the padding vector of 0s
         decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
-                                self.embedding_rst_pos( tail_treepos_ids ) + \
-                                    self.embedding_tokentype( torch.full_like( tail_ids  , 
-                                        fill_value=self.embedding_tokentype.padding_idx ) )
+                                self.embedding_rst_pos( tail_treepos_ids ) 
+
                             
             #TODO: think of way to incorporate a keyphrase score prediction
         decoder_inputs_embeds = decoder_inputs_embeds * self.transformer.model.decoder.embed_scale
@@ -390,8 +397,7 @@ class COMERST(nn.Module):
         #region decoderinputs_embeds
             #token type ids does not have to be added to decoder input embeds
         decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
-                                self.embedding_rst_pos( tail_treepos_ids ) + \
-                                    self.embedding_tokentype( torch.full_like( tail_ids  , fill_value=self.embedding_tokentype.padding_idx ) )
+                                self.embedding_rst_pos( tail_treepos_ids ) 
                             
         decoder_inputs_embeds = decoder_inputs_embeds * self.transformer.model.decoder.embed_scale
         #endregion
@@ -407,14 +413,21 @@ class COMERST(nn.Module):
         }
 
     def return_params(self):
-        keys = ['base_model_name','max_len_head', 'max_len_tail'
-                        'scale_grad_by_freq','model_name']
+        keys = ['base_model_name','max_len_head', 'max_len_tail',
+                        'scale_grad_by_freq','model_name',
+                        'filter_atomic_rels','max_edu_nodes_to_select']
 
         json_keys = []
         
         params = {
-            k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
-        }
+            k:self.__dict__[k] for k in keys if 
+                k in self.__dict__.keys() }
+
+        tokenizer_params = {
+            k:self.tokenizer.__dict__[k] for k in keys if 
+                k in self.tokenizer.__dict__.keys() }
+
+        params = {**params, **tokenizer_params}
 
         json_params = {
             k:json.dumps(self.__dict__[k]) for k in json_keys if k in self.__dict__.keys()
@@ -594,7 +607,8 @@ class COMERST(nn.Module):
         parser.add_argument('-mlh','--max_len_head', type= int, default=20 )
         parser.add_argument('-mlt','--max_len_tail', type= int, default=20 )
         parser.add_argument('-ments','--max_edu_nodes_to_select', type=int, default=-1, )
-                      
+        parser.add_argument('-far','--filter_atomic_rels', type=lambda x: bool(int(x)), default=False, )
+        
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         mparams = parser.parse_known_args( )[0]
@@ -616,8 +630,8 @@ class COMERST_tokenizer():
                  dir_tokenizer='./models/bart_tokenizer',
                  max_len_head=20,
                  max_len_tail=20,
-                 randomize_comet_pronouns=True,
                  max_edu_nodes_to_select=-1,
+                 filter_atomic_rels=False,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -626,6 +640,7 @@ class COMERST_tokenizer():
         self.max_len_head = max_len_head
         self.max_len_tail = max_len_tail
         self.max_edu_nodes_to_select = max_edu_nodes_to_select
+        self.filter_atomic_rels = filter_atomic_rels
 
         # region Setting up RST relation encoding
 
@@ -652,12 +667,19 @@ class COMERST_tokenizer():
         #endregion
 
         # region Setting up CSKG relation encoding
-                
-        self.atomic_rel_li = ['oEffect', 'oReact', 'oWant', 'xAttr', 'xEffect', 'xIntent',
+        self.filter_atomic_rels = filter_atomic_rels
+        if self.filter_atomic_rels == False:      
+            self.atomic_rel_li = ['oEffect', 'oReact', 'oWant', 'xAttr', 'xEffect', 'xIntent',
                                 'xNeed', 'xReact', 'xWant', 'AtLocation', 'ObjectUse', 'Desires',
                                 'HasProperty', 'NotDesires', 'Causes', 'HasSubEvent', 'xReason',
                                 'CapableOf', 'MadeUpOf', 'isAfter', 'isBefore', 'isFilledBy',
                                 'HinderedBy']
+        
+        elif self.filter_atomic_rels == True :
+            self.atomic_rel_li = ['oEffect', 'oReact', 'oWant', 'xAttr', 'xEffect', 'xIntent',
+                                        'xNeed', 'xReact', 'xWant', 'Desires', 'HasProperty',
+                                        'NotDesires','Causes','HasSubEvent','xReason',
+                                        'CapableOf','MadeupOf','isAfter','isBefore', 'HinderedBy' ]
 
         self.atomic_rel_labeler = sklp.LabelEncoder()
         self.atomic_rel_labeler.fit(  self.atomic_rel_li )
@@ -677,7 +699,6 @@ class COMERST_tokenizer():
         # endregion 
 
         #region properties and methods to be used when randomly swapping PersonX/PersonY for name/pronoun
-        self.randomize_comet_pronouns = randomize_comet_pronouns
         self.pattern_personx = re.compile("person[ ]*x", re.IGNORECASE)
         self.pattern_persony = re.compile("person[ ]*y", re.IGNORECASE)
         
@@ -726,7 +747,7 @@ class COMERST_tokenizer():
         li_edukp_pos =  [ self.find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ]
         li_edukp_pos = sum( li_edukp_pos, [] )
         #TODO: need to reorder the edukp pos from left to right on a flattened binary tree
-
+ 
         li_edukp_pos.sort(key=self.edukp_pos_sort_function)
         #endregion
 
@@ -767,7 +788,7 @@ class COMERST_tokenizer():
             
         max_edu_nodes_to_select = self.max_edu_nodes_to_select if self.max_edu_nodes_to_select!=-1 else len( li_edukp_pos )
         edu_count_to_select = random.randint(2, max_edu_nodes_to_select)
-        start_edu_node_idx = random.randint(0, max_edu_nodes_to_select-len(edu_count_to_select) )
+        start_edu_node_idx = random.randint(0, max_edu_nodes_to_select-edu_count_to_select-1 )
         
         li_edu_kp = li_edu_kp[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
         li_edukp_pos = li_edukp_pos[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
@@ -823,6 +844,7 @@ class COMERST_tokenizer():
        
         # region relation : encoded list of rst parent nodes information
         rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze()
+        rst_rel_ids = rst_rel_ids + len(self.tokenizer.atomic_rel_li )
         rst_treepos_ids = torch.tensor( li_rst_pos, dtype=torch.long )
         rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze()
         #endregion
@@ -906,18 +928,19 @@ class COMERST_tokenizer():
             'labels':labels.squeeze()
         }
 
-    def tokenize_comet( self, head, rel, tail ):
+    def tokenize_comet( self, head, rel, tail, randomize_comet_pronouns  ):
         
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
             #Do this at random, so model can still predict for PersonX PersonY in dset
-        if random.random() > 0.33 and self.randomize_comet_pronouns:
+        if random.random() > 0.33 and randomize_comet_pronouns:
             head, rel, tail = self.tokenize_comet_person_randomizer(head, rel, tail)
         # endregion
-
+        
         # region head tail rel
         head_ids = self.base_tokenizer.encode( head, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_head)
 
         rels_ids = torch.tensor( self.atomic_rel_labeler.transform( [rel] ), dtype=torch.long )
+        rels_ids = rels_ids
 
         #tail_ids = self.base_tokenizer.encode( self.token_edu + " " + tail + " " + self.token_eos , add_prefix_space=False, return_tensor='pt')
         tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
@@ -1306,22 +1329,22 @@ class COMERST_tokenizer():
         li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
         while abs(parent_pos)!=0:
-            parent_pos = (edukp_pos-1 )/2
+            parent_pos = (parent_pos-1 )/2
             # child node is left child node if (child_node_pos-1 /2)==int
             # child node is right child node if (child_node_pos-1 /2)=/int
-            if _.is_integer():
+            if parent_pos.is_integer():
                 child_position_rel_to_parent = 'L'
             else:
                 child_position_rel_to_parent = 'R'
             
-            li_leftright_seq = li_leftright_seq + [child_position_rel_to_parent]
+            li_leftright_seq = [child_position_rel_to_parent] + li_leftright_seq
 
             parent_pos = math.floor(parent_pos)
         
         # Now calculate the flattened position using the sequence of left and rights
         _ = {'L':-1, 'R':+1}
-        li_flattened_pos_contributions = [  _[direction]*(0.5**idx) for idx,direction in enumerate(li_leftright_seq)  ]
-        flattened_pos = sum(li_leftright_seq)
+        li_flattened_pos_contributions = [  _[direction]*(0.5**(idx+1)) for idx,direction in enumerate(li_leftright_seq)  ]
+        flattened_pos = sum(li_flattened_pos_contributions)
 
         return flattened_pos
 
@@ -1373,7 +1396,7 @@ class COMERST_tokenizer():
     
     @lru_cache(maxsize=None)
     def node_x_reachable_from_node_y(self, nodex, nodey):
-        """returns (bool, [sequence showing path from nodex to nodey])
+        """returns (bool, [sequence showing path from nodex down tre to nodey])
 
         Args:
             nodex ([type]): [description]
@@ -1388,6 +1411,24 @@ class COMERST_tokenizer():
         Returns:
             [type]: [description]
         """
+
+        #Find path by calculating the sequence of Left and Rights between a nodey and node x
+        #Convert this path to the nodes that it represents
+
+        parent_ path = []
+        nth_parent_node = nodey
+        reachable=False
+
+        while nodex_reached==False:
+        
+            if parent_node
+            parent_node != nodex:
+
+
+
+        
+        return reachable, path
+        
 
 
 class TrainingModule(pl.LightningModule):
@@ -1406,7 +1447,7 @@ class TrainingModule(pl.LightningModule):
                     data_splits = {'train':0.6,'val':0.2,'test':0.2},
                     loss_weight_rst = 0.5,
                     loss_weight_comet = 0.5,
-                    #dset_blend={'ATOMIC2020':0.5 , 'RST':0.5 },
+                    randomize_comet_pronouns = True,
                     tag='',
                     *args,
                     **kwargs):
@@ -1420,12 +1461,13 @@ class TrainingModule(pl.LightningModule):
         self.data_splits = data_splits
         self.loss_weight_rst = loss_weight_rst
         self.loss_weight_comet = loss_weight_comet
-        #self.dset_blend = dset_blend
+        self.randomize_comet_pronouns = randomize_comet_pronouns
         
         if self.mode in ['train_new','train_cont','test']:
-            self.dir_data_rst = utils.get_path(dir_data_rst)
+            self.dir_data_rst = dir_data_rst
             self.dir_data_atomic2020 = dir_data_atomic2020
             self.create_data_loaders( )
+            
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
@@ -1439,9 +1481,11 @@ class TrainingModule(pl.LightningModule):
             model_params_to_save = self.model.return_params()
 
             self.hparams.update({ **train_params_to_save, **model_params_to_save})
+            #self.save_hyperparameters()
+            # save_hparams_to_yaml(f"{self.logger.log_dir}/hparams.yaml",
+            #                   self.hparams)
 
             self.inference_samples = list( islice( self.inference_dl, 10 ) )
-            self.inference_samples_comet_raw_records = [ self.inference_dl.dataset['rst'].data ]
             del self.inference_dl
 
         if self.mode in ['inference']:
@@ -1463,11 +1507,11 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
-        #parser.add_argument('--dset_blend', default={'ATOMIC2020':0.5, 'RST':0.5}, type=lambda _str: ast.literal_eval(_str), required=False)
         parser.add_argument('--version', default=0,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
         parser.add_argument( '-lwr','--loss_weight_rst',default=0.5, required=False, type=float)
         parser.add_argument( '-lwc','--loss_weight_comet',default=0.5, required=False, type=float)
+        parser.add_argument( '--rcp', '--randomize_comet_pronouns', default=True, type= lambda x : bool(int(x)) )
         parser.add_argument('--tag', default='default model', required=False, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
             #TODO: check --version of required type None actually works
@@ -1499,7 +1543,7 @@ class TrainingModule(pl.LightningModule):
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_tokenizer_name','model_name','max_len_head','max_len_tail'
-                    ,'scale_grad_by_freq' ]} )
+                    ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select']} )
                 
                 mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'context_len'] }
@@ -1735,13 +1779,13 @@ class TrainingModule(pl.LightningModule):
         # Getting tparams
         tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'batch_size', 'learning_rate','precision','splits',
-            'tag','loss_weight_rst','loss_weight_comet']}
+            'tag','loss_weight_rst','loss_weight_comet','randomize_comet_pronouns']}
 
         tparams['mode'] = 'inference'
 
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
-            'frst_version','scale_grad_by_freq']}
+            'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 
@@ -1774,24 +1818,19 @@ class TrainingModule(pl.LightningModule):
         input_ = batch
 
         model_output = self.forward(input_) #(lm_logits and loss)
-        
+        lm_loss = model_output[0]
         loss = None
-
-        if 'rst' in model_output:
-            lm_loss_rst = model_output['rst']['lm_loss_rst']
-            if loss == None:
-                loss = lm_loss_rst
-            else:
-                loss = loss + lm_loss_rst*self.loss_weight_rst
         
-        if 'comet' in model_output:
-            lm_loss_comet = model_output['comet']['lm_loss_comet']
-            
-            loss = loss + lm_loss_comet*self.loss_weight_comet
+        if 'comet' in lm_loss:
+            lm_loss_comet = lm_loss['comet'] * self.loss_weight_comet
+            loss = lm_loss_comet
+        
+        if 'rst' in lm_loss:
+            lm_loss_rst = lm_loss['rst'] *self.loss_weight_rst
             if loss == None:
                 loss = lm_loss_rst
             else:
-                loss = loss + lm_loss_rst*self.loss_weight_rst
+                loss = loss + lm_loss_rst
         
         loss_key = f"{step_name}_loss"
         
@@ -1842,6 +1881,11 @@ class TrainingModule(pl.LightningModule):
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
         if step_name == "val" and _get_rank() == 0 :
+            generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                'num_return_sequences':1,
+                                'min_length':2, 'max_length':20 } #'max_length':30,'min_length':4
+
             # At end of validation loop produce some quantitative examples of model's performance
 
             # Making directory for inference testing results
@@ -1884,7 +1928,7 @@ class TrainingModule(pl.LightningModule):
                 heads_treepos_rst = batch_rst['head_treepos_ids'] 
                 heads_treepos_rst = [ group[0] for key, group in groupby(heads_treepos_rst) ]
 
-                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rels_ids'] )
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rels_ids'] ) - len(self.model.tokenizer.atomic_rel_li )
                 rels_treepos_rst = batch_rst['rst_treepos_ids'] 
                 rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'])
 
@@ -1966,35 +2010,14 @@ class TrainingModule(pl.LightningModule):
                 df_rst = df_rst.append(datum_rst, ignore_index=True)
                 df_rst.to_csv( fp_rst, index=False)
 
-
-
-
-                
-                
-
-
-                
-            
-            # RST Testing
-        # elif step_name == "test" and _get_rank() == 0 :
-        #     # At end of test loop - perform the COMET Evaluation and any RST evaluation
-            
-        #     # Making directory for inference testing results
-        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
-        #     if not os.path.exists(dir_infer):
-        #         os.makedirs(dir_infer,exist_ok=True)
         
-        #     # COMET testing
-
-        #     # RST Testing
-        
-
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
         dg = DataLoaderGenerator(self.dir_data_rst, self.dir_data_atomic2020,
                 self.batch_size, self.model.pad_values,
                 self.model.tokenizer, 
-                workers=self.workers, mode=self.mode, split=self.data_splits
+                workers=self.workers, mode=self.mode, split=self.data_splits,
+                randomize_comet_pronouns = self.randomize_comet_pronouns,
                 #dset_blend=self.dset_blend
                 )
 
@@ -2039,7 +2062,8 @@ class TrainingModule(pl.LightningModule):
         params = {}
         keys = ['batch_size','accumulate_grad_batches','learning_rate','max_epochs',
             'dir_data_rst','dir_data_atomic2020',
-            'warmup_proportion','tag','version','loss_weight_rst','loss_weight_comet']
+            'warmup_proportion','tag','version','loss_weight_rst','loss_weight_comet',
+            'randomize_comet_pronouns']
         
         params = {
             k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
@@ -2064,14 +2088,15 @@ class DataLoaderGenerator():
                     pad_values ,
                     tokenizer, workers=0, mode='train_new',
                     splits={'train':0.6,'val':0.2,'test':0.2},
-                    #dset_blend={'ATOMIC2020':0.5 , 'RST':0.5 },
+                    randomize_comet_pronouns = True,
                     **kwargs):
         
         self.dir_data_rst = dir_data_rst
         self.dir_data_atomic2020 = dir_data_atomic2020
         self.tokenizer = tokenizer
         self.splits = splits
-        #self.dset_blend = dset_blend
+        self.randomize_comet_pronouns = randomize_comet_pronouns
+        
 
         self.bs = batch_size
         self.workers_rst = int( workers/2) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
@@ -2146,7 +2171,7 @@ class DataLoaderGenerator():
         #TODO: change defualt collate to allow padding of elements for batching
         return dataloader
 
-    def prepare_dloader_atomic2020(self, shuffle=False, 
+    def prepare_dloader_atomic2020(self, shuffle,
         split_name='train'):
 
         """Prepares a dataloader given a directory of data for NLG language module
@@ -2160,26 +2185,30 @@ class DataLoaderGenerator():
        
         #defining starting line and total lines to use for dataset
         if split_name == 'train':
-            shuffle = True
+            shuffle = shuffle
             fn = os.path.join( self.dir_data_atomic2020,"train_v2.csv" )
             drop_duplicates = False
+            randomize_comet_pronouns = self.randomize_comet_pronouns
 
         elif split_name == 'val':
             fn = os.path.join( self.dir_data_atomic2020,"dev_v2.csv" )
-            shuffle = True
+            shuffle = shuffle
             drop_duplicates = False
+            randomize_comet_pronouns = self.randomize_comet_pronouns
 
         elif split_name == 'test':
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
-            shuffle = False
+            shuffle = shuffle
             drop_duplicates = False
+            randomize_comet_pronouns = self.randomize_comet_pronouns
 
         elif split_name == 'inference':
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
-            shuffle = False
+            shuffle = shuffle
             drop_duplicates = True
+            randomize_comet_pronouns = self.randomize_comet_pronouns
 
-        dset = SingleDataset_atomic2020(fn, self.tokenizer, drop_duplicates=drop_duplicates )
+        dset = SingleDataset_atomic2020(fn, self.tokenizer, randomize_comet_pronouns=randomize_comet_pronouns, drop_duplicates=drop_duplicates )
                 
         if split_name == 'inference':
             bs = 1
@@ -2209,8 +2238,8 @@ class SingleDataset_rst(torch.utils.data.Dataset):
                 #TODO: remove nrows
                 self.data = pd.read_csv(file_path, sep=',', header=0, 
                     skiprows=skiprows,
-                    nrows=(self.line_end-self.line_start),
-                    #nrows=100
+                    #nrows=(self.line_end-self.line_start),
+                    nrows=100
                      )
 
             else: 
@@ -2218,8 +2247,8 @@ class SingleDataset_rst(torch.utils.data.Dataset):
                             
                 self.data = pd.read_csv(file_path, sep=',', 
                     names=names, skiprows=skiprows,
-                    nrows=(self.line_end-self.line_start)
-                    #nrows=100
+                    #nrows=(self.line_end-self.line_start)
+                    nrows=100
                     ) 
                 
         # TODO: add a check for lines which have keyphrases that are empty and remove them
@@ -2315,21 +2344,25 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
     """
     #TODO: think of way to balance ATOMIC and RST contribution
     #TODO: find research on multi task learning well
-    def __init__(self, file_path, tokenizer, drop_duplicates=False ):
+    def __init__(self, file_path, tokenizer, randomize_comet_pronouns=False, drop_duplicates=False ):
         self.fp = file_path
         self.tokenizer = tokenizer
-        self.drop_duplicates = True #used for test set. In the case our model uses greedy decoding. Filters on duplicate head and tails
+        self.drop_duplicates = drop_duplicates #used for test set. In the case our model uses greedy decoding. Filters on duplicate head and tails
+        self.randomize_comet_pronouns = randomize_comet_pronouns
 
         #TODO: remove nrows
         self.data = pd.read_csv(self.fp 
-            #,nrows=100
+            ,nrows=100
             )
         
         if self.drop_duplicates:
             self.data = skl_shuffle(self.data)
-            self.data = self.data.drop_duplicates(subset=['head','relation'],keep='first',ignore_index=True)
-
+            self.data = self.data.drop_duplicates(subset=['head','relation'],
+                keep='first',ignore_index=True)
         
+        if self.tokenizer.filter_atomic_rels == True:
+            #self.data = self.data.loc[ self.data['relation'].isin( self.tokenizer.atomic_rel_li ) ]
+            self.data = self.data.loc[ self.data.relation.str.strip('"').str.contains('|'.join(self.tokenizer.atomic_rel_li),regex=True) ]
     def __len__(self):
         return len(self.data)
     
@@ -2339,8 +2372,9 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
         
         #encoding
         encoded = self.tokenizer.tokenize_comet( head=head,
-                                                        rel=rel,
-                                                        tail=tail )
+                                                rel=rel,
+                                                tail=tail,
+                                                randomize_comet_pronouns=self.randomize_comet_pronouns )
 
             # encoded May include some of the following
             # return {
@@ -2411,4 +2445,4 @@ if __name__ == '__main__':
 
 # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20  -ments 2 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline" 
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20  -ments 2 -far 0 -rcp 1 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline" 
