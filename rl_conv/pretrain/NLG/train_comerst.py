@@ -377,7 +377,7 @@ class COMERST(nn.Module):
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
 
-        inputs_embed_rel = self.embedding_comet_rel( rels_ids )
+        inputs_embed_rel = self.embedding_rels( rels_ids )
         inputs_embed_rel += self.embedding_rst_pos( rels_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( torch.full_like( rels_treepos_ids , 
                                 fill_value=self.embedding_rst_ns.padding_idx  )  )
@@ -786,9 +786,13 @@ class COMERST_tokenizer():
                 #  Once a n-level parent node is found that connects, this is the new ROOT node....
                 #  Now retrieve all intermediate parent nodes between ROOT node and edus in span ------
             
-        max_edu_nodes_to_select = self.max_edu_nodes_to_select if self.max_edu_nodes_to_select!=-1 else len( li_edukp_pos )
+        if self.max_edu_nodes_to_select==-1:
+            max_edu_nodes_to_select = len( li_edukp_pos ) 
+        else:
+            max_edu_nodes_to_select = min( len( li_edukp_pos ), self.max_edu_nodes_to_select )
+
         edu_count_to_select = random.randint(2, max_edu_nodes_to_select)
-        start_edu_node_idx = random.randint(0, max_edu_nodes_to_select-edu_count_to_select-1 )
+        start_edu_node_idx = random.randint(0, (max_edu_nodes_to_select-1)-(edu_count_to_select-1) )
         
         li_edu_kp = li_edu_kp[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
         li_edukp_pos = li_edukp_pos[ start_edu_node_idx: start_edu_node_idx+edu_count_to_select]
@@ -843,10 +847,10 @@ class COMERST_tokenizer():
         #endregion 
        
         # region relation : encoded list of rst parent nodes information
-        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze()
-        rst_rel_ids = rst_rel_ids + len(self.tokenizer.atomic_rel_li )
+        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze(dim=-1)
+        rst_rel_ids = torch.add( rst_rel_ids, len(self.atomic_rel_li ) )
         rst_treepos_ids = torch.tensor( li_rst_pos, dtype=torch.long )
-        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze()
+        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze(dim=-1)
         #endregion
 
         #region attention mask
@@ -862,8 +866,8 @@ class COMERST_tokenizer():
             # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
             # it should also refer to the relations
         curr_bos_token_pos=0
+        
         for hids in li_head_ids:
-
             len_ids = len(hids)
             _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
 
@@ -1277,9 +1281,11 @@ class COMERST_tokenizer():
             else:
                 idxs = np.arange( len(li_edukp_pos) )
             
-            # here we sample the edukp_pos, with more weight placed on the deeper edukp_pos
+            # here we sample the edukp_pos (from the ones that could have been incorrectly labelled)
+                # , with more weight placed on the deeper edukp_pos
             #pos = li_edukp_pos.pop(idxs[-1])
-            level_of_each_edukp_pos = [ math.floor( math.log( pos+1 , 2 ) ) for pos in li_edukp_pos]
+            li_edukp_pos_filt = [ li_edukp_pos[i] for i in idxs]
+            level_of_each_edukp_pos = [ math.floor( math.log( pos+1 , 2 ) ) for pos in li_edukp_pos_filt]
             maxl = max(level_of_each_edukp_pos)
                 #twice as likely to pick node from a level l+1 compared to node from level l
             weights_for_each_edukp = [ 0.5**(maxl-level) for level in level_of_each_edukp_pos  ]
@@ -1363,21 +1369,23 @@ class COMERST_tokenizer():
         candidiate_root_node = self.parent_node_pos(smallest_edukp_pos)
 
         while root_found==False:
-            root_found = all( self.node_x_reachable_from_node_y( pos,candidiate_root_node )[0] for pos in li_edukp_pos )
+            root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edukp_pos )
             
             if root_found == False:
-                candidiate_root_node = self.parent_node_pos(smallest_edukp_pos)
+                candidiate_root_node = self.parent_node_pos(candidiate_root_node)
             
             elif root_found == True:
                 #find the nodes that
-                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( pos,candidiate_root_node )[1] for pos in li_edukp_pos   ]
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edukp_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
+                nodes_in_minimum_spanning_tree.sort()
 
-                bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
-                li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_ ] 
-                li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_]
-                li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_]
+                if not nodes_in_minimum_spanning_tree == li_rst_pos:
+                    bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
+                    li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_ ] 
+                    li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_]
+                    li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_]
         
         return li_rst_pos, li_rst_rel, li_rst_ns
         
@@ -1394,6 +1402,12 @@ class COMERST_tokenizer():
         parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )
         return parent_node
     
+    @lru_cache()
+    def node_level(self, node_pos):
+        val = math.floor( math.log( node_pos+1 , 2 ) )
+        
+        return val
+
     @lru_cache(maxsize=None)
     def node_x_reachable_from_node_y(self, nodex, nodey):
         """returns (bool, [sequence showing path from nodex down tre to nodey])
@@ -1414,20 +1428,25 @@ class COMERST_tokenizer():
 
         #Find path by calculating the sequence of Left and Rights between a nodey and node x
         #Convert this path to the nodes that it represents
+        #We assume node x is reachable until we know it is not.
 
-        parent_ path = []
-        nth_parent_node = nodey
-        reachable=False
+        parent_path = []
+        curr_node = nodey
+        reachable=True
 
-        while nodex_reached==False:
+        while reachable==True and nodex not in parent_path:
         
-            if parent_node
-            parent_node != nodex:
+            curr_node = self.parent_node_pos(curr_node)
+            
+            parent_path = [curr_node] + parent_path
 
-
+            # Check if new curr node is on same level as nodex.
+                # if yes At which point we know nodex is not directly reachable if curr_node is not nodex
+            if self.node_level(curr_node) == self.node_level(nodex):
+                reachable = (curr_node == nodex)
 
         
-        return reachable, path
+        return reachable, parent_path
         
 
 
@@ -1624,16 +1643,12 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator=accelerator,
-                        #limit_train_batches =10,
-                        #limit_val_batches = 10,
-                        #val_check_interval=0.25,
-                        val_check_interval=0.3,
+                        limit_train_batches =5,
+                        limit_val_batches = 5,
+                        #val_check_interval=0.3,
                         num_sanity_val_steps=0, 
-                        #track_grad_norm = True,
                         #overfit_batches=25,
-                        #fast_dev_run=2, 
-                        #log_gpu_memory=True,
-                        reload_dataloaders_every_epoch=False,
+                        reload_dataloaders_every_epoch=True,
                         multiple_trainloader_mode='max_size_cycle'
                         )
 
@@ -1818,15 +1833,14 @@ class TrainingModule(pl.LightningModule):
         input_ = batch
 
         model_output = self.forward(input_) #(lm_logits and loss)
-        lm_loss = model_output[0]
         loss = None
         
-        if 'comet' in lm_loss:
-            lm_loss_comet = lm_loss['comet'] * self.loss_weight_comet
+        if 'comet' in model_output:
+            lm_loss_comet = model_output['comet'].loss * self.loss_weight_comet
             loss = lm_loss_comet
         
-        if 'rst' in lm_loss:
-            lm_loss_rst = lm_loss['rst'] *self.loss_weight_rst
+        if 'rst' in model_output:
+            lm_loss_rst = model_output['rst'].loss *self.loss_weight_rst
             if loss == None:
                 loss = lm_loss_rst
             else:
@@ -1908,37 +1922,38 @@ class TrainingModule(pl.LightningModule):
                 
                 # COMET testing
                 batch_comet = batch['comet']
-                heads_comet = self.model.tokenizer.base_tokenizer.decode( batch_comet['head_ids'] ) 
-                rels_comet = self.model.tokenizer.atomic_rel_labeler.inverse_transform( batch_comet['rels_ids'] )
-                tails_comet =  self.model.tokenizer.base_tokenizer.decode( batch_comet['tail_ids'] ) 
+                heads_comet = self.model.tokenizer.base_tokenizer.decode( batch_comet['head_ids'][0], skip_special_tokens=True  ).strip() 
+                rels_comet = self.model.tokenizer.atomic_rel_labeler.inverse_transform( batch_comet['rels_ids'] )[0]
+                tails_comet =  self.model.tokenizer.base_tokenizer.decode( batch_comet['tail_ids'][0] , skip_special_tokens=True  ).strip() 
 
-                preds = self.model.generate_from_dloaderbatch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )
+                preds = self.model.generate_from_dloaderbatch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )[0]
                 
                 li_comet_heads.extend(heads_comet.strip())
                 li_comet_rels.extend(rels_comet)
                 li_comet_tails.append(tails_comet.strip())
-                li_comet_preds.extend(preds.strip())
+                li_comet_preds.extend(preds)
 
                 # RST Testing
                 batch_rst = batch['rst']
 
                 preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs )
                 
-                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'],  skip_special_tokens=False ).split('<\s>') 
-                heads_treepos_rst = batch_rst['head_treepos_ids'] 
-                heads_treepos_rst = [ group[0] for key, group in groupby(heads_treepos_rst) ]
+                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s> ') 
+                heads_rst = [ _.strip("<s>").strip("</") for _ in heads_rst ]
+                heads_treepos_rst = batch_rst['head_treepos_ids'][0]
+                heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
 
-                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rels_ids'] ) - len(self.model.tokenizer.atomic_rel_li )
-                rels_treepos_rst = batch_rst['rst_treepos_ids'] 
-                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'])
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rel_ids'].cpu().squeeze() - len(self.model.tokenizer.atomic_rel_li ) ) 
+                rels_treepos_rst = batch_rst['rst_treepos_ids'][0] 
+                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu())
 
-                tails_comet = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'] ) 
-                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'][0]
+                tails_comet = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
+                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0]
 
-                li_rst_heads.append( [ {'pos': pos, 'head':head.strip() } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
+                li_rst_heads.append( [ {'pos': pos, 'head':head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
                 li_rst_rels.append( [ {'pos':pos, 'rel':rel, 'ns':ns} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
-                li_rst_tails.append( {'pos':tail_treepos_ids_rst[0], 'tail':tails_comet.strip()} )
-                li_rst_preds.append( {'pos':tail_treepos_ids_rst[0], 'pred':preds.strip() }  )
+                li_rst_tails.append( {'pos':tail_treepos_ids_rst, 'tail':tails_comet.strip()} )
+                li_rst_preds.append( {'pos':tail_treepos_ids_rst, 'pred':preds.strip() }  )
 
 
             # Adding records from this epoch to files
