@@ -111,12 +111,14 @@ class COMERST(nn.Module):
                     filter_atomic_rels=False,
                     dict_embed_mnorms = {},
                     init_std_var = 0.005,
+                    relation_embedding = "flattened"
                     ):
         super(COMERST, self).__init__()
 
         self.base_model_name = base_model_name   
         self.model_name = model_name
         self.scale_grad_by_freq = scale_grad_by_freq
+        self.relation_embedding = relation_embedding
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
         self.transformer.comerst = lambda : self
@@ -146,12 +148,48 @@ class COMERST(nn.Module):
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
 
         # relations embedding
-        rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
-        rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
-        self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
-        self.embedding_rels.weight.data.normal_(mean=0.0, std=2*init_std_var) 
+        if self.relation_embedding == "flattened":
+            rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
+            rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
+            self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
+            self.embedding_rels.weight.data.normal_(mean=0.0, std=2*init_std_var) 
             # In this embedding comet takes the first set of embedding indices. RST takes the second set of embedding indices
+        
+        elif self.relation_embedding == "hierarchical1":
+            # This is the normal embedding layer for COMET model
+                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST - essentially a bias term
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+            self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
 
+            #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
+            rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
+            rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
+            self.embedding_rels_rst = torch.nn.Eembedding( rel_embed_len_rst, rel_pad_idx_atomic , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+        
+        elif self.relation_embedding == "hierarchical2":
+            # This is the normal embedding layer for COMET model
+                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+            self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+
+            #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
+            rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
+            rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
+            self.embedding_rels_rst_l1 = torch.nn.Eembedding( rel_embed_len_rst, int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ) , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+
+            self.embedding_rels_rst = torch.nn.Sequential(
+                self.embedding_rels_rst_l1,
+                torch.nn.Linear( int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ), rel_embed_len_atomic + 1, bias=False ) ,
+                torch.nn.Tanh(),
+            )
+            self.embedding_rels_rst.padding_idx = self.embedding_rels_rst[0].padding_idx
+          
         # setting the pad token to 0 in posiiton_ids embedding and then freezing
         self.transformer.model.encoder.embed_positions.padding_idx = 0
         self.transformer.model.decoder.embed_positions.padding_idx = 0
@@ -173,6 +211,9 @@ class COMERST(nn.Module):
             "r_pos": self.embedding_rst_pos ,
             "r_ns": self.embedding_rst_ns,
             "rels": self.embedding_rels,
+
+            "rels_h1": self.embedding_rels_rst,
+            "rels_h2":self.embedding_rels_rst[0]
 
             }
 
@@ -209,7 +250,6 @@ class COMERST(nn.Module):
         self.pad_values = {'head_ids':self.transformer.model.shared.padding_idx , 
                         'head_treepos_ids':self.embedding_rst_pos.padding_idx, 
                         
-                        'rst_rel_ids': self.embedding_rels.padding_idx, 
                         'rst_treepos_ids': self.embedding_rst_pos.padding_idx,
                         'rst_ns_ids': self.embedding_rst_ns.padding_idx, 
 
@@ -226,6 +266,18 @@ class COMERST(nn.Module):
                         'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
                                         self.transformer.model.encoder.embed_positions.padding_idx else 0  
                         }
+        
+        if self.relation_embedding == 'flattened':
+            self.pad_values['rst_rel_ids'] = self.embedding_rels.padding_idx
+        
+        elif self.relation_embedding == "hierarchical1":
+            self.pad_values['rst_rel_ids_atomic'] = self.embedding_rels_atomic.padding_idx
+            self.pad_values['rst_rel_ids_rst'] = self.embedding_rels_rst.padding_idx
+        
+        elif self.relation_embedding == "hierarchical2":
+            self.pad_values['rst_rel_ids_atomic'] = self.embedding_rels_atomic.padding_idx
+            self.pad_values['rst_rel_ids_rst'] = self.embedding_rels_rst[0].padding_idx
+
 
 
 
@@ -345,7 +397,15 @@ class COMERST(nn.Module):
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
         #inputs_embed_head += self.embedding_kp_score( head_kpscore )
 
-        inputs_embed_rel = self.embedding_rels( rst_rel_ids )
+        if self.relation_embedding == "flattened":        
+            inputs_embed_rel = self.embedding_rels( rst_rel_ids )
+        elif self.relation_embedding == "hierarchical1":
+            _ = self.embedding_rels_rst( rst_rel_ids )
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
+        elif self.relation_embedding == "hierarchical2":
+            _ = self.embedding_rels_rst( rst_rel_ids )
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
+
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
 
@@ -406,7 +466,11 @@ class COMERST(nn.Module):
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
 
-        inputs_embed_rel = self.embedding_rels( rels_ids )
+        if self.relation_embedding == "flattened":
+            inputs_embed_rel = self.embedding_rels( rels_ids )
+        else:
+            inputs_embed_rel = self.embedding_rels_atomic(rels_ids)
+
         inputs_embed_rel += self.embedding_rst_pos( rels_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( torch.full_like( rels_treepos_ids , 
                                 fill_value=self.embedding_rst_ns.padding_idx  )  )
@@ -445,7 +509,7 @@ class COMERST(nn.Module):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
                         'filter_atomic_rels','max_edu_nodes_to_select',
-                        'init_std_var']
+                        'init_std_var','relation_embedding']
 
         json_keys = ['dict_embed_mnorms']
         
@@ -640,6 +704,7 @@ class COMERST(nn.Module):
         parser.add_argument('-far','--filter_atomic_rels', type=lambda x: bool(int(x)), default=False, )
         parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
         parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
+        parser.add_argument('-re', '--relation_embedding', type=str, choices=['flattened','hierarchical1','hierarchical2'], default='flattened' )
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -1443,7 +1508,7 @@ class COMERST_tokenizer():
         Returns:
             [type]: [description]
         """
-        parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )
+        parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )    
         return parent_node
     
     @lru_cache()
@@ -1608,10 +1673,11 @@ class TrainingModule(pl.LightningModule):
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_tokenizer_name','model_name','max_len_head','max_len_tail'
-                    ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select']} )
+                    ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select',
+                    'init_std_var', 'relation_embedding']} )
                 
                 mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'init_std_var','dict_embed_mnorms'] }
+                    'dict_embed_mnorms'] }
         
                 mparams =  {**mparams, **mparams_json}
             
