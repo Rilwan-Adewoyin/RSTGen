@@ -3,7 +3,7 @@
 
 # Use this for finishing off code for fine-tuning https://github.com/allenai/comet-atomic-2020/blob/master/models/comet_atomic2020_bart/finetune.py
 
-
+#region imports 
 import os
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
@@ -90,6 +90,9 @@ from pytorch_lightning.core.saving import save_hparams_to_yaml
 
 nlp = spacy.load("en_core_web_sm") 
 components = ["parser","ner"]
+
+#endregion 
+
 # removing non needed componenets
 for name in nlp.pipe_names:
     if name not in components:
@@ -105,7 +108,9 @@ class COMERST(nn.Module):
                     max_len_head=80,
                     max_len_tail=20,
                     max_edu_nodes_to_select=-1,
-                    filter_atomic_rels=False
+                    filter_atomic_rels=False,
+                    dict_embed_mnorms = {},
+                    init_std_var = 0.005,
                     ):
         super(COMERST, self).__init__()
 
@@ -131,11 +136,11 @@ class COMERST(nn.Module):
                 #+1+1 here because max_node =30, but our node data is 0 indexed  padding index is final node
         self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
                                     padding_idx=(2*self.tokenizer.rst_pos_maxidx +2 ) + 1   , scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
+        self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=init_std_var)
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.005)
+        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.5*init_std_var)
 
         # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
@@ -144,7 +149,7 @@ class COMERST(nn.Module):
         rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
         rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
         self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
-        self.embedding_rels.weight.data.normal_(mean=0.0, std=0.005) 
+        self.embedding_rels.weight.data.normal_(mean=0.0, std=2*init_std_var) 
             # In this embedding comet takes the first set of embedding indices. RST takes the second set of embedding indices
 
         # setting the pad token to 0 in posiiton_ids embedding and then freezing
@@ -159,8 +164,28 @@ class COMERST(nn.Module):
         
         #endregion
 
+        # region embedding layer normalization
+        mapping = {"word":self.transformer.model.shared,
+        
+            "pe":self.transformer.model.encoder.embed_positions ,
+            "pd":self.transformer.model.decoder.embed_positions ,
+
+            "r_pos": self.embedding_rst_pos ,
+            "r_ns": self.embedding_rst_ns,
+            "rels": self.embedding_rels,
+
+            }
+
+        for key, val in dict_embed_mnorms.items():
+            mapping[key].max_norm = val
+
+        del mapping
+            
+        #end region
+
         self.loss_fct = CrossEntropyLoss()
 
+        # region adapting existing methods
         self.transformer.model.encoder.forward = types.MethodType(utils.BART_encoder_forward, 
                                                     self.transformer.model.encoder )
 
@@ -174,6 +199,8 @@ class COMERST(nn.Module):
         self.transformer.greedy_search = types.MethodType(utils.greedy_search, 
                                                     self.transformer)
         
+        #endregion
+
         self.generate = self.transformer.generate
         self.config = self.transformer.config
         self.get_encoder = self.transformer.get_encoder
@@ -199,6 +226,8 @@ class COMERST(nn.Module):
                         'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
                                         self.transformer.model.encoder.embed_positions.padding_idx else 0  
                         }
+
+
 
     def forward(self, input_, return_dict=None):
 
@@ -415,9 +444,10 @@ class COMERST(nn.Module):
     def return_params(self):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
-                        'filter_atomic_rels','max_edu_nodes_to_select']
+                        'filter_atomic_rels','max_edu_nodes_to_select',
+                        'init_std_var']
 
-        json_keys = []
+        json_keys = ['dict_embed_mnorms']
         
         params = {
             k:self.__dict__[k] for k in keys if 
@@ -608,6 +638,8 @@ class COMERST(nn.Module):
         parser.add_argument('-mlt','--max_len_tail', type= int, default=20 )
         parser.add_argument('-ments','--max_edu_nodes_to_select', type=int, default=-1, )
         parser.add_argument('-far','--filter_atomic_rels', type=lambda x: bool(int(x)), default=False, )
+        parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
+        parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -807,13 +839,25 @@ class COMERST_tokenizer():
         # region select target edu
             # optionally: randomly selecting a edu keyphrase node to be the target node for prediction
             # the other edu keyphrases form the relation information
-        r_int = random.randint( 0, len(li_edukp_pos)-1 )
+
+            # we aim to select an edu node that is at least two words long if one exists otherwise select any
 
         if target_edu_kp == None:
-                #extracting target data
+            
+            
+            
+            # indexes for phrases in li_edukp_pos that contain at least two words
+            idxs_of_valid_phrases = [ idx for idx, phrase in enumerate(li_edu_kp) if len(phrase.split(' '))>1 ]
+
+            if len(idxs_of_valid_phrases)>1:
+                r_int = random.randint(0, len(idxs_of_valid_phrases)-1 )
+            else:
+                r_int = random.randint(0, len(li_edu_kp) )
+
             target_edu_kp = li_edu_kp.pop(r_int)
             target_edu_pos = li_edukp_pos.pop(r_int)
             target_edu_kpscore = li_kp_score.pop(r_int)
+
 
         #endregion
 
@@ -1567,7 +1611,7 @@ class TrainingModule(pl.LightningModule):
                     ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select']} )
                 
                 mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'context_len'] }
+                    'init_std_var','dict_embed_mnorms'] }
         
                 mparams =  {**mparams, **mparams_json}
             
@@ -1789,7 +1833,7 @@ class TrainingModule(pl.LightningModule):
             raise NotImplementedError   
     
     @staticmethod
-    def load_comerst(model_name="COMERST", model_version=0 ):
+    def load_comerst(model_name="COMERST", model_version=0, device="cuda:0" ):
         # Loading in NLG model
         checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
 
@@ -1817,8 +1861,9 @@ class TrainingModule(pl.LightningModule):
         del checkpoint
         torch.cuda.empty_cache()
           
-        if torch.cuda.is_available():
-            model = model.cuda()
+        #if torch.cuda.is_available():
+        if device != 'cpu' and torch.cuda.is_available():
+            model = model.to(device)
         
         return model
 
@@ -2171,7 +2216,9 @@ class DataLoaderGenerator():
 
         li_dsets = [ SingleDataset_rst(_f, self.tokenizer, line_start, line_end) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
-        li_dsets = [dset for dset in li_dsets if dset.valid==True]
+        
+        # remove invalid dataset
+        li_dsets = [dset for dset in li_dsets if dset.valid_dset==True]
 
         if split_name == 'inference':
             li_dsets = random.sample(li_dsets,20)
@@ -2273,10 +2320,15 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         # filtering out lines which relate to long texts        
         if 'li_edus' in self.data.columns:
             #cls.data = cls.data[0:0]
-            self.valid = True
+            self.valid_dset = True
+            # filtering out long lines
             self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 225 ) & (~ self.data['li_edus'].isnull()) ]
+
+            # only select columns that have at least two non null phrases in li_edus
+
+            
         else:
-            self.valid = False
+            self.valid_dset = False
 
     def __len__(self):
         return len(self.data)
@@ -2460,6 +2512,18 @@ if __name__ == '__main__':
 
     main(vars(tparams), vars(mparams))
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline"
+# 1 - Baseline
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 0 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 20 --tag "baseline"
 
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20  -ments 2 -far 0 -rcp 1 -bs 216 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 60 --tag "baseline" 
+# 2 - Baseline w\ reduced feature set size
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 20 --tag "reduced feature set size"
+
+# 3 - Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-5 -me 20 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5"
+
+# 4 - Baselines w\ reduced feature set size and starting variance of 1.5 an max_norm to 3 3 4 to r_pos, r_ns, rels 3 3 3
+# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":3, \"r_ns\":3, \"rels\":3} -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 3 3 3"
+
+# 5 - Map the relations from RST onto the COMET embedding space
+
+# 6 - Map the relations from RST onto the COMET embedding space - Train COMET first - then freeze network besides a trainable two dimensional vector
