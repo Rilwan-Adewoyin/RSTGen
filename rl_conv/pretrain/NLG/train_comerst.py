@@ -914,10 +914,10 @@ class COMERST_tokenizer():
             # indexes for phrases in li_edukp_pos that contain at least two words
             idxs_of_valid_phrases = [ idx for idx, phrase in enumerate(li_edu_kp) if len(phrase.split(' '))>1 ]
 
-            if len(idxs_of_valid_phrases)>1:
-                r_int = random.randint(0, len(idxs_of_valid_phrases)-1 )
+            if len(idxs_of_valid_phrases)>0:
+                r_int = random.choice(idxs_of_valid_phrases)
             else:
-                r_int = random.randint(0, len(li_edu_kp) )
+                r_int = random.randint(0, len(li_edu_kp)-1 )
 
             target_edu_kp = li_edu_kp.pop(r_int)
             target_edu_pos = li_edukp_pos.pop(r_int)
@@ -2582,13 +2582,13 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 0 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 20 --tag "baseline"
 
 # 2 - Baseline w\ reduced feature set size
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-4 -me 20 --tag "reduced feature set size"
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 2 --precision 16 --mode train_new -lr 1e-4 -me 20 --tag "reduced feature set size"
 
 # 3 - Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-5 -me 20 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5"
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 3 --precision 16 --mode train_new -lr 3e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5"
 
 # 4 - Baselines w\ reduced feature set size and starting variance of 1.5 an max_norm to 3 3 4 to r_pos, r_ns, rels 3 3 3
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":3, \"r_ns\":3, \"rels\":3} -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 2 --workers 12 --version 1 --precision 16 --mode train_new -lr 3e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 3 3 3"
+# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":3, \"r_ns\":3, \"rels\":3} -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 4 --precision 16 --mode train_new -lr 3e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 3 3 3"
 
 # 5 - Map the relations from RST onto the COMET embedding space
 
