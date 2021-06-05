@@ -1689,9 +1689,9 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',# use_amp=True,
                         accelerator=accelerator,
-                        limit_train_batches =5,
-                        limit_val_batches = 5,
-                        #val_check_interval=0.3,
+                        #limit_train_batches =5,
+                        #limit_val_batches = 5,
+                        val_check_interval=0.3,
                         num_sanity_val_steps=0, 
                         #overfit_batches=25,
                         reload_dataloaders_every_epoch=True,
@@ -2302,8 +2302,8 @@ class SingleDataset_rst(torch.utils.data.Dataset):
                 #TODO: remove nrows
                 self.data = pd.read_csv(file_path, sep=',', header=0, 
                     skiprows=skiprows,
-                    #nrows=(self.line_end-self.line_start),
-                    nrows=100
+                    nrows=(self.line_end-self.line_start),
+                    #nrows=100
                      )
 
             else: 
@@ -2311,8 +2311,8 @@ class SingleDataset_rst(torch.utils.data.Dataset):
                             
                 self.data = pd.read_csv(file_path, sep=',', 
                     names=names, skiprows=skiprows,
-                    #nrows=(self.line_end-self.line_start)
-                    nrows=100
+                    nrows=(self.line_end-self.line_start)
+                    #nrows=100
                     ) 
                 
         # TODO: add a check for lines which have keyphrases that are empty and remove them
@@ -2421,7 +2421,7 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
 
         #TODO: remove nrows
         self.data = pd.read_csv(self.fp 
-            ,nrows=100
+            #,nrows=100
             )
         
         if self.drop_duplicates:
