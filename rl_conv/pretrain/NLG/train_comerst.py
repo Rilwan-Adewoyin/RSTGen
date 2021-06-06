@@ -7,6 +7,7 @@
 import os
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
+os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
 import torch
 import argparse
@@ -24,6 +25,7 @@ from itertools import islice
 import math
 from itertools import groupby
 import copy
+
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -127,7 +129,8 @@ class COMERST(nn.Module):
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
                                             max_len_head, max_len_tail,
                                             max_edu_nodes_to_select,
-                                            filter_atomic_rels )
+                                            filter_atomic_rels,
+                                            self.relation_embedding )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
@@ -153,6 +156,9 @@ class COMERST(nn.Module):
             rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
             self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
             self.embedding_rels.weight.data.normal_(mean=0.0, std=2*init_std_var) 
+            with torch.no_grad():
+                self.embedding_rels.weight[ self.embedding_rels.padding_idx ].fill_(0)
+                
             # In this embedding comet takes the first set of embedding indices. RST takes the second set of embedding indices
         
         elif self.relation_embedding == "hierarchical1":
@@ -166,8 +172,12 @@ class COMERST(nn.Module):
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
-            self.embedding_rels_rst = torch.nn.Eembedding( rel_embed_len_rst, rel_pad_idx_atomic , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )
+            self.embedding_rels_rst = torch.nn.Embedding( rel_embed_len_rst, rel_embed_len_atomic , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )
             self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+
+            with torch.no_grad():
+                self.embedding_rels_atomic.weight[ self.embedding_rels_atomic.padding_idx ].fill_(0)
+                self.embedding_rels_rst.weight[ self.embedding_rels_rst.padding_idx ].fill_(0)
         
         elif self.relation_embedding == "hierarchical2":
             # This is the normal embedding layer for COMET model
@@ -180,15 +190,19 @@ class COMERST(nn.Module):
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
-            self.embedding_rels_rst_l1 = torch.nn.Eembedding( rel_embed_len_rst, int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ) , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
+            self.embedding_rels_rst_l1 = torch.nn.Embedding( rel_embed_len_rst, int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ) , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
             self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
 
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
-                torch.nn.Linear( int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ), rel_embed_len_atomic + 1, bias=False ) ,
+                torch.nn.Linear( int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ), rel_embed_len_atomic , bias=False ) ,
                 torch.nn.Tanh(),
             )
             self.embedding_rels_rst.padding_idx = self.embedding_rels_rst[0].padding_idx
+
+            with torch.no_grad():
+                self.embedding_rels_atomic.weight[ self.embedding_rels_atomic.padding_idx ].fill_(0)
+                self.embedding_rels_rst[0].weight[ self.embedding_rels_rst.padding_idx ].fill_(0) 
           
         # setting the pad token to 0 in posiiton_ids embedding and then freezing
         self.transformer.model.encoder.embed_positions.padding_idx = 0
@@ -210,12 +224,16 @@ class COMERST(nn.Module):
 
             "r_pos": self.embedding_rst_pos ,
             "r_ns": self.embedding_rst_ns,
-            "rels": self.embedding_rels,
-
-            "rels_h1": self.embedding_rels_rst,
-            "rels_h2":self.embedding_rels_rst[0]
-
+            
             }
+        if self.relation_embedding == 'flattened':
+            mapping['rels'] = self.embedding_rels
+
+        elif self.relation_embedding == 'hierarchical1':
+            mapping["rels_h1"] = self.embedding_rels_rst
+
+        elif self.relation_embedding == 'hierarchical2':
+            mapping["rels_h2"] = self.embedding_rels_rst[0]
 
         for key, val in dict_embed_mnorms.items():
             mapping[key].max_norm = val
@@ -271,12 +289,10 @@ class COMERST(nn.Module):
             self.pad_values['rst_rel_ids'] = self.embedding_rels.padding_idx
         
         elif self.relation_embedding == "hierarchical1":
-            self.pad_values['rst_rel_ids_atomic'] = self.embedding_rels_atomic.padding_idx
-            self.pad_values['rst_rel_ids_rst'] = self.embedding_rels_rst.padding_idx
+            self.pad_values['rst_rel_ids'] = self.embedding_rels_rst.padding_idx
         
         elif self.relation_embedding == "hierarchical2":
-            self.pad_values['rst_rel_ids_atomic'] = self.embedding_rels_atomic.padding_idx
-            self.pad_values['rst_rel_ids_rst'] = self.embedding_rels_rst[0].padding_idx
+            self.pad_values['rst_rel_ids'] = self.embedding_rels_rst[0].padding_idx
 
 
 
@@ -397,7 +413,8 @@ class COMERST(nn.Module):
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
         #inputs_embed_head += self.embedding_kp_score( head_kpscore )
 
-        if self.relation_embedding == "flattened":        
+        if self.relation_embedding == "flattened":  
+            #TODO: make sure padding vectors dont get gi      
             inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         elif self.relation_embedding == "hierarchical1":
             _ = self.embedding_rels_rst( rst_rel_ids )
@@ -729,6 +746,7 @@ class COMERST_tokenizer():
                  max_len_tail=20,
                  max_edu_nodes_to_select=-1,
                  filter_atomic_rels=False,
+                 relation_embedding = "flattened",
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -739,29 +757,6 @@ class COMERST_tokenizer():
         self.max_edu_nodes_to_select = max_edu_nodes_to_select
         self.filter_atomic_rels = filter_atomic_rels
 
-        # region Setting up RST relation encoding
-
-        self.rst_rel_li = ['Attribution',
-            'Background','Cause','Comparison','Condition',
-            'Contrast','Elaboration','Enablement','Evaluation',
-            'Explanation','Joint','Manner-Means','Topic-Comment',
-            'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
-
-        self.rst_rel_labeler = sklp.LabelEncoder()
-        self.rst_rel_labeler.fit(  self.rst_rel_li )
-        #endregion
-        
-        # region Setting up NS encoding 
-        self.rst_ns_li = ['NN','NS','SN','a'] 
-        self.rst_ns_labeler = sklp.LabelEncoder()
-        self.rst_ns_labeler.fit( self.rst_ns_li  )
-
-        # rst_pos
-        #self.rst_pos_maxidx = 2*30 + 2  #original
-        #self.rst_pos_maxidx =2*( 2*30 + 2 )  #original
-        self.rst_pos_maxidx = 30  #same as in train_nlg. Our model can only, model sentences with 5 rst tree depth
-        
-        #endregion
 
         # region Setting up CSKG relation encoding
         self.filter_atomic_rels = filter_atomic_rels
@@ -781,6 +776,36 @@ class COMERST_tokenizer():
         self.atomic_rel_labeler = sklp.LabelEncoder()
         self.atomic_rel_labeler.fit(  self.atomic_rel_li )
     
+        #endregion
+
+        # region Setting up RST relation encoding
+
+        self.rst_rel_li = ['Attribution',
+            'Background','Cause','Comparison','Condition',
+            'Contrast','Elaboration','Enablement','Evaluation',
+            'Explanation','Joint','Manner-Means','Topic-Comment',
+            'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
+
+        self.rst_rel_labeler = sklp.LabelEncoder()
+        self.rst_rel_labeler.fit(  self.rst_rel_li )
+        if relation_embedding == "flattened":
+            self.rst_rel_labeler.starting_idx = len(self.atomic_rel_li)
+        else:
+            self.rst_rel_labeler.starting_idx = 0
+        self.rst_rel_labeler.transform_patch  = types.MethodType(utils.transform_patch, self.rst_rel_labeler) #monkey patch
+
+        #endregion
+
+        # region Setting up NS encoding 
+        self.rst_ns_li = ['NN','NS','SN','a'] 
+        self.rst_ns_labeler = sklp.LabelEncoder()
+        self.rst_ns_labeler.fit( self.rst_ns_li  )
+
+        # rst_pos
+        #self.rst_pos_maxidx = 2*30 + 2  #original
+        #self.rst_pos_maxidx =2*( 2*30 + 2 )  #original
+        self.rst_pos_maxidx = 30  #same as in train_nlg. Our model can only, model sentences with 5 rst tree depth
+        
         #endregion
 
         # region Initalising base tokenzier
@@ -909,8 +934,6 @@ class COMERST_tokenizer():
 
         if target_edu_kp == None:
             
-            
-            
             # indexes for phrases in li_edukp_pos that contain at least two words
             idxs_of_valid_phrases = [ idx for idx, phrase in enumerate(li_edu_kp) if len(phrase.split(' '))>1 ]
 
@@ -922,8 +945,6 @@ class COMERST_tokenizer():
             target_edu_kp = li_edu_kp.pop(r_int)
             target_edu_pos = li_edukp_pos.pop(r_int)
             target_edu_kpscore = li_kp_score.pop(r_int)
-
-
         #endregion
 
         #region tail
@@ -935,11 +956,8 @@ class COMERST_tokenizer():
         tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
         #endregion
 
-        #endregion
 
         
-
-
         # region head
             #    encode list of keyphrases and scores that are input to encoder
             # append edu token to start of each head
@@ -956,8 +974,7 @@ class COMERST_tokenizer():
         #endregion 
        
         # region relation : encoded list of rst parent nodes information
-        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze(dim=-1)
-        rst_rel_ids = torch.add( rst_rel_ids, len(self.atomic_rel_li ) )
+        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze(dim=-1)
         rst_treepos_ids = torch.tensor( li_rst_pos, dtype=torch.long )
         rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze(dim=-1)
         #endregion
@@ -1753,7 +1770,7 @@ class TrainingModule(pl.LightningModule):
                         logger=tb_logger,
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
-                        #accelerator='ddp2', amp_level='O2',# use_amp=True,
+                        #accelerator='ddp2', amp_level='O2',
                         accelerator=accelerator,
                         #limit_train_batches =5,
                         #limit_val_batches = 5,
@@ -2171,7 +2188,7 @@ class TrainingModule(pl.LightningModule):
     @lru_cache()
     def total_steps(self):
 
-        ds_size = max( [ len(dl) for dl in self.train_dl.values()] ) // self.gpus
+        ds_size = max( [ len(dl) for dl in self.train_dl.values()] ) // max(1,self.gpus)
         steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
         return steps
 
@@ -2590,6 +2607,9 @@ if __name__ == '__main__':
 # 4 - Baselines w\ reduced feature set size and starting variance of 1.5 an max_norm to 3 3 4 to r_pos, r_ns, rels 3 3 3
 # CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":3, \"r_ns\":3, \"rels\":3} -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 4 --precision 16 --mode train_new -lr 3e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 3 3 3"
 
-# 5 - Map the relations from RST onto the COMET embedding space
 
-# 6 - Map the relations from RST onto the COMET embedding space - Train COMET first - then freeze network besides a trainable two dimensional vector
+# 5 - Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 5 --precision 16 --mode train_new -lr 3e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels"
+
+# 6 - Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 6 --precision 16 --mode train_new -lr 3e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map"

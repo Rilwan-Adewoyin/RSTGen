@@ -359,6 +359,14 @@ def BART_forward(
         encoder_attentions=encoder_outputs.attentions,
     )
 
+
+def transform_patch( self, val ):
+    encoded = self.transform(val)
+    encoded  = encoded + self.starting_idx
+    return encoded
+
+
+
 #region Mixin Classes to override
 
 def prepare_inputs_for_generation(
