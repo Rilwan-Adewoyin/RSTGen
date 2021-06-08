@@ -7,7 +7,7 @@
 import os
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
-os.environ['CUDA_LAUNCH_BLOCKING']='1' 
+#os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
 import torch
 import argparse
@@ -15,11 +15,10 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Tuple
 import transformers
-from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import get_cosine_schedule_with_warmup
 from pytorch_lightning.trainer.supporters import CombinedLoader
 from pytorch_lightning.utilities.distributed import _get_rank
-from transformers.modeling_outputs import BaseModelOutput, Seq2SeqModelOutput, Seq2SeqLMOutput
+from transformers.modeling_outputs import Seq2SeqLMOutput
 from sklearn.utils import shuffle as skl_shuffle
 from itertools import islice
 import math
@@ -304,32 +303,32 @@ class COMERST(nn.Module):
 
         return_dict = return_dict if return_dict is not None else self.transformer.config.use_return_dict
 
-        lm_logits_rst = None
-        lm_logits_comet = None
+        labels_rst = None
+        labels_comet = None
         output_rst = []
         output_comet = []
 
         #region forward pass
         if 'rst' in input_:
             input_rst = self.forward_embed_rst(**input_['rst'])
-            labels_rst = input_rst.pop('labels')
+            labels_rst = input_rst.pop('labels',None)
             output_rst = self.transformer.model.forward(
                             **input_rst)
             lm_logits_rst = self.transformer.lm_head(output_rst[0]) + self.transformer.final_logits_bias
 
         if 'comet' in input_:
             input_comet = self.forward_embed_comet(**input_['comet'])
-            labels_comet = input_comet.pop('labels')
+            labels_comet = input_comet.pop('labels',None)
             output_comet = self.transformer.model.forward(
                             **input_comet)
             lm_logits_comet = self.transformer.lm_head(output_comet[0]) + self.transformer.final_logits_bias
         
         # endregion
-        lm_loss_rst= None
-        lm_loss_comet =None
+        lm_loss_rst = None
+        lm_loss_comet = None
 
         #region Calculation Losses
-        if labels_rst is not None:
+        if labels_comet is not None:
             #the labels are automatically aligned as per the GPT2 code
             #TODO: reevaluate whether bos or eos is the best method to use as start of output
                 # right now we use the edu token to start sentences. The EDU token is just the bos token
@@ -337,7 +336,7 @@ class COMERST(nn.Module):
             shift_labels_comet = labels_comet[..., 1:].contiguous() 
             lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
 
-        if  labels_comet is not None:
+        if  labels_rst is not None:
             shift_logits_rst = lm_logits_rst[..., :-1, :].contiguous()
             shift_labels_rst = labels_rst[..., 1:].contiguous() 
             lm_loss_rst = self.loss_fct(shift_logits_rst.view(-1, self.transformer.config.vocab_size), shift_labels_rst.view(-1))
@@ -358,7 +357,7 @@ class COMERST(nn.Module):
         else:
             s1s_output = {}
 
-            if lm_logits_rst is not None:
+            if lm_loss_rst is not None:
                 s1s_output_rst =  Seq2SeqLMOutput(
                     loss=lm_loss_rst,
                     logits=lm_logits_rst,
@@ -372,7 +371,7 @@ class COMERST(nn.Module):
                     )
                 s1s_output['rst'] = s1s_output_rst
 
-            if lm_logits_rst is not None:
+            if lm_loss_comet is not None:
                 s1s_output_comet =  Seq2SeqLMOutput(
                     loss=lm_loss_comet,
                     logits=lm_logits_comet,
@@ -421,10 +420,10 @@ class COMERST(nn.Module):
             inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         elif self.relation_embedding == "hierarchical1":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) 
 
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
@@ -1622,7 +1621,7 @@ class TrainingModule(pl.LightningModule):
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data_rst = dir_data_rst
             self.dir_data_atomic2020 = dir_data_atomic2020
-            self.create_data_loaders( )
+            self.create_data_loaders(  )
             
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
@@ -2103,74 +2102,73 @@ class TrainingModule(pl.LightningModule):
 
             # Adding records from this epoch to files
             for idx in range(len(self.inference_samples)):
-                fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
-                fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
-                
-                # comet- If file for example idx does not exists we add the true observed records
-                if not os.path.exists(fp_comet):
+                if 'comet' in batch:
+                    fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
                     
-                    df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                    # comet- If file for example idx does not exists we add the true observed records
+                    if not os.path.exists(fp_comet):
+                        
+                        df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                        
+                        head = li_comet_heads[idx]
+                        rels = li_comet_rels[idx]
+                        tail = li_comet_tails[idx]
+                        preds = li_comet_preds[idx]
+                                            
+                        datum = { 'epoch': 0,
+                                    'head': head,
+                                    "rels": rels,
+                                    "tail":tail,
+                                    "preds":preds }
                     
-                    head = li_comet_heads[idx]
-                    rels = li_comet_rels[idx]
-                    tail = li_comet_tails[idx]
-                    preds = li_comet_preds[idx]
-                                        
-                    datum = { 'epoch': 0,
-                                'head': head,
-                                "rels": rels,
-                                "tail":tail,
-                                "preds":preds }
-                
-                    df_comet = df_comet.append(datum, ignore_index=True)
+                        df_comet = df_comet.append(datum, ignore_index=True)
+                        df_comet.to_csv( fp_comet, index=False)
+
+                    # comet - adding to preds
+                    df_comet = pd.read_csv(fp_comet)    
+                    datum_comet = {
+                        'epoch':df_comet['epoch'].max()+1,
+                        'head': '',
+                        'rels':'',
+                        'tail':'',
+                        'preds':li_comet_preds[idx] }
+
+                    df_comet = df_comet.append(datum_comet, ignore_index=True)
                     df_comet.to_csv( fp_comet, index=False)
 
-                # rst - If file for example idx does not exists we add the true observed records
-                if not os.path.exists(fp_rst):
+                if 'rst' in batch:
+                    fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                    # rst - If file for example idx does not exists we add the true observed records
+                    if not os.path.exists(fp_rst):
+                        
+                        df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                        
+                        head = li_rst_heads[idx]
+                        rels = li_rst_rels[idx]
+                        tail = li_rst_tails[idx]
+                        preds = li_rst_preds[idx]
+                                            
+                        datum = { 'epoch': 0,
+                                    'head': head,
+                                    "rels": rels,
+                                    "tail":tail,
+                                    "preds":preds }
                     
-                    df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
-                    
-                    head = li_rst_heads[idx]
-                    rels = li_rst_rels[idx]
-                    tail = li_rst_tails[idx]
-                    preds = li_rst_preds[idx]
-                                        
-                    datum = { 'epoch': 0,
-                                'head': head,
-                                "rels": rels,
-                                "tail":tail,
-                                "preds":preds }
-                
-                    df_rst = df_rst.append(datum, ignore_index=True)
+                        df_rst = df_rst.append(datum, ignore_index=True)
+                        df_rst.to_csv( fp_rst, index=False)
+
+                    # rst - adding to preds
+                    df_rst = pd.read_csv(fp_rst)    
+                    datum_rst = {
+                        'epoch':df_rst['epoch'].max()+1,
+                        'head': '',
+                        'rels':'',
+                        'tail':'',
+                        'preds':li_rst_preds[idx] }
+
+                    df_rst = df_rst.append(datum_rst, ignore_index=True)
                     df_rst.to_csv( fp_rst, index=False)
 
-                # comet - adding to preds
-
-                df_comet = pd.read_csv(fp_comet)    
-                datum_comet = {
-                    'epoch':df_comet['epoch'].max()+1,
-                    'head': '',
-                    'rels':'',
-                    'tail':'',
-                    'preds':li_comet_preds[idx] }
-
-                df_comet = df_comet.append(datum_comet, ignore_index=True)
-                df_comet.to_csv( fp_comet, index=False)
-
-
-                # rst - adding to preds
-                df_rst = pd.read_csv(fp_rst)    
-                datum_rst = {
-                    'epoch':df_rst['epoch'].max()+1,
-                    'head': '',
-                    'rels':'',
-                    'tail':'',
-                    'preds':li_rst_preds[idx] }
-
-                df_rst = df_rst.append(datum_rst, ignore_index=True)
-                df_rst.to_csv( fp_rst, index=False)
-
-        
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
         dg = DataLoaderGenerator(self.dir_data_rst, self.dir_data_atomic2020,
@@ -2182,11 +2180,10 @@ class TrainingModule(pl.LightningModule):
 
         
         if "train" in self.mode:
-            self.train_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='train')
-            self.val_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='val')
-            self.test_dl = dg.prepare_dataloader_combined(shuffle=False, split_name='test')
-            self.inference_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='inference')
-        
+            self.train_dl = dg.prepare_dataloader_combined(True, 'train', loss_weight_rst=self.loss_weight_rst, loss_weight_comet=self.loss_weight_comet)
+            self.val_dl = dg.prepare_dataloader_combined(True, 'val', loss_weight_rst=self.loss_weight_rst, loss_weight_comet=self.loss_weight_comet)
+            self.test_dl = dg.prepare_dataloader_combined(False, 'test', loss_weight_rst=self.loss_weight_rst, loss_weight_comet=self.loss_weight_comet)
+            self.inference_dl = dg.prepare_dataloader_combined(True, 'inference', loss_weight_rst=self.loss_weight_rst, loss_weight_comet=self.loss_weight_comet)        
         elif self.mode == "test":
             self.test_dl = dg.prepare_dataloader_combined(shuffle=True, split_name='test')
 
@@ -2263,12 +2260,16 @@ class DataLoaderGenerator():
         self.pad_values = pad_values
         
     def prepare_dataloader_combined(self, shuffle=False, 
-        split_name='train'):
+        split_name='train', **kwargs):
 
-        dataloder_rst = self.prepare_dloader_rst(shuffle, split_name)
-        dataloader_atomic2020 = self.prepare_dloader_atomic2020(shuffle, split_name)
-
-        output = {'comet':dataloader_atomic2020, 'rst':dataloder_rst }
+        output = {}
+        if kwargs.get('loss_weight_rst',0.5) != 0.0:
+            dataloder_rst = self.prepare_dloader_rst(shuffle, split_name)
+            output['rst'] = dataloder_rst
+        if kwargs.get('loss_weight_comet',0.5) != 0.0:
+            dataloader_atomic2020 = self.prepare_dloader_atomic2020(shuffle, split_name)
+            output['comet'] = dataloader_atomic2020
+        
 
         if split_name in ["val","test","inference"] :
             output = CombinedLoader( output, "max_size_cycle")
@@ -2320,7 +2321,7 @@ class DataLoaderGenerator():
             li_dsets = random.sample(li_dsets,20)
             bs = 1
         else:
-            bs = self.bs #* self.dset_blend['rst']
+            bs = self.bs
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
         
@@ -2623,7 +2624,13 @@ if __name__ == '__main__':
 
 
 # 5 - Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels
-# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 5 --precision 16 --mode train_new -lr 3e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels"
+# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 5 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels"
 
 # 6 - Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map
-# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 6 --precision 16 --mode train_new -lr 3e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map"
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 1.0 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map"
+
+# 7 - Same as #3, but only trained on RST data
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 1.0 -lwc 0.0 -mlh 20 -mlt 20 -bs 360 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 7 --precision 16 --mode train_new -lr 5e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on RST data"
+
+# 8 - Same as #3, but only trained on COMET data
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.0 -lwc 1.0 -mlh 20 -mlt 20 -bs 540 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 8 --precision 16 --mode train_new -lr 5e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on COMET data"
