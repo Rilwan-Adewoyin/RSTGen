@@ -2634,3 +2634,6 @@ if __name__ == '__main__':
 
 # 8 - Same as #3, but only trained on COMET data
 # CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.0 -lwc 1.0 -mlh 20 -mlt 20 -bs 540 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 8 --precision 16 --mode train_new -lr 5e-5 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on COMET data"
+
+# 9 - Same as #3, but masking fixed and attention method used where relation embeddings don't attend to text embeddings 
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.3 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.0 -lwc 1.0 -mlh 20 -mlt 20 -bs 216 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 8 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings"
