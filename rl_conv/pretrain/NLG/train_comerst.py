@@ -5,8 +5,10 @@
 
 #region imports 
 import os
-os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
-#os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
+#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
+#os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
+os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
+os.environ['NCCL_IB_DISABLE'] ="1"
 #os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
 import torch
@@ -157,7 +159,7 @@ class COMERST(nn.Module):
             rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
             self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels.weight.data.normal_(mean=0.0, std=2*init_std_var) 
+            self.embedding_rels.weight.data.normal_(mean=0.0, std=1.0*init_std_var) 
             with torch.no_grad():
                 self.embedding_rels.weight[ self.embedding_rels.padding_idx ].fill_(0)
                 
@@ -169,13 +171,13 @@ class COMERST(nn.Module):
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
             self.embedding_rels_rst = torch.nn.Embedding( rel_embed_len_rst, rel_embed_len_atomic , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             with torch.no_grad():
                 self.embedding_rels_atomic.weight[ self.embedding_rels_atomic.padding_idx ].fill_(0)
@@ -187,17 +189,19 @@ class COMERST(nn.Module):
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
-            self.embedding_rels_rst_l1 = torch.nn.Embedding( rel_embed_len_rst, int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ) , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=2*init_std_var)
+            self.embedding_rels_rst_l1 = torch.nn.Embedding( rel_embed_len_rst, 80 , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
+            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
-                torch.nn.Linear( int( (rel_embed_len_rst + rel_embed_len_atomic) / 2 ), rel_embed_len_atomic , bias=False ) ,
+                torch.nn.Linear( 80, 80 , bias=True ) ,
+                torch.nn.Tanh(),
+                torch.nn.Linear( 80, rel_embed_len_atomic , bias=True ) ,
                 torch.nn.Tanh(),
             )
             self.embedding_rels_rst.padding_idx = self.embedding_rels_rst[0].padding_idx
@@ -420,10 +424,10 @@ class COMERST(nn.Module):
             inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         elif self.relation_embedding == "hierarchical1":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) # embedding vector times all the embedding vectors from the comet things
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) 
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
 
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
@@ -751,6 +755,7 @@ class COMERST_tokenizer():
                  filter_atomic_rels=False,
                  relation_embedding = "flattened",
                  randomize_comet_pronouns=False,
+                 remove_to=False,
                  attention_type=1,
                  **kwargs ):
         
@@ -762,6 +767,7 @@ class COMERST_tokenizer():
         self.max_edu_nodes_to_select = max_edu_nodes_to_select
         self.filter_atomic_rels = filter_atomic_rels
         self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.remove_to = remove_to
         self.attention_type = attention_type
 
 
@@ -1064,6 +1070,13 @@ class COMERST_tokenizer():
 
     def tokenize_comet( self, head, rel, tail  ):
         
+        # region possibly removing the to at the start of the tail
+        if self.remove_to:
+            if tail[:3] == "to ":
+                tail = tail[3:]
+
+        # endregion
+
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
             #Do this at random, so model can still predict for PersonX PersonY in dset
         if random.random() > 0.33 and self.randomize_comet_pronouns:
@@ -1601,6 +1614,7 @@ class TrainingModule(pl.LightningModule):
                     loss_weight_rst = 0.5,
                     loss_weight_comet = 0.5,
                     randomize_comet_pronouns = True,
+                    remove_to = False,
                     tag='',
                     *args,
                     **kwargs):
@@ -1609,7 +1623,10 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.model = COMERST( **model_params )
-        self.model.tokenizer.randomize_comet_pronouns = randomize_comet_pronouns
+        self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.model.tokenizer.randomize_comet_pronouns = self.randomize_comet_pronouns
+        self.remove_to = remove_to
+        self.model.tokenizer.remove_to = self.remove_to
         
         self.mode = mode
         self.workers = workers
@@ -1659,7 +1676,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-bs','--batch_size', default=100, type=int)
         parser.add_argument('-lr','--learning_rate', default=5e-4, type=float)
-        parser.add_argument('--warmup_proportion', default=0.15)
+        parser.add_argument('--warmup_proportion', default=0.25)
         parser.add_argument('--workers', default=12, type=int) 
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
@@ -1668,7 +1685,8 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
         parser.add_argument( '-lwr','--loss_weight_rst',default=0.5, required=False, type=float)
         parser.add_argument( '-lwc','--loss_weight_comet',default=0.5, required=False, type=float)
-        parser.add_argument( '--rcp', '--randomize_comet_pronouns', default=True, type= lambda x : bool(int(x)) )
+        parser.add_argument( '--rcp', '--randomize_comet_pronouns', default=True, type= lambda x : bool(int(x)), help="remove all 'to' from the start of the comet phrases" )
+        parser.add_argument( '-rmto', '--remove_to', default=False, type= lambda x : bool(int(x)) )
         parser.add_argument('--tag', default='default model', required=False, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
             #TODO: check --version of required type None actually works
@@ -1759,7 +1777,7 @@ class TrainingModule(pl.LightningModule):
             monitor='val_loss',
             #monitor='val_loss_comet',
             min_delta=0.00,
-            patience=10,
+            patience=5,
             verbose=False,
             mode='min'
         )
@@ -1933,7 +1951,7 @@ class TrainingModule(pl.LightningModule):
         # Getting tparams
         tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'batch_size', 'learning_rate','precision','splits',
-            'tag','loss_weight_rst','loss_weight_comet','randomize_comet_pronouns']}
+            'tag','loss_weight_rst','loss_weight_comet','randomize_comet_pronouns','remove_to']}
 
         tparams['mode'] = 'inference'
 
@@ -2036,10 +2054,13 @@ class TrainingModule(pl.LightningModule):
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
         if step_name == "val" and _get_rank() == 0 :
+            bad_words = ['"']
+            bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words ]
+            
             generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
                                 'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1,
-                                'min_length':2, 'max_length':20 } #'max_length':30,'min_length':4
+                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                'min_length':3, 'max_length':20 } #'max_length':30,'min_length':4
 
             # At end of validation loop produce some quantitative examples of model's performance
 
@@ -2219,7 +2240,7 @@ class TrainingModule(pl.LightningModule):
         keys = ['batch_size','accumulate_grad_batches','learning_rate','max_epochs',
             'dir_data_rst','dir_data_atomic2020',
             'warmup_proportion','tag','version','loss_weight_rst','loss_weight_comet',
-            'randomize_comet_pronouns']
+            'randomize_comet_pronouns','remove_to']
         
         params = {
             k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
@@ -2251,6 +2272,7 @@ class DataLoaderGenerator():
         self.tokenizer = tokenizer
         self.splits = splits
         self.randomize_comet_pronouns = self.tokenizer.randomize_comet_pronouns
+        self.remove_to = self.tokenizer.remove_to
         
 
         self.bs = batch_size
@@ -2622,12 +2644,11 @@ if __name__ == '__main__':
 # 4 - Baselines w\ reduced feature set size and starting variance of 1.5 an max_norm to 3 3 4 to r_pos, r_ns, rels 3 3 3
 # CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":3, \"r_ns\":3, \"rels\":3} -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 4 --precision 16 --mode train_new -lr 3e-4 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 3 3 3"
 
-
 # 5 - Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels
-# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.0 -re hierarchical1 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 5 --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels"
+# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.0 -rmto 1 -at 2 -re hierarchical1 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 5 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels, with fixed attention and 'to' removed from comet"
 
 # 6 - Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map
-# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 1.0 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map"
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
 
 # 7 - Same as #3, but only trained on RST data
 # CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 1.0 -lwc 0.0 -mlh 20 -mlt 20 -bs 360 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 7 --precision 16 --mode train_new -lr 5e-4 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on RST data"
@@ -2636,7 +2657,13 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.0 -lwc 1.0 -mlh 20 -mlt 20 -bs 540 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 8 --precision 16 --mode train_new -lr 5e-4 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on COMET data"
 
 # 9 - Same as #3, but masking fixed and attention method used where relation embeddings don't attend to text embeddings 
-# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.3 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 9 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings"
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -isv 1.3 -rmto 1 -at 2 -dem "{\"r_pos\":2, \"r_ns\":2, \"rels\":5}" -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 240 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 9 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings, with fixed attention and 'to' removed from comet"
 
 # 10 - Same as #9, but using full comet relations set 
-# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.3 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 0 -agb 1 --gpus 1 --workers 6 --version 10 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations"
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.3 -rmto 1 -at 2 -dem "{\"r_pos\":2, \"r_ns\":2, \"rels\":5}" -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 240 -ments 5 -far 0 -agb 1 --gpus 1 --workers 6 --version 10 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
+
+# 11 - Same as #10, but no maxnorms, lower initial starting variance,  no scaling embeddings by frequency
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -sgbf 0 -isv 0.005 -rmto 1 -at 2 -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 240 -ments 5 -far 0 -agb 1 --gpus 1 --workers 6 --version 11 --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
+
+# 12 - Same as #10, but smaller batch
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py  --gpus 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 48 -ments 5 -far 0 -agb 1  --workers 6 --version 12 --precision 16 --mode train_new -lr 1e-5 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
