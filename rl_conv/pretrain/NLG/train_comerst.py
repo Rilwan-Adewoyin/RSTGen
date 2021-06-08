@@ -86,7 +86,7 @@ import pandas as pd
 from pytorch_lightning.core.decorators import auto_move_data
 from typing import Optional, Callable, Union, Optional, List, Iterable
 
-from functools import lru_cache
+from functools import lru_cache, reduce
 import spacy
 from pytorch_lightning.core.saving import save_hparams_to_yaml
 
@@ -113,7 +113,8 @@ class COMERST(nn.Module):
                     filter_atomic_rels=False,
                     dict_embed_mnorms = {},
                     init_std_var = 0.005,
-                    relation_embedding = "flattened"
+                    relation_embedding = "flattened",
+                    attention_type = 1,
                     ):
         super(COMERST, self).__init__()
 
@@ -121,6 +122,7 @@ class COMERST(nn.Module):
         self.model_name = model_name
         self.scale_grad_by_freq = scale_grad_by_freq
         self.relation_embedding = relation_embedding
+        self.attention_type = attention_type
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
         self.transformer.comerst = lambda : self
@@ -130,7 +132,8 @@ class COMERST(nn.Module):
                                             max_len_head, max_len_tail,
                                             max_edu_nodes_to_select,
                                             filter_atomic_rels,
-                                            self.relation_embedding )
+                                            self.relation_embedding,
+                                            attention_type=self.attention_type )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
@@ -433,8 +436,14 @@ class COMERST(nn.Module):
 
         # region reforming attention mask
         _shape = attention_mask_head.shape[1] + attention_mask_rel.shape[1]
-        attention_mask = torch.ones( [ attention_mask_head.shape[0], _shape , _shape ], dtype=torch.float, device=attention_mask_head.device )
+        attention_mask = torch.zeros( [ attention_mask_head.shape[0], _shape , _shape ], dtype=torch.float, device=attention_mask_head.device )
         attention_mask[:, :attention_mask_head.shape[1], :attention_mask_head.shape[1]] = attention_mask_head
+        
+        if self.attention_type == 1:
+            attention_mask[:, -attention_mask_rel.shape[1]:, :] = 1 
+
+        elif self.attention_type==2:
+            attention_mask[  : , -attention_mask_rel.shape[1]: , -attention_mask_rel.shape[1]: ] = 1
         #end region
 
             # Here we trim data of all columns which just have padding value 
@@ -526,7 +535,7 @@ class COMERST(nn.Module):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
                         'filter_atomic_rels','max_edu_nodes_to_select',
-                        'init_std_var','relation_embedding']
+                        'init_std_var','relation_embedding','attention_type']
 
         json_keys = ['dict_embed_mnorms']
         
@@ -641,11 +650,6 @@ class COMERST(nn.Module):
                 )
             input_['decoder_input_ids'] = decoder_input_ids
 
-            
-            #for batch in list(self.chunks(examples, self.batch_size)):
-            #for batch in examples:
-                #batch = self.tokenizer(batch, return_tensors="pt", truncation=True, padding="max_length").to(self.device)
-                #input_ids, attention_mask = trim_batch(**batch, pad_token_id=self.tokenizer.pad_token_id)
 
             summaries = self.transformer.generate(
                 decoder_start_token_id=decoder_start_token_id,
@@ -656,8 +660,7 @@ class COMERST(nn.Module):
                 )
 
             decs = self.tokenizer.base_tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            #refs = self.tokenizer.base_tokenizer.batch_decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            
+                        
         return decs
     
     def chunks(self, lst, n):
@@ -722,6 +725,7 @@ class COMERST(nn.Module):
         parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
         parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
         parser.add_argument('-re', '--relation_embedding', type=str, choices=['flattened','hierarchical1','hierarchical2'], default='flattened' )
+        parser.add_argument('-at','--attention_type',type=int, choices=[1,2], default=1)
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -747,6 +751,8 @@ class COMERST_tokenizer():
                  max_edu_nodes_to_select=-1,
                  filter_atomic_rels=False,
                  relation_embedding = "flattened",
+                 randomize_comet_pronouns=False,
+                 attention_type=1,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -756,6 +762,8 @@ class COMERST_tokenizer():
         self.max_len_tail = max_len_tail
         self.max_edu_nodes_to_select = max_edu_nodes_to_select
         self.filter_atomic_rels = filter_atomic_rels
+        self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.attention_type = attention_type
 
 
         # region Setting up CSKG relation encoding
@@ -792,7 +800,9 @@ class COMERST_tokenizer():
             self.rst_rel_labeler.starting_idx = len(self.atomic_rel_li)
         else:
             self.rst_rel_labeler.starting_idx = 0
+
         self.rst_rel_labeler.transform_patch  = types.MethodType(utils.transform_patch, self.rst_rel_labeler) #monkey patch
+        self.rst_rel_labeler.inverse_transform_patch = types.MethodType(utils.inverse_transform_patch, self.rst_rel_labeler)
 
         #endregion
 
@@ -985,7 +995,6 @@ class COMERST_tokenizer():
             #                   2) all encoder inputs can attend to rst relation tree info
 
         
-        #attention_mask = torch.zeros( [enc_input_dim, enc_input_dim], dtype=torch.long  )
         attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
 
             # here we implement the diagonal attention for each sub keyphrase
@@ -1002,14 +1011,10 @@ class COMERST_tokenizer():
 
             curr_bos_token_pos += len_ids
         
-        # # here we ensure that all tokens can attend to the rel section
-        # attention_mask[ :, head_ids.shape[-1]: ] = 1
-
-        # # Ensuring rel token attends to all subphrase edus
-        # attention_mask[ head_ids.shape[-1]: , : ] = 1
-
         # Create the 1dimensional mask representing tail attn. We appnd this later
         attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
+
+
         #endregion
 
         #region position_ids
@@ -1058,11 +1063,11 @@ class COMERST_tokenizer():
             'labels':labels.squeeze()
         }
 
-    def tokenize_comet( self, head, rel, tail, randomize_comet_pronouns  ):
+    def tokenize_comet( self, head, rel, tail  ):
         
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
             #Do this at random, so model can still predict for PersonX PersonY in dset
-        if random.random() > 0.33 and randomize_comet_pronouns:
+        if random.random() > 0.33 and self.randomize_comet_pronouns:
             head, rel, tail = self.tokenize_comet_person_randomizer(head, rel, tail)
         # endregion
         
@@ -1094,7 +1099,11 @@ class COMERST_tokenizer():
 
         enc_input_dim = head_ids.shape[-1] + rels_ids.shape[-1]
 
-        attention_mask = torch.ones( [enc_input_dim, enc_input_dim], dtype=torch.long  )
+        if self.attention_type == 1:
+            attention_mask = torch.ones( [enc_input_dim, enc_input_dim], dtype=torch.long  )
+        if self.attention_type == 2:
+            attention_mask = torch.ones( [enc_input_dim, enc_input_dim], dtype=torch.long  )
+            attention_mask[ -1:, :-1 ] = 0
 
             # relation attention
         #_ =  attention_mask.new_zeros( [ rels_ids.shape[-1], head_ids.shape[-1] ] )
@@ -1601,12 +1610,14 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.model = COMERST( **model_params )
+        self.model.tokenizer.randomize_comet_pronouns = randomize_comet_pronouns
+        
         self.mode = mode
         self.workers = workers
         self.data_splits = data_splits
         self.loss_weight_rst = loss_weight_rst
         self.loss_weight_comet = loss_weight_comet
-        self.randomize_comet_pronouns = randomize_comet_pronouns
+        
         
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data_rst = dir_data_rst
@@ -1859,7 +1870,7 @@ class TrainingModule(pl.LightningModule):
     def get_ckpt_file(_dir_checkpoint,mode='best'):
         if mode=='best':
             checkpoint_yaml_file = os.path.join( _dir_checkpoint,"best_k_models.yaml" )
-            scores_dict = yaml.load( open(checkpoint_yaml_file,"r") ) #key= ckptpath, value = val_loss
+            scores_dict = yaml.load( open(checkpoint_yaml_file,"r"), Loader = yaml.FullLoader ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
             if os.path.exists(best_ckpt_path) == False:
@@ -1929,7 +1940,8 @@ class TrainingModule(pl.LightningModule):
 
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
-            'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels']}
+            'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels',
+            'relation_embedding','attention_type']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 
@@ -2067,22 +2079,25 @@ class TrainingModule(pl.LightningModule):
                 batch_rst = batch['rst']
 
                 preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
-                generation_kwargs=generation_kwargs )[0]
+                    generation_kwargs=generation_kwargs )[0]
                 heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
                 heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
                 heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
                 heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
+                
 
-                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0) - len(self.model.tokenizer.atomic_rel_li ) ).tolist()
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0)  ).tolist()
+
+
                 rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
                 rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
 
-                tails_comet = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
+                tails_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
                 tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
 
                 li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
                 li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
-                li_rst_tails.append( {tail_treepos_ids_rst:tails_comet.strip()} )
+                li_rst_tails.append( {tail_treepos_ids_rst:tails_rst.strip()} )
                 li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
 
 
@@ -2162,7 +2177,6 @@ class TrainingModule(pl.LightningModule):
                 self.batch_size, self.model.pad_values,
                 self.model.tokenizer, 
                 workers=self.workers, mode=self.mode, split=self.data_splits,
-                randomize_comet_pronouns = self.randomize_comet_pronouns,
                 #dset_blend=self.dset_blend
                 )
 
@@ -2233,14 +2247,13 @@ class DataLoaderGenerator():
                     pad_values ,
                     tokenizer, workers=0, mode='train_new',
                     splits={'train':0.6,'val':0.2,'test':0.2},
-                    randomize_comet_pronouns = True,
                     **kwargs):
         
         self.dir_data_rst = dir_data_rst
         self.dir_data_atomic2020 = dir_data_atomic2020
         self.tokenizer = tokenizer
         self.splits = splits
-        self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.randomize_comet_pronouns = self.tokenizer.randomize_comet_pronouns
         
 
         self.bs = batch_size
@@ -2355,7 +2368,7 @@ class DataLoaderGenerator():
             drop_duplicates = True
             randomize_comet_pronouns = self.randomize_comet_pronouns
 
-        dset = SingleDataset_atomic2020(fn, self.tokenizer, randomize_comet_pronouns=randomize_comet_pronouns, drop_duplicates=drop_duplicates )
+        dset = SingleDataset_atomic2020(fn, self.tokenizer,  drop_duplicates=drop_duplicates )
                 
         if split_name == 'inference':
             bs = 1
@@ -2454,13 +2467,8 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         li_rst = ujson.loads(datum['rst'].values[0] )
         
         #list of dicts. Each dict contains keys:value => part of speech labelling system name
-        try:
-            li_dict_posname_likpscore = ujson.loads( datum['li_dict_posname_likpscore'].values[0] )
-        except TypeError as e:
-            print( datum['li_dict_posname_likpscore'] )
-            print("len: ", len(self.data))
-            raise Exception
-        
+
+        li_dict_posname_likpscore = ujson.loads( datum['li_dict_posname_likpscore'].values[0] )
         
         li_li_kp_score = [ self.pos_type_chooser( _dict ) for _dict in li_dict_posname_likpscore ]
 
@@ -2496,11 +2504,12 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
     """
     #TODO: think of way to balance ATOMIC and RST contribution
     #TODO: find research on multi task learning well
-    def __init__(self, file_path, tokenizer, randomize_comet_pronouns=False, drop_duplicates=False ):
+    def __init__(self, file_path, tokenizer, drop_duplicates=False, sample_size=None ):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.drop_duplicates = drop_duplicates #used for test set. In the case our model uses greedy decoding. Filters on duplicate head and tails
-        self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.randomize_comet_pronouns = self.tokenizer.randomize_comet_pronouns
+        
 
         #TODO: remove nrows
         self.data = pd.read_csv(self.fp 
@@ -2513,20 +2522,25 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
                 keep='first',ignore_index=True)
         
         if self.tokenizer.filter_atomic_rels == True:
-            #self.data = self.data.loc[ self.data['relation'].isin( self.tokenizer.atomic_rel_li ) ]
             self.data = self.data.loc[ self.data.relation.str.strip('"').str.contains('|'.join(self.tokenizer.atomic_rel_li),regex=True) ]
+
+        if sample_size != None:
+            assert type(sample_size) == int
+            self.data = skl_shuffle(self.data)
+            self.data = self.data[:sample_size]
+
+
     def __len__(self):
         return len(self.data)
     
-    def __getitem__(self, index,pad_utterance=True):
+    def __getitem__(self, index):
         
         head, rel, tail = self.getitem_extract_datum(index)
         
         #encoding
         encoded = self.tokenizer.tokenize_comet( head=head,
                                                 rel=rel,
-                                                tail=tail,
-                                                randomize_comet_pronouns=self.randomize_comet_pronouns )
+                                                tail=tail )
 
             # encoded May include some of the following
             # return {

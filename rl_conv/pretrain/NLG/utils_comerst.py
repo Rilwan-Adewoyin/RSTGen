@@ -3,21 +3,25 @@
 import itertools
 import json
 import linecache
+from multiprocessing import Value
 import os
 import pickle
 import warnings
 from logging import getLogger
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List
+import nltk
+
+import sacrebleu
+import bert_score
 
 dirname = os.path.dirname(__file__)
 from copy import deepcopy
-
+from argparse import Namespace
 import numpy as np
 import torch
-import rouge_score
 from rouge_score import rouge_scorer, scoring
-from sacrebleu import corpus_bleu
+from sacrebleu import corpus_bleu, metrics
 from torch import nn
 from torch.utils.data import Dataset, Sampler
 import torch.nn.functional as F
@@ -365,6 +369,16 @@ def transform_patch( self, val ):
     encoded  = encoded + self.starting_idx
     return encoded
 
+def inverse_transform_patch(self, val):
+    if type(val) in [ np.array, torch.Tensor]:
+        val = val.tolist()
+    
+    val = [v - self.starting_idx for v in val ]    
+    val = [v for v in val if v< len(self.classes_) ]
+    decoded = self.inverse_transform( val )
+    
+    
+    return decoded
 
 
 #region Mixin Classes to override
@@ -691,11 +705,6 @@ def _monitor_candidates(self, trainer):
 # endregion
 
 
-# region  COMET Scores
-def calculate_bleu_score(output_lns, refs_lns, **kwargs) -> dict:
-    """Uses sacrebleu's corpus_bleu implementation."""
-    return {"bleu": corpus_bleu(output_lns, [refs_lns], **kwargs).score}
-
 
 def use_task_specific_params(model, task):
     """Update config with summarization specific params."""
@@ -710,10 +719,43 @@ def use_task_specific_params(model, task):
 def flatten_list(summary_ids: List[List]):
     return [x for x in itertools.chain.from_iterable(summary_ids)]
 
+# region  COMERST Scores
+def calculate_bleu_score(output_lns, refs_lns, order=4, **kwargs) -> float:
+    
+    """Uses sacrebleu's corpus_bleu implementation."""
+    args = Namespace(
+        smooth_method=kwargs.get('smooth_method', 'exp'), 
+        smooth_value=None, 
+        force=False,
+        short=False,
+        lc=kwargs.get('lc',True),
+        tokenize=kwargs.get('tokenize', sacrebleu.tokenizers.DEFAULT_TOKENIZER ) )
+    
+    #Hack - changing the default order
+    metrics.BLEU.NGRAM_ORDER = order
+    sacrebleu.metrics.BLEU.extract_ngrams.__defaults__ = (1, order)
+    
+    metric = metrics.BLEU(args)
+        
+    li_scores = []
 
-ROUGE_KEYS = ["rouge1", "rouge2", "rougeL"]
+    for pred, ref in zip(output_lns, refs_lns):
+        
+        score = metric.corpus_score(
+            pred, ref, 
+            use_effective_order=kwargs.get('use_effective_order',True) ).score
+        
+        li_scores.append(score)
 
+    avg_score = sum(li_scores)/len(li_scores)
 
+    #returning to normal
+    metrics.BLEU.NGRAM_ORDER = 4
+    sacrebleu.metrics.BLEU.extract_ngrams.__defaults__ = (1, 4)
+    
+    return round( avg_score, 3) 
+
+ROUGE_KEYS = ["rougeL"]
 def calculate_rouge(output_lns: List[str], reference_lns: List[str], use_stemmer=True) -> Dict:
     scorer = rouge_scorer.RougeScorer(ROUGE_KEYS, use_stemmer=use_stemmer)
     aggregator = scoring.BootstrapAggregator()
@@ -723,7 +765,63 @@ def calculate_rouge(output_lns: List[str], reference_lns: List[str], use_stemmer
         aggregator.add_scores(scores)
 
     result = aggregator.aggregate()
-    return {k: v.mid.fmeasure for k, v in result.items()}
+    return {k: round( v.mid.fmeasure, 3) for k, v in result.items()}
+
+def calculate_meteor(output_lns: List[str], reference_lns: List[str], use_stemmer=True) -> float:
+    
+    li_scores =  []
+    
+    for pred, ref in zip(output_lns, reference_lns):
+        score = nltk.translate.meteor_score.meteor_score([ref], pred) 
+        li_scores.append(score)
+    
+    score = sum(li_scores)/len(li_scores)
+
+    return round(score, 3)
+
+def calculate_bertscore(output_lns: List[str], reference_lns: List[str],
+                            model_type="roberta-large-mnli",
+                            device="cuda:0",
+                            pre_existing_bscore=None,
+                            delete_ater_gen=True,
+                            return_bscore=False,
+                            batch_size=2 ) -> Dict:
+    
+    assert not (delete_ater_gen and return_bscore)
+
+    if pre_existing_bscore != None:
+        bscore_model = pre_existing_bscore
+    else:
+        bscore_model = bert_score.BERTScorer(
+            model_type = model_type,
+            device = device )
+
+    prec, rec, f1 = bscore_model.score(output_lns, reference_lns,
+                        verbose=False, batch_size=batch_size,
+                        return_hash=False )
+    
+    prec = torch.mean( prec ).item()
+    rec = torch.mean( rec ).item()
+    f1 = torch.mean( f1 ).item()
+
+    output = ( prec, rec, f1,  )
+
+    if delete_ater_gen:
+        bscore_model._model.to('cpu')
+        del bscore_model._model
+        del bscore_model
+    
+    if return_bscore:
+        output = ( output,  tuple([bscore_model]) )
+    
+    return output
+
+    
+
+
+
+
+
 #endregion
 
 #region Dataprocessing

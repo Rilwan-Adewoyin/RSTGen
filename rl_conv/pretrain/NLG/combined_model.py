@@ -1,8 +1,20 @@
+from nltk.tree import Tree
 import train_comerst
 import train_nlg
 import train_rstplanner
 
 class Combined_model():
+
+    # Generation method
+        # Input Factors
+            # 1)RST Tree:kwargs used by rst_planner
+            # 2)Key_phrase: key phrases and (possibly) their position and (possibly) their Nuclearity
+            # 3)NLG:
+        # Prediction Order
+            # All of RST Tree
+            # All key phrases
+            # Sequentially predict text, using previous text as word context and rst tree and key phrases to guide
+
 
     def __init__(self):
         
