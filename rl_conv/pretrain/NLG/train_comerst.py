@@ -114,6 +114,7 @@ class COMERST(nn.Module):
                     init_std_var = 0.005,
                     relation_embedding = "flattened",
                     attention_type = 1,
+                    freeze_embeds=False,
                     ):
         super(COMERST, self).__init__()
 
@@ -122,6 +123,7 @@ class COMERST(nn.Module):
         self.scale_grad_by_freq = scale_grad_by_freq
         self.relation_embedding = relation_embedding
         self.attention_type = attention_type
+        self.freeze_embeds = freeze_embeds
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
         self.transformer.comerst = lambda : self
@@ -214,7 +216,14 @@ class COMERST(nn.Module):
             self.transformer.model.encoder.embed_positions.weight[self.transformer.model.encoder.embed_positions.padding_idx].fill_(0)
             self.transformer.model.decoder.embed_positions.weight[self.transformer.model.decoder.embed_positions.padding_idx].fill_(0)
 
-        #TODO: later initialize starting weight for special tokens to weight of pre-existing token like eos
+        #TODO: freezing weights
+        if self.freeze_embeds:
+            utils.freeze_params(self.transformer.model.shared)
+
+            for d in [self.transformer.model.encoder, self.model.model.decoder]:
+                utils.freeze_params(d.embed_positions)
+                
+                utils.freeze_params(d.embed_tokens)
         
         #endregion
 
@@ -534,7 +543,8 @@ class COMERST(nn.Module):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
                         'filter_atomic_rels','max_edu_nodes_to_select',
-                        'init_std_var','relation_embedding','attention_type']
+                        'init_std_var','relation_embedding','attention_type',
+                        'freeze_embeds']
 
         json_keys = ['dict_embed_mnorms']
         
@@ -724,7 +734,8 @@ class COMERST(nn.Module):
         parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
         parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
         parser.add_argument('-re', '--relation_embedding', type=str, choices=['flattened','hierarchical1','hierarchical2'], default='flattened' )
-        parser.add_argument('-at','--attention_type',type=int, choices=[1,2], default=1)
+        parser.add_argument('-at','--attention_type',type=int, choices=[1,2,3], default=1)
+        parser.add_argument('-fe','--freeze_embeds',type=lambda x: bool(int(x)), default=False)
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -1954,7 +1965,7 @@ class TrainingModule(pl.LightningModule):
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
             'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels',
-            'relation_embedding','attention_type']}
+            'relation_embedding','attention_type','freeze_embeds']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 

@@ -702,6 +702,10 @@ def _monitor_candidates(self, trainer):
     ckpt_name_metrics.update(trainer.logger_connector.callback_metrics)
 
     return ckpt_name_metrics
+
+def freeze_params(model: nn.Module):
+    for par in model.parameters():
+        par.requires_grad = False
 # endregion
 
 
