@@ -751,6 +751,7 @@ class COMERST_tokenizer():
                  filter_atomic_rels=False,
                  relation_embedding = "flattened",
                  randomize_comet_pronouns=False,
+                 remove_to=False,
                  attention_type=1,
                  **kwargs ):
         
@@ -762,6 +763,7 @@ class COMERST_tokenizer():
         self.max_edu_nodes_to_select = max_edu_nodes_to_select
         self.filter_atomic_rels = filter_atomic_rels
         self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.remove_to = remove_to
         self.attention_type = attention_type
 
 
@@ -1064,6 +1066,13 @@ class COMERST_tokenizer():
 
     def tokenize_comet( self, head, rel, tail  ):
         
+        # region possibly removing the to at the start of the tail
+        if self.remove_to:
+            if tail[:3] == "to ":
+                tail = tail[3:]
+
+        # endregion
+
         # region randomising pronouns (randomly replacing occurences of PersonX or PersonY with names)
             #Do this at random, so model can still predict for PersonX PersonY in dset
         if random.random() > 0.33 and self.randomize_comet_pronouns:
@@ -1601,6 +1610,7 @@ class TrainingModule(pl.LightningModule):
                     loss_weight_rst = 0.5,
                     loss_weight_comet = 0.5,
                     randomize_comet_pronouns = True,
+                    remove_to = False,
                     tag='',
                     *args,
                     **kwargs):
@@ -1609,7 +1619,10 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.model = COMERST( **model_params )
-        self.model.tokenizer.randomize_comet_pronouns = randomize_comet_pronouns
+        self.randomize_comet_pronouns = randomize_comet_pronouns
+        self.model.tokenizer.randomize_comet_pronouns = self.randomize_comet_pronouns
+        self.remove_to = remove_to
+        self.model.tokenizer.remove_to = self.remove_to
         
         self.mode = mode
         self.workers = workers
@@ -1668,7 +1681,8 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
         parser.add_argument( '-lwr','--loss_weight_rst',default=0.5, required=False, type=float)
         parser.add_argument( '-lwc','--loss_weight_comet',default=0.5, required=False, type=float)
-        parser.add_argument( '--rcp', '--randomize_comet_pronouns', default=True, type= lambda x : bool(int(x)) )
+        parser.add_argument( '--rcp', '--randomize_comet_pronouns', default=True, type= lambda x : bool(int(x)), help="remove all 'to' from the start of the comet phrases" )
+        parser.add_argument( '-rmto', '--remove_to', default=False, type= lambda x : bool(int(x)) )
         parser.add_argument('--tag', default='default model', required=False, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
             #TODO: check --version of required type None actually works
@@ -1933,7 +1947,7 @@ class TrainingModule(pl.LightningModule):
         # Getting tparams
         tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'batch_size', 'learning_rate','precision','splits',
-            'tag','loss_weight_rst','loss_weight_comet','randomize_comet_pronouns']}
+            'tag','loss_weight_rst','loss_weight_comet','randomize_comet_pronouns','remove_to']}
 
         tparams['mode'] = 'inference'
 
@@ -2219,7 +2233,7 @@ class TrainingModule(pl.LightningModule):
         keys = ['batch_size','accumulate_grad_batches','learning_rate','max_epochs',
             'dir_data_rst','dir_data_atomic2020',
             'warmup_proportion','tag','version','loss_weight_rst','loss_weight_comet',
-            'randomize_comet_pronouns']
+            'randomize_comet_pronouns','remove_to']
         
         params = {
             k:self.__dict__[k] for k in keys if k in self.__dict__.keys()
@@ -2251,6 +2265,7 @@ class DataLoaderGenerator():
         self.tokenizer = tokenizer
         self.splits = splits
         self.randomize_comet_pronouns = self.tokenizer.randomize_comet_pronouns
+        self.remove_to = self.tokenizer.remove_to
         
 
         self.bs = batch_size
