@@ -116,6 +116,7 @@ class COMERST(nn.Module):
                     init_std_var = 0.005,
                     relation_embedding = "flattened",
                     attention_type = 1,
+                    freeze_embeds=False,
                     ):
         super(COMERST, self).__init__()
 
@@ -124,6 +125,7 @@ class COMERST(nn.Module):
         self.scale_grad_by_freq = scale_grad_by_freq
         self.relation_embedding = relation_embedding
         self.attention_type = attention_type
+        self.freeze_embeds = freeze_embeds
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
         self.transformer.comerst = lambda : self
@@ -218,7 +220,15 @@ class COMERST(nn.Module):
             self.transformer.model.encoder.embed_positions.weight[self.transformer.model.encoder.embed_positions.padding_idx].fill_(0)
             self.transformer.model.decoder.embed_positions.weight[self.transformer.model.decoder.embed_positions.padding_idx].fill_(0)
 
-        #TODO: later initialize starting weight for special tokens to weight of pre-existing token like eos
+        #TODO: freezing weights
+        if self.freeze_embeds:
+            utils.freeze_params(self.transformer.model.shared)
+            utils.freeze_params( self.transformer.lm_head )
+
+            for d in [self.transformer.model.encoder, self.transformer.model.decoder]:
+                utils.freeze_params(d.embed_positions)
+                
+                utils.freeze_params(d.embed_tokens)
         
         #endregion
 
@@ -538,7 +548,8 @@ class COMERST(nn.Module):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
                         'filter_atomic_rels','max_edu_nodes_to_select',
-                        'init_std_var','relation_embedding','attention_type']
+                        'init_std_var','relation_embedding','attention_type',
+                        'freeze_embeds']
 
         json_keys = ['dict_embed_mnorms']
         
@@ -568,7 +579,6 @@ class COMERST(nn.Module):
     def generate(
             self, 
             queries,
-            decode_method="beam", 
             num_generate=5, 
             ):
 
@@ -581,8 +591,6 @@ class COMERST(nn.Module):
                 batch = self.tokenizer(batch, return_tensors="pt", truncation=True, padding="max_length").to(self.device)
                 input_ids, attention_mask = utils.trim_batch(**batch, pad_token_id=self.tokenizer.pad_token_id)
 
-
-                 
                 summaries = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -728,7 +736,8 @@ class COMERST(nn.Module):
         parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
         parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
         parser.add_argument('-re', '--relation_embedding', type=str, choices=['flattened','hierarchical1','hierarchical2'], default='flattened' )
-        parser.add_argument('-at','--attention_type',type=int, choices=[1,2], default=1)
+        parser.add_argument('-at','--attention_type',type=int, choices=[1,2,3], default=1)
+        parser.add_argument('-fe','--freeze_embeds',type=lambda x: bool(int(x)), default=False)
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -1958,7 +1967,7 @@ class TrainingModule(pl.LightningModule):
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
             'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels',
-            'relation_embedding','attention_type']}
+            'relation_embedding','attention_type','freeze_embeds']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 
@@ -2665,5 +2674,11 @@ if __name__ == '__main__':
 # 11 - Same as #10, but no maxnorms, lower initial starting variance,  no scaling embeddings by frequency
 # CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -sgbf 0 -isv 0.005 -rmto 1 -at 2 -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 240 -ments 5 -far 0 -agb 1 --gpus 1 --workers 6 --version 11 --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
 
-# 12 - Same as #10, but smaller batch
-# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py  --gpus 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 48 -ments 5 -far 0 -agb 1  --workers 6 --version 12 --precision 16 --mode train_new -lr 1e-5 -me 40 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
+# 13 - Same as #10, but medium and embeddings frozen
+# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py  --gpus 1 --version 13 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -lwr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 0 -agb 1 --workers 6  --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Baseline w\ reduced feature set size . masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
+
+# 14 - Same as #10, but medium and embeddings frozen weighted more towards comet
+# CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py  --gpus 1 --version 13 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -lwr 0.35 -lwc 0.65 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 0 -agb 1 --workers 6  --precision 16 --mode train_new -lr 5e-4 -me 40 --tag "Baseline w\ reduced feature set size . masking fixed and attention method used where relation embeddings don't attend to text embeddings and full comet relations, with fixed attention and 'to' removed from comet"
+
+# 6 - Same as 6 but fixed embedding 
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
