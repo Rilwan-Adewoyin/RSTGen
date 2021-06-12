@@ -18,29 +18,33 @@ class CombinedModel():
             # Sequentially predict text, using previous text as word context and rst tree and key phrases to guide
 
 
-    def __init__(self):
+    def __init__(self, rst_init_params={}, kp_init_params={}, nlg_init_params={}):
         
-        rst_params = "{ \"sampling_method\":\"random\", \"cond_subreddit\":\"aggregated\", \"cond_rstlength\":7, \"reduce_rel_space\":True }"
+        rst_init_params = train_rstplanner.parse_args()
+        kp_init_params = {'model_version':13, 'device':'cuda:0' }
+        nlg_init_params = {'model_version':11, 'device':'cuda:0' }
 
-        self.rstplanner = train_rstplanner.RSTPlanner()
-        self.comerst = train_comerst.load_comerst('COMERST', model_version=1)
-        self.nlg_model = train_nlg.load_nlgmodel(model_name="NLG_rt", model_version=11,max_input_len=None)
+        self.rstplanner = train_rstplanner.RSTPlanner(**rst_init_params)
+        self.comerst = train_comerst.load_comerst(**kp_init_params)
+        self.nlg = train_nlg.load_nlgmodel(**nlg_init_params)
         
         
-    def generate(self):
+    def generate(self, rst_gen_params={}, kp_gen_params={} ):
         
         # sample an rst template
-        rst_template = self.sample_rst() 
+        rst_gen_params = train_rstplanner.parse_args().pop('sampling_params')
+        rst_context = self.sample_rst( rst_gen_params ) 
 
         # sample key phrases 
-        key_phrases = self.sample_keyphrases()
+        kp_gen_params = 
+        key_phrases = self.sample_keyphrases( kp_gen_params, rst_context)
 
         # generate text
         generated_text = self.gen_text()
     
-    def sample_rst(self):
+    def sample_rst(self, sampling_params):
 
-        rst_chain = self.train_rstplanner.sample_rst_chain( )
+        rst_chain = self.train_rstplanner.sample_rst_chain( **sampling_params )
 
         rst_chain_decoded = self.train_rstplanner.deserialize_chain( )
     

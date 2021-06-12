@@ -8,8 +8,7 @@ import numpy as np
 
 
 # This script provides two functions:
-# 1) Remove records in rst files where the pos 0 contains a key phrase with no characters
-# 2) Changes the files in place
+# 1) TODO: clean text that may incude garble
 #endregion
 
 
@@ -33,6 +32,7 @@ def process_and_save( fp ):
     columns = data.columns
     
     if 'li_edus' not in columns and 'li_dict_posname_likpscore' not in columns:
+        os.remove(fp)
         return True
         
     #remove rows where pos0 is empty

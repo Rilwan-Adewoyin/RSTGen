@@ -94,6 +94,16 @@ tree_order = {
     
     }
 
+# function which returns position in tree based on the binary tuple indicating left,rights down a tree
+def tree_order_func(tuple_pos):
+    
+    pos = 0
+    for binary_left_right in tuple_pos:
+        pos = 2*pos + 2**binary_left_right
+    
+    return pos
+
+
 rst_rel_li = ['Attribution',
                 'Background','Cause','Comparison','Condition',
                 'Contrast','Elaboration','Enablement','Evaluation',

@@ -32,7 +32,7 @@ import math
 import itertools
 import pandas as pd
 import nltk
-nltk.download('stopwords')
+#nltk.download('stopwords')
 import rake_nltk
 import json
 import pytextrank
@@ -53,13 +53,8 @@ import torch
 
 from filelock import Timeout, FileLock
 
-
-from utils import get_best_ckpt_path
-from utils import get_path
-
 import regex as re
 import multiprocessing as mp
-import distutils
 # import torch.multiprocessing as mp
 # from torch.multiprocessing import set_start_method
 import html
@@ -91,44 +86,8 @@ invalidtxt2 = "Thank you for your submission! Unfortunately, it has been removed
 
 r1 = rake_nltk.Rake( ranking_metric=rake_nltk.Metric.DEGREE_TO_FREQUENCY_RATIO,max_length=3)
 
-import warnings
-import contextlib
 
-import requests
 from urllib3.exceptions import InsecureRequestWarning
-
-
-old_merge_environment_settings = requests.Session.merge_environment_settings
-
-# @contextlib.contextmanager
-# def no_ssl_verification():
-#     opened_adapters = set()
-
-#     def merge_environment_settings(self, url, proxies, stream, verify, cert):
-#         # Verification happens only once per connection so we need to close
-#         # all the opened adapters once we're done. Otherwise, the effects of
-#         # verify=False persist beyond the end of this context manager.
-#         opened_adapters.add(self.get_adapter(url))
-
-#         settings = old_merge_environment_settings(self, url, proxies, stream, verify, cert)
-#         settings['verify'] = False
-
-#         return settings
-
-#     requests.Session.merge_environment_settings = merge_environment_settings
-
-#     try:
-#         with warnings.catch_warnings():
-#             warnings.simplefilter('ignore', InsecureRequestWarning)
-#             yield
-#     finally:
-#         requests.Session.merge_environment_settings = old_merge_environment_settings
-
-#         for adapter in opened_adapters:
-#             try:
-#                 adapter.close()
-#             except:
-#                 pass
 
 # Iterate through Conversations
         # Convert conversation to a pd.Dataframe or numpy array in the format used for Dialog Act Datasets
@@ -173,29 +132,30 @@ def main(danet_vname,
     # setting up model for Da prediction
     
     if annotate_da == True and title_only==False: 
+        raise ValueError("Not yet designed for extraction of da")
             #title_only forces only one line per reddit conversation, so dialogue act can not be calcualted
-        model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
-        checkpoint_dir = f'{model_dir}/logs'
+        # model_dir = utils_nlg.get_path(f'../DialogueAct/models/{danet_vname}')
+        # checkpoint_dir = f'{model_dir}/logs'
 
-        checkpoint_path = get_best_ckpt_path(checkpoint_dir) #TOdO: need to insert changes from da branch into nlg branch
+        # checkpoint_path = get_best_ckpt_path(checkpoint_dir) #TOdO: need to insert changes from da branch into nlg branch
         
-        if torch.cuda.is_available():
-            checkpoint = torch.load(checkpoint_path)
-        else:
-            checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+        # if torch.cuda.is_available():
+        #     checkpoint = torch.load(checkpoint_path)
+        # else:
+        #     checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
         
 
-        mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
-        tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
+        # mparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"mparam.json"),"r" ) ) )
+        # tparams = argparse.Namespace(**json.load( open( os.path.join(model_dir,"tparam.json"),"r" ) ) )
 
 
-        danet = DaNet(**vars(mparams))
-        danet_module = TrainingModule(mode='inference', model=danet)
-        danet_module.load_state_dict(checkpoint['state_dict'] )
-        danet_module.eval()
-        torch.set_grad_enabled(False)
+        # danet = DaNet(**vars(mparams))
+        # danet_module = TrainingModule(mode='inference', model=danet)
+        # danet_module.load_state_dict(checkpoint['state_dict'] )
+        # danet_module.eval()
+        # torch.set_grad_enabled(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
+        # tokenizer = AutoTokenizer.from_pretrained(get_path('../DialogueAct/models/bert-base-cased') )
 
     # setting up docker image for rst
         #Platform dependent way to start docker
@@ -679,10 +639,10 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
             stdout = str(stdout,"utf-8")
 
         #print("\n\n\n",stdout,"\n\n\n")
-        li_strtree = json.loads( stdout )
-        #li_strtree = stdout
+        li_li_strtree = json.loads( stdout )
+        #li_li_strtree = stdout
             
-        #print(len(li_strtree), "\n\n\n")
+        #print(len(li_li_strtree), "\n\n\n")
 
     except (TypeError, json.JSONDecodeError) as e:
         # print(f"\nError", e)
@@ -695,19 +655,20 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         return new_li_li_thread_utterances
     
     # parsing encoded tree
-    for idx, str_tree in enumerate(li_strtree):
+    for idx, li_strtree in enumerate(li_li_strtree):
         li_thread_utterances = li_li_thread_utterances[idx]
-        li_subtrees = []
+        # li_subtrees = []
 
-        # Parsing a list of subtrees in the utterance tree str_tree
-        for idx, pt_str in enumerate(str_tree):
-            try:
-                if pt_str == '': raise ValueError
-                _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
-            except ValueError:
-                _ = None
-                pass
-            li_subtrees.append(_)
+        # # Parsing a list of subtrees in the utterance tree li_strtree
+        # for idx, pt_str in enumerate(li_strtree):
+        #     try:
+        #         if pt_str == '': raise ValueError
+        #         _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+        #     except ValueError:
+        #         _ = None
+        #         pass
+        #     li_subtrees.append(_)
+        li_subtrees = _parse_tree(li_strtree)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
         
@@ -726,6 +687,22 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
 
         new_li_li_thread_utterances.append(new_li_thread_utterance)
     return new_li_li_thread_utterances
+
+def _parse_tree(li_strtree):
+    #parses tree into an nltk object
+    li_subtrees = []
+
+    # Parsing a list of subtrees in the utterance tree li_strtree
+    for idx, pt_str in enumerate(li_strtree):
+        try:
+            if pt_str == '': raise ValueError
+            _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+        except ValueError:
+            _ = None
+            pass
+        li_subtrees.append(_)
+    
+    return li_subtrees
 
 def _da_assigning(li_li_thread_utterances:list, danet_module, tokenizer):
 
@@ -839,7 +816,8 @@ def _tree_to_rst_code(_tree):
     pos_xleaves = list(set(tree_pos) - set(leaves_pos)) #unordered
     pos_xleaves = [  tuple(x if x<2 else 1 for x in _tuple ) for _tuple in pos_xleaves]        #binarizing ( correcting any number above 1 to 1)
         # reording pos_xleaves to breadfirst ordering
-    li_bintreepos = sorted([ utils_nlg.tree_order.get(x,-1) for x in pos_xleaves])
+    #li_bintreepos = sorted([ utils_nlg.tree_order.get(x,-1) for x in pos_xleaves])
+    li_bintreepos = sorted( [utils_nlg.tree_order_func(x) for x in pos_xleaves] )
 
     # Zipping List 1 2 and 3
     li_dict_rels_ns_bintreepos = [  {'rel':rels_ns[0], 'ns':rels_ns[1], 'pos': bintreepos } for rels_ns,bintreepos in zip(li_rels_ns,li_bintreepos) if bintreepos!=-1 ]
