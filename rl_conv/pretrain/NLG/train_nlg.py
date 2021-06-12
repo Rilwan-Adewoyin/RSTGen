@@ -2564,7 +2564,7 @@ class TrainingModule(pl.LightningModule):
             raise NotImplementedError   
     
     @staticmethod
-    def load_nlgmodel(model_name="NLG_rt", model_version=11,max_input_len=None):
+    def load_nlgmodel(model_name="NLG_rt", model_version=11,max_input_len=None, device="cuda:0"):
         # Loading in NLG model
         checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
 
@@ -2599,8 +2599,9 @@ class TrainingModule(pl.LightningModule):
         del checkpoint
         torch.cuda.empty_cache()
           
-        if torch.cuda.is_available():
-            nlg_model =nlg_model.cuda()
+        #if torch.cuda.is_available():
+        if device != 'cpu' and torch.cuda.is_available():
+            nlg_model = nlg_model.to(device)
         
         return nlg_model
 
