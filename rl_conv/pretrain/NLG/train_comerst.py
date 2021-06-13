@@ -1475,6 +1475,7 @@ class COMERST_tokenizer():
 
 # endregion
 
+        
     @lru_cache(maxsize=124)
     def edukp_pos_sort_function(self, edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
@@ -1508,6 +1509,7 @@ class COMERST_tokenizer():
         flattened_pos = sum(li_flattened_pos_contributions)
 
         return flattened_pos
+
 
     def smallest_spanning_subtree(self, li_edukp_pos, li_rst_pos, li_rst_rel, li_rst_ns  ):
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
@@ -1602,6 +1604,7 @@ class COMERST_tokenizer():
         
         return reachable, parent_path
         
+
 
 class TrainingModule(pl.LightningModule):
 
