@@ -30,7 +30,13 @@ from pke.data_structures import Candidate
 
 import regex as re
 pattern_punctuation_space = re.compile(r'\s([?.!"](?:\s|$))')
-
+pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
+             "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
+                                          # but not after an acronym
+             "\w(?:\.\w)|"+               # start/middle of acronym
+             "(?<=\w\.)\w",               # end of acronym
+             )
+ 
 
 # sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
 # #making spacy model #spedding up textrank processing
@@ -276,9 +282,15 @@ def processing_txt(li_dict_rsttext):
         # capitalizing starting letter
         if not txt_preproc[:1].isupper():
             txt_preproc = txt_preproc[:1].capitalize() + txt_preproc[1:]
-            
+
         # removin spaces between punctuation and preceeding word
         txt_preproc = re.sub(pattern_punctuation_space, r'\1', txt_preproc)
+
+        # Adding correct capitalization to dataset
+        txt_preproc = re.sub(pattern_capitalize_after_punct,               # end of acronym
+             lambda x: x.group().upper(), 
+             txt_preproc)
+
 
         li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
     return li_dict_rsttext
@@ -551,7 +563,7 @@ if __name__ == '__main__':
     parser.add_argument('-bps','--batch_process_size', default=3,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=3, type=int)
+    parser.add_argument('--mp_count', default=4, type=int)
     
     parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
