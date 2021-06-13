@@ -1475,6 +1475,7 @@ class COMERST_tokenizer():
 
 # endregion
 
+        
     @lru_cache(maxsize=124)
     def edukp_pos_sort_function(self, edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
@@ -1508,6 +1509,7 @@ class COMERST_tokenizer():
         flattened_pos = sum(li_flattened_pos_contributions)
 
         return flattened_pos
+
 
     def smallest_spanning_subtree(self, li_edukp_pos, li_rst_pos, li_rst_rel, li_rst_ns  ):
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
@@ -1602,6 +1604,7 @@ class COMERST_tokenizer():
         
         return reachable, parent_path
         
+
 
 class TrainingModule(pl.LightningModule):
 
@@ -2652,7 +2655,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=3 python3 train_comerst.py -isv 1.0 -rmto 1 -at 2 -re hierarchical1 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 5 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix to map from rst rels to comet rels, with fixed attention and 'to' removed from comet"
 
 # 6 - Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map
-# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
 
 # 7 - Same as #3, but only trained on RST data
 # CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -isv 1.5 -dem {\"r_pos\":2, \"r_ns\":2, \"rels\":5} -lwr 1.0 -lwc 0.0 -mlh 20 -mlt 20 -bs 360 -ments 5 -far 1 -agb 1 --gpus 1 --workers 12 --version 7 --precision 16 --mode train_new -lr 5e-4 -me 30 --tag "Baseline w\ reduced feature set size and starting variance of 1.5 and max_norm set to r_pos, r_ns, rels 2 2 5. Only trained on RST data"
