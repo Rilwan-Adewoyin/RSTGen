@@ -28,6 +28,8 @@ import en_core_web_sm
 import pke
 from pke.data_structures import Candidate
 
+import regex as re
+pattern_punctuation_space = re.compile(r'\s([?.!"](?:\s|$))')
 
 
 # sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
@@ -57,7 +59,7 @@ import torch
 
 from filelock import Timeout, FileLock
 
-import regex as re
+
 import multiprocessing as mp
 
 import ujson
@@ -158,6 +160,10 @@ def main(   batch_process_size=20,
                 else:
                     batches_completed[subreddit] = int( df_records.loc[ subreddit, 'last_batch' ] ) + 1
                     batch_process_size = int( df_records.loc[subreddit, 'batch_process_size'] )
+                    total_batch_count = math.ceil(len(dset_source)/batch_process_size)
+
+                    if batches_completed[subreddit] >= total_batch_count:
+                        continue
         
                 print(f"Skipping forwards {batches_completed[subreddit]} batches")
                 dset_source = dset_source[batches_completed[subreddit]*batch_process_size:]
@@ -193,9 +199,11 @@ def main(   batch_process_size=20,
             
             with mp.Pool(mp_count) as pool:
                 
-                cs =  max( 3, math.ceil( batch_process_size / (mp_count*3*10) ) )
+                cs =  max( 3, math.ceil( batch_process_size / (mp_count) ) )
                 
                 res = pool.imap( filtering_out_records, _chunks(batch_li_dict_utt, cs)  )
+
+                res = pool.imap( processing_txt, res )
 
                 res = pool.imap( edu_segmenter, res )
 
@@ -223,7 +231,7 @@ def main(   batch_process_size=20,
 
             #end region    
 
-        print(f"Finished at batch {batches_completed}")        
+        print(f"Finished at batch {batches_completed[subreddit] }")        
 
 def _chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -251,6 +259,28 @@ def filtering_out_records(li_dict_rsttext, min_rst_len=5):
             li_dict_rsttext.pop(idx)
             continue
     
+    return li_dict_rsttext
+
+
+
+def processing_txt(li_dict_rsttext):
+    # Preventing errors in rst tree parsing
+    # Ensuring text starts with a capital letter
+    # ensuring there arent spaces between punctuation and preceeding character
+    
+    for idx in range( len(li_dict_rsttext)-1 ,-1 , -1 ):
+
+        dict_rsttext = li_dict_rsttext[idx]
+        txt_preproc = dict_rsttext['txt_preproc']
+
+        # capitalizing starting letter
+        if not txt_preproc[:1].isupper():
+            txt_preproc = txt_preproc[:1].capitalize() + txt_preproc[1:]
+            
+        # removin spaces between punctuation and preceeding word
+        txt_preproc = re.sub(pattern_punctuation_space, r'\1', txt_preproc)
+
+        li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
     return li_dict_rsttext
 
 
@@ -348,8 +378,8 @@ def check_full_rst(li_dict_rsttext):
     li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_subtrees ]
 
     # Attaching the new rst codes to the dataset
-    for idx in idxs_w_shrtnd_rst:
-        li_dict_rsttext[idx]['rst'] = li_rst_dict[idx]
+    for idx1, idx2 in enumerate(idxs_w_shrtnd_rst):
+        li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
 
     return li_dict_rsttext
 
@@ -482,19 +512,19 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
             if os.path.exists(old_fp) and old_fp!=new_fp:
                 os.remove(old_fp)
                 
-            # Updating record of last batch operated on for each subreddit
-            new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
-            if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
-                df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
-            else:
-                df_records = pd.DataFrame( columns=['last_batch','batch_process_size'] )
-                df_records.index.names = ['subreddit']
+        # Updating record of last batch operated on for each subreddit
+        new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
+        if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
+            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+        else:
+            df_records = pd.DataFrame( columns=['last_batch','batch_process_size'] )
+            df_records.index.names = ['subreddit']
 
-            #df_records = df_records.append(new_record, ignore_index=True)
-            for k,v in new_record.items():
-                df_records.loc[ subreddit, [k] ] =  v
+        #df_records = df_records.append(new_record, ignore_index=True)
+        for k,v in new_record.items():
+            df_records.loc[ subreddit, [k] ] =  v
 
-            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
+        df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
       
 
 class Timer():
@@ -521,7 +551,7 @@ if __name__ == '__main__':
     parser.add_argument('-bps','--batch_process_size', default=3,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=1, type=int)
+    parser.add_argument('--mp_count', default=3, type=int)
     
     parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
@@ -540,7 +570,7 @@ if __name__ == '__main__':
         except Exception as e:
             print(e)
             print(traceback.format_exc())
-            batches_completed[subreddit] = batches_completed[subreddit] + 1
+            batches_completed[subreddit] = batches_completed[subreddit] + 2
             dict_args['resume_progress'] = True
             
         finally :
@@ -554,11 +584,5 @@ if __name__ == '__main__':
             pass
 
 
-#python3 data_setup.py -bps 60 -ad 0 -rdv CasualConversation -sb -1 --mp_count 6 
 
-# python3 data_setup.py -bps 60 -ad 0 -rdv changemyview -sb 0 --mp_count 2
-#python3 data_setup.py -bps 60 -ad 0 -rdv PoliticalDiscussion -sb 0 --mp_count 2
-
-# python3 data_setup.py -bps 10 -ad 0 -rdv small -sb -1 --mp_count 6 
-
-# python3 data_setup.py -bps 10 -ad 0 -rdv WritingPrompts -sb 1 --mp_count 6 -to 1
+# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8
