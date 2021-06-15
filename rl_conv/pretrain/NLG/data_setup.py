@@ -668,7 +668,7 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         #         _ = None
         #         pass
         #     li_subtrees.append(_)
-        li_subtrees = _parse_tree(li_strtree)
+        li_subtrees = _parse_trees(li_strtree)
 
         li_rst_dict = [ _tree_to_rst_code(_tree) if _tree != None else None for _tree in li_subtrees ]
         
@@ -688,14 +688,15 @@ def _rst_v2(li_li_thread_utterances, fh_container_id ):
         new_li_li_thread_utterances.append(new_li_thread_utterance)
     return new_li_li_thread_utterances
 
-def _parse_tree(li_strtree):
+def _parse_trees(li_strtree):
+    
     #parses tree into an nltk object
     li_subtrees = []
 
     # Parsing a list of subtrees in the utterance tree li_strtree
     for idx, pt_str in enumerate(li_strtree):
         try:
-            if pt_str == '': raise ValueError
+            if pt_str in ['',None]: raise ValueError
             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
         except ValueError:
             _ = None

@@ -89,7 +89,7 @@ for path_ in modules_paths:
 
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 
-from data_setup import _tree_to_rst_code, _parse_tree
+from data_setup import _tree_to_rst_code, _parse_trees
 
 # Only take dsets with 5 or more RST chunks since we want to learn transitions between chunks of 3 EDUs
 
@@ -97,11 +97,15 @@ from data_setup import _tree_to_rst_code, _parse_tree
 def main(   batch_process_size=20,
             mp_count=4,
             resume_progress=False,
-            subreddit_names = [],
-            #subreddit_names = ["askscience","askwomen", "atheism", 
-                # "business", "changemyview", "Christianity", "DebateReligion", "Economics",
-                #  "explainlikeimfive", "malefashionadvice","POLITIC","PoliticalDicussion", "politics",
-                # "relationship_advice", "WritingPrompts_story_only"],
+            #subreddit_names = [],
+                #batch du11ducks
+            subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","AskReddit","askscience","AskWomen","asoiaf","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz","DebateReligion","Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive"],
+                
+                #batch enigma
+            #subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography"],
+        
+                #batch ... 
+            #subreddit_names = ["pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
                 min_rst_len = 6,
             **kwargs):
     """[summary]
@@ -385,13 +389,20 @@ def check_full_rst(li_dict_rsttext):
     li_li_unparsed_tree = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_text]), 
                                                 skip_parsing=False, redirect_output=True)
     li_unparsed_tree = sum( li_li_unparsed_tree, [] )
-    li_subtrees = _parse_tree(li_unparsed_tree)
+    li_subtrees = _parse_trees(li_unparsed_tree)
     
-    li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_subtrees ]
+    li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
 
     # Attaching the new rst codes to the dataset
-    for idx1, idx2 in enumerate(idxs_w_shrtnd_rst):
-        li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
+        # and removing trees which could not be parsed
+    for idx1, idx2 in reversed(list(enumerate(idxs_w_shrtnd_rst))):
+        if li_rst_dict[idx1] == None:
+            li_dict_rsttext.pop(idx2)
+        else:
+            li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
+
+    
+
 
     return li_dict_rsttext
 
@@ -597,4 +608,4 @@ if __name__ == '__main__':
 
 
 
-# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8
+# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8  
