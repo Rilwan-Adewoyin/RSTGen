@@ -400,8 +400,10 @@ def prepare_inputs_for_generation(
             decoder_input_ids = decoder_input_ids[:, -1:]
         
         tti  = kwargs['tail_treepos_ids']
-        decoder_inputs_embeds = self.model.shared( decoder_input_ids ) + \
-                                self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
+
+        decoder_inputs_embeds = self.model.shared( decoder_input_ids )
+        
+        self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
 
         decoder_inputs_embeds = decoder_inputs_embeds * self.model.decoder.embed_scale
 
