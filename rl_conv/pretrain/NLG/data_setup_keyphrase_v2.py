@@ -30,7 +30,13 @@ from pke.data_structures import Candidate
 
 import regex as re
 pattern_punctuation_space = re.compile(r'\s([?.!"](?:\s|$))')
-
+pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
+             "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
+                                          # but not after an acronym
+             "\w(?:\.\w)|"+               # start/middle of acronym
+             "(?<=\w\.)\w",               # end of acronym
+             )
+ 
 
 # sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
 # #making spacy model #spedding up textrank processing
@@ -83,7 +89,7 @@ for path_ in modules_paths:
 
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 
-from data_setup import _tree_to_rst_code, _parse_tree
+from data_setup import _tree_to_rst_code, _parse_trees
 
 # Only take dsets with 5 or more RST chunks since we want to learn transitions between chunks of 3 EDUs
 
@@ -91,11 +97,15 @@ from data_setup import _tree_to_rst_code, _parse_tree
 def main(   batch_process_size=20,
             mp_count=4,
             resume_progress=False,
-            subreddit_names = [],
-            #subreddit_names = ["askscience","askwomen", "atheism", 
-                # "business", "changemyview", "Christianity", "DebateReligion", "Economics",
-                #  "explainlikeimfive", "malefashionadvice","POLITIC","PoliticalDicussion", "politics",
-                # "relationship_advice", "WritingPrompts_story_only"],
+            #subreddit_names = [],
+                #batch du11ducks
+            subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","AskReddit","askscience","AskWomen","asoiaf","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz","DebateReligion","Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive"],
+                
+                #batch enigma
+            #subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography"],
+        
+                #batch ... 
+            #subreddit_names = ["pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
                 min_rst_len = 6,
             **kwargs):
     """[summary]
@@ -276,9 +286,15 @@ def processing_txt(li_dict_rsttext):
         # capitalizing starting letter
         if not txt_preproc[:1].isupper():
             txt_preproc = txt_preproc[:1].capitalize() + txt_preproc[1:]
-            
+
         # removin spaces between punctuation and preceeding word
         txt_preproc = re.sub(pattern_punctuation_space, r'\1', txt_preproc)
+
+        # Adding correct capitalization to dataset
+        txt_preproc = re.sub(pattern_capitalize_after_punct,               # end of acronym
+             lambda x: x.group().upper(), 
+             txt_preproc)
+
 
         li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
     return li_dict_rsttext
@@ -373,13 +389,20 @@ def check_full_rst(li_dict_rsttext):
     li_li_unparsed_tree = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_text]), 
                                                 skip_parsing=False, redirect_output=True)
     li_unparsed_tree = sum( li_li_unparsed_tree, [] )
-    li_subtrees = _parse_tree(li_unparsed_tree)
+    li_subtrees = _parse_trees(li_unparsed_tree)
     
-    li_rst_dict = [ _tree_to_rst_code(_tree) for _tree in li_subtrees ]
+    li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
 
     # Attaching the new rst codes to the dataset
-    for idx1, idx2 in enumerate(idxs_w_shrtnd_rst):
-        li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
+        # and removing trees which could not be parsed
+    for idx1, idx2 in reversed(list(enumerate(idxs_w_shrtnd_rst))):
+        if li_rst_dict[idx1] == None:
+            li_dict_rsttext.pop(idx2)
+        else:
+            li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
+
+    
+
 
     return li_dict_rsttext
 
@@ -551,7 +574,7 @@ if __name__ == '__main__':
     parser.add_argument('-bps','--batch_process_size', default=3,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=3, type=int)
+    parser.add_argument('--mp_count', default=4, type=int)
     
     parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
@@ -585,4 +608,4 @@ if __name__ == '__main__':
 
 
 
-# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8
+# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8  
