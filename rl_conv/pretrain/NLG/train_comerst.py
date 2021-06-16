@@ -7,9 +7,9 @@
 import os
 #os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
-os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
+#os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
 #os.environ['NCCL_IB_DISABLE'] ="1"#
-# os.environ['CUDA_LAUNCH_BLOCKING']='1' 
+#os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
 import torch
 import argparse
@@ -249,7 +249,9 @@ class EmbeddingRstPos(nn.Module):
 
     def forward(self, x ):
         while x.max() >= self.max_rst_index:
-            x = torch.where( x<self.max_rst_index,x, torch.ceil( (x-2)/2 ).long() )
+            x = torch.where( x<self.max_rst_index, x, torch.ceil( (x-2)/2 ).long() )
+   
+
         x = self.fixed_rst_encoding(x)
         x = self.ffd( x )
         return x
@@ -1302,13 +1304,14 @@ class COMERST_tokenizer():
         edus_in_tail = min_edus_in_chunk
         count_edus_in_record = len( li_edu_pos )
 
+
         if self.max_edu_nodes_to_select==-1:
             max_edu_nodes_to_select_for_head =  count_edus_in_record - min_edus_in_chunk
         else:
-            max_edu_nodes_to_select_for_head = min( max( min_edus_in_chunk, self.max_edu_nodes_to_select ), count_edus_in_record - min_edus_in_chunk )
+            max_edu_nodes_to_select_for_head = min(5, self.max_edu_nodes_to_select )
 
-        count_edus_for_head = random.randint(3, max_edu_nodes_to_select_for_head)
-        start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
+        count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head )
+        start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head+1 )
         
         final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
         tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
@@ -2992,7 +2995,7 @@ class SingleDataset_rst_v2(torch.utils.data.Dataset):
         # filtering out lines which relate to long texts        
         if 'dict_pos_edu' in self.data.columns:
             self.valid_dset = True
-            # filtering out long lines
+            
             self.data  = self.data[ ~self.data['dict_pos_edu'].isnull() ]
             
         else:
@@ -3210,4 +3213,4 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
 
 # 101 - New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded
-# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -far 0 -agb 1 --gpus 1 --workers 6 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -rpet 2 -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -far 0 -agb 1 --gpus 1 --workers 12 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"

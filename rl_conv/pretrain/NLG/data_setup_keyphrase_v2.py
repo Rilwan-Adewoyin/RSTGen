@@ -215,6 +215,8 @@ def main( batch_process_size=20,
 
                 res = pool.imap( check_full_rst, res )
 
+                res = pool.imap( filtering_out_records, res)
+
                 res = pool.imap( position_edus, res)
                               
                 batch_li_dict_utt = list(res)

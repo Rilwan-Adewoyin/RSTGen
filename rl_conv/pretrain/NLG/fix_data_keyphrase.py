@@ -30,19 +30,16 @@ def process_and_save( fp ):
     
     data = pd.read_csv(fp, sep=',', header=0 )
     columns = data.columns
-    
-    if 'li_edus' not in columns and 'li_dict_posname_likpscore' not in columns:
-        os.remove(fp)
-        return True
-        
-    #remove rows where pos0 is empty
-    pos0_records = data['li_dict_posname_likpscore'].values
+            
+    #remove rows where dict_pos_edu is less than 6 length
+    li_dict_pos_edu = data['dict_pos_edu'].values
 
-    pos0_records = [ujson.decode(val) if type(val)==str else False for val in pos0_records ]
+    li_dict_pos_edu = [ujson.decode(val) for val in li_dict_pos_edu ]
 
     # Creating a filter to check all pos0's are larger than length 0
-    bool_filter = [ all( len(dict_['pos0'][0][0])!=0  for dict_ in li_dict ) if li_dict!=False else False for li_dict in pos0_records  ]
-    
+        
+    bool_filter = [len(_dict)>=6 for _dict in li_dict_pos_edu]
+
     # remove rows
     data = data[  bool_filter  ]
         
@@ -58,7 +55,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
 
-    parser.add_argument('-dd','--data_dir', default="./dataset_keyphrase",
+    parser.add_argument('-dd','--data_dir', default="./dataset_keyphrase_v2",
         type=str )    
     args = parser.parse_args()
     
