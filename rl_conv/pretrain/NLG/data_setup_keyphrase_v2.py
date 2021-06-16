@@ -99,13 +99,10 @@ def main(   batch_process_size=20,
             resume_progress=False,
             #subreddit_names = [],
                 #batch du11ducks
-            subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","AskReddit","askscience","AskWomen","asoiaf","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz","DebateReligion","Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive"],
+            #subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","AskReddit","askscience","AskWomen","asoiaf","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz","DebateReligion","Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive"],
                 
                 #batch enigma
-            #subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography"],
-        
-                #batch ... 
-            #subreddit_names = ["pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
+            subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography","pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
                 min_rst_len = 6,
             **kwargs):
     """[summary]
@@ -608,4 +605,4 @@ if __name__ == '__main__':
 
 
 
-# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8  
+# python3 data_setup_keyphrase_v2.py -bps 240 -rp 1  --mp_count 16 
