@@ -230,6 +230,60 @@ for name in nlp.pipe_names:
     if name not in components:
         nlp.remove_pipe(name)
 
+# region 
+class EmbeddingRstPos(nn.Module):
+    def __init__(self, max_rst_index=None, rst_encoding_ndim=768):
+        super(EmbeddingRstPos, self).__init__()
+
+        self.max_rst_index = self.max_rst_index
+        self.fixed_rst_encoding = self.make_rst_encoding( rst_encoding_ndim )
+        self.ffd = torch.nn.Linear(self.rst_pos_maxdepth, self.transformer.config.d_model, bias=False )
+        
+        self.padding_idx = self.fixed_rst_encoding.padding_idx
+
+    def forward(self, x ):
+        
+        x = self.fixed_rst_encoding(x)
+        x = self.ffd( x )
+        return x
+    
+    def make_rst_encoding(self, rst_encoding_ndim):
+        
+        embedding_weight = torch.zeros( 
+                                (self.fixed_rst_encoding, rst_encoding_ndim ),
+                                dtype = torch.float )
+        
+        # zero index embedding vector
+        zero_embedding = np.zeros( [self.max_rst_index] )
+
+        split_dir_numb = {'L':-1, 'R':1}
+        
+        # for each embedding
+        for idx in range(self.max_rst_index):
+            
+            np_arr_copy = copy.deepcopy( zero_embedding )
+            # Determine the sequence of lefts and rights to reach node    
+            left_rights_from_root_to_pos = self.left_right_seq_from_root_to_edu_pos( idx )
+            
+            # Convert sequence to a sequence of -1 and 1s and 0s
+            for idx, val in enumerate(left_right_from_root):
+                np_arr_copy[idx] = split_dir_numb[val]
+
+            # set this as the new embedding
+            embedding_weight[idx] = torch.FloatTensor( np_arr_copy )
+
+        fixed_rst_encoding = torch.nn.Embedding.from_pretrained( embedding_weight ,
+                                    freeze=True, padding_idx=0)
+
+        return fixed_rst_encoding
+    
+
+        
+
+
+
+#endregion
+
 
 #region COMERST model and tokenizer
 class COMERST(nn.Module):
@@ -277,14 +331,14 @@ class COMERST(nn.Module):
                 #+1+1 here because max_node =N, but our node data is 0 indexed  padding index is final node
         if self.rst_pos_embed_type == 1:
             self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
-                                    padding_idx=(2*self.tokenizer.rst_pos_maxidx +2 ) + 1   , scale_grad_by_freq=self.scale_grad_by_freq )
+                                    padding_idx=(2*self.tokenizer.rst_pos_maxidx+2)+1 , scale_grad_by_freq=self.scale_grad_by_freq )
             self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=init_std_var)
 
         elif self.rst_pos_embed_type == 2:
             self.rst_pos_maxdepth = 12
-            self.embedding_rst_pos = torch.nn.Linear(self.rst_pos_maxdepth, self.transformer.config.d_model, bias=False )
-            self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.0005)
-            self.embedding_rst_pos.padding_idx = torch.zeros( ( 1 , self.rst_pos_maxdepth ), dtype=torch.float, device=self.embedding_rst_pos.device  )
+            self.embedding_rst_pos = EmbeddingRstPos( max_rst_index=self.rst_pos_maxdepth,
+                                                rst_encoding_ndim=self.transformer.config.d_model,
+                                                )
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
@@ -1218,13 +1272,11 @@ class COMERST_tokenizer():
             # If node position numbers are too deep, then need to maybe move them up into higher positions
                 # Allow tree rst position embedding to extend to a larger number. Then put a method in place to clamp the max value
 
-
         dict_pos_edu = {int(k):v for k,v in dict_pos_edu.items()}
         # region prepping rst tree info
         li_rst_rel = [ rst_node['rel'] for rst_node in li_rst ] 
         li_rst_pos = [ rst_node['pos'] for rst_node in li_rst ]
         li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
-
 
         # getting a list of all graph posiitons of edus in li_edus
         li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
@@ -1368,11 +1420,18 @@ class COMERST_tokenizer():
         # endregion
 
         #TODO: make sure none of the rst positions are too high somewhere during this encoding just pull them all down
-        self.rst_pos_embed_type == 1:
+        if self.rst_pos_embed_type == 1:
             head_treepos_ids = self.rst_pos_bounding(head_treepos_ids)
             rst_treepos_ids  = self.rst_pos_bounding(rst_treepos_ids)
             tail_treepos_ids = self.rst_pos_bounding(tail_treepos_ids)
-        # TODO: ADD IN CONVERSION FRO rst POSITION TO VECTOR REPRESENTATION
+        
+        elif self.rst_pos_embed_type == 2:
+            # Create a new combined sequential class which calls a gather on matrix below
+                # Have a Nx768 matrix which stores the 1/0s vector for each index position - Untrainable
+            
+            # Then passes the output to the input layer of a neural network
+
+            # TODO: ADD IN CONVERSION For RST POSITION TO VECTOR REPRESENTATION
 
         return {
             #head
@@ -1839,17 +1898,10 @@ class COMERST_tokenizer():
 
         return rst_pos
 
-    @lru_cache(maxsize=124)
-    def edukp_pos_sort_function(self, edukp_pos: int):
-        # We use a sorting function to know tree leftright order of edukp_pos
-            # sort_function
-            # from root pos find the sequence of left/rights down the tree to each edukp_pos
-            # Then use the 1/2, 1/4 method to calculate edukpos float representtion on flat line
-            # Then retun this float
-            # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
+    @lru_cache(maxsize=1240)
+    def left_right_seq_from_root_to_edu_pos(self, edukp_pos: int):
+            # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
-
-        
         parent_pos = edukp_pos
         li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
@@ -1866,13 +1918,25 @@ class COMERST_tokenizer():
 
             parent_pos = math.floor(parent_pos)
         
+        return li_leftright_seq
+
+    @lru_cache(maxsize=1240)
+    def edukp_pos_sort_function(self, edukp_pos: int):
+        # We use a sorting function to know tree leftright order of edukp_pos
+            # sort_function
+            # from root_pos find the sequence of left/rights down the tree to each edukp_pos
+            # Then use the 1/2, 1/4 method to calculate edukpos float representtion on flat line
+            # Then retun this float
+            # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
+
+        li_leftright_seq = self.left_right_seq_from_root_to_edu_pos(edukp_pos) 
+        
         # Now calculate the flattened position using the sequence of left and rights
         _ = {'L':-1, 'R':+1}
         li_flattened_pos_contributions = [  _[direction]*(0.5**(idx+1)) for idx,direction in enumerate(li_leftright_seq)  ]
         flattened_pos = sum(li_flattened_pos_contributions)
 
         return flattened_pos
-
 
     def smallest_spanning_subtree(self, li_edu_pos, li_rst_pos=None, li_rst_rel=None, li_rst_ns=None  ):
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
@@ -1926,10 +1990,6 @@ class COMERST_tokenizer():
         
         return candidiate_root_node
         
-
-
-
-
     @lru_cache(maxsize=1024)
     def parent_node_pos(self, node_pos):
         """Gets the parent node position for any node_pos
