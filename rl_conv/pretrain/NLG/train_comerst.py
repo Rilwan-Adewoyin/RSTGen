@@ -272,8 +272,7 @@ class COMERST(nn.Module):
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
         # region Extra embedding layers
-         
-
+        
             # The rst_parent_nodes can go up to N, but the edu_positions can then go up to N*2 +2
                 #+1+1 here because max_node =N, but our node data is 0 indexed  padding index is final node
         if self.rst_pos_embed_type == 1:
