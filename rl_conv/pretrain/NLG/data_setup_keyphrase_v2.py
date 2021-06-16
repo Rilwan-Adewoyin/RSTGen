@@ -93,8 +93,7 @@ from data_setup import _tree_to_rst_code, _parse_trees
 
 # Only take dsets with 5 or more RST chunks since we want to learn transitions between chunks of 3 EDUs
 
-
-def main(   batch_process_size=20,
+def main( batch_process_size=20,
             mp_count=4,
             resume_progress=False,
             #subreddit_names = [],
@@ -268,8 +267,6 @@ def filtering_out_records(li_dict_rsttext, min_rst_len=5):
     
     return li_dict_rsttext
 
-
-
 def processing_txt(li_dict_rsttext):
     # Preventing errors in rst tree parsing
     # Ensuring text starts with a capital letter
@@ -296,9 +293,8 @@ def processing_txt(li_dict_rsttext):
         li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
     return li_dict_rsttext
 
-
 # region edu processing     
-def edu_segmenter( li_dict_rsttext ):
+def edu_segmenter(li_dict_rsttext):
     """[summary]
 
         Args:
@@ -336,8 +332,7 @@ def edu_segmenter( li_dict_rsttext ):
 
     return li_dict_rsttext
 
-
-def edu_fixer(li_textwedutoken ):
+def edu_fixer(li_textwedutoken):
         
     li_li_edutext = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]
     
@@ -362,7 +357,6 @@ def split(sequence, sep):
         else:
             chunk.append(val)
     yield chunk
-
 #endregion
 
 def check_full_rst(li_dict_rsttext):
@@ -402,7 +396,6 @@ def check_full_rst(li_dict_rsttext):
 
 
     return li_dict_rsttext
-
 
 def position_edus(li_dict_rsttext):
     if len(li_dict_rsttext) == 0:
@@ -477,11 +470,8 @@ def _key_phrase_extractor(str_utterance, extractor, spacy_model, pos_tags):
 
 def kp_shortener( txt, spacy_model, pos_to_remove = ['ADV','DET','X'], tags_to_remove=['VBZ']  ):
     
-
     doc = spacy_model(txt)
-    
-    txt = ' '.join( [ tkn.text for tkn in doc if ( tkn.pos_ not in pos_to_remove) and (tkn.tag_ not in tags_to_remove)  ] )
-           
+    txt = ' '.join( [ tkn.text for tkn in doc if ( tkn.pos_ not in pos_to_remove) and (tkn.tag_ not in tags_to_remove)  ] ) 
     return txt
 # endregion
 
@@ -603,6 +593,4 @@ if __name__ == '__main__':
             # time.sleep(3)
             pass
 
-
-
-# python3 data_setup_keyphrase_v2.py -bps 240 -rp 1  --mp_count 16 
+# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8  

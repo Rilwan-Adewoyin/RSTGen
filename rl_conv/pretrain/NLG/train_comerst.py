@@ -8,8 +8,8 @@ import os
 #os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
 os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
-os.environ['NCCL_IB_DISABLE'] ="1"
-#os.environ['CUDA_LAUNCH_BLOCKING']='1' 
+#os.environ['NCCL_IB_DISABLE'] ="1"#
+# os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
 import torch
 import argparse
@@ -26,7 +26,10 @@ from itertools import islice
 import math
 from itertools import groupby
 import copy
-
+from types import MethodType
+from collections import defaultdict
+import pke
+from pke.data_structures import Candidate, Document
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -51,6 +54,135 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.bool(), torch.finfo(dtype).min)
 
 transformers.models.bart.modeling_bart._expand_mask = _expand_mask
+
+#patching the pke reader 
+def read(self, text, **kwargs):
+    """Read the input file and use spacy to pre-process.
+    Spacy model selection: By default this function will load the spacy
+    model that is closest to the `language` parameter ('fr' language will
+    load the spacy model linked to 'fr' or any 'fr_core_web_*' available
+    model). In order to select the model that will be used please provide a
+    preloaded model via the `spacy_model` parameter, or link the model you
+    wish to use to the corresponding language code
+    `python3 -m spacy link spacy_model lang_code`.
+    Args:
+        text (str): raw text to pre-process.
+        max_length (int): maximum number of characters in a single text for
+            spacy (for spacy<3 compatibility, as of spacy v3 long texts
+            should be splitted in smaller portions), default to
+            1,000,000 characters (1mb).
+        spacy_model (model): an already loaded spacy model.
+    """
+
+    spacy_model = kwargs.get('spacy_model', None)
+
+    if spacy_model is None:
+        try:
+            spacy_model = spacy.load(str2spacy(self.language),
+                                     disable=['ner', 'textcat', 'parser'])
+        except OSError:
+            logging.warning('No spacy model for \'{}\' language.'.format(self.language))
+            logging.warning('Falling back to using english model. There might '
+                'be tokenization and postagging errors. A list of available '
+                'spacy model is available at https://spacy.io/models.'.format(
+                    self.language))
+            spacy_model = spacy.load(str2spacy('en'),
+                                     disable=['ner', 'textcat', 'parser'])
+        if int(spacy.__version__.split('.')[0]) < 3:
+            sentencizer = spacy_model.create_pipe('sentencizer')
+        else:
+            sentencizer = 'sentencizer'
+        spacy_model.add_pipe(sentencizer)
+        if 'max_length' in kwargs and kwargs['max_length']:
+            spacy_model.max_length = kwargs['max_length']
+
+    #spacy_model = fix_spacy_for_french(spacy_model)
+    spacy_doc = spacy_model(text)
+    
+    retokenize(spacy_doc)
+    
+    sentences = []
+    for sentence_id, sentence in enumerate(spacy_doc.sents):
+        sentences.append({
+            "words": [token.text for token in sentence],
+            "lemmas": [token.lemma_ for token in sentence],
+            # FIX : This is a fallback if `fix_spacy_for_french` does not work
+            "POS": [token.pos_ or token.tag_ for token in sentence],
+            "char_offsets": [(token.idx, token.idx + len(token.text))
+                             for token in sentence]
+        })
+
+    doc = Document.from_sentences(
+        sentences, input_file=kwargs.get('input_file', None), **kwargs)
+
+    return doc
+
+def retokenize(doc):
+    position = [token.i for token in doc if token.i!=0 and "'" in token.text]
+    with doc.retokenize() as retokenizer:
+        for pos in position:
+            try:
+                retokenizer.merge(doc[pos-1:pos+1])
+            except ValueError:
+                pass
+
+def get_n_best(self, n=10, redundancy_removal=False, stemming=False):
+    """Returns the n-best candidates given the weights.
+    Args:
+        n (int): the number of candidates, defaults to 10.
+        redundancy_removal (bool): whether redundant keyphrases are
+            filtered out from the n-best list, defaults to False.
+        stemming (bool): whether to extract stems or surface forms
+            (lowercased, first occurring form of candidate), default to
+            False.
+    """
+
+    # sort candidates by descending weight
+    best = sorted(self.weights, key=self.weights.get, reverse=True)
+
+    # remove redundant candidates
+    if redundancy_removal:
+
+        # initialize a new container for non redundant candidates
+        non_redundant_best = []
+
+        # loop through the best candidates
+        for candidate in best:
+
+            # test wether candidate is redundant
+            if self.is_redundant(candidate, non_redundant_best):
+                continue
+
+            # add the candidate otherwise
+            non_redundant_best.append(candidate)
+
+            # break computation if the n-best are found
+            if len(non_redundant_best) >= n:
+                break
+
+        # copy non redundant candidates in best container
+        best = non_redundant_best
+
+    # get the list of best candidates as (lexical form, weight) tuples
+    n_best = [(u, self.weights[u]) for u in best[:min(n, len(best))]]
+
+    # replace with surface forms if no stemming
+    if not stemming:
+        n_best = [  (''.join( [ " "+sf if (sf not in [".","(",")","[","]","?","{","}","!"]) else sf for sf in self.candidates[u].surface_forms[0] ]).strip(' ') ,
+                   self.weights[u]) for u in best[:min(n, len(best))]]
+
+    # return the list of best candidates
+    return n_best
+
+pke.readers.RawTextReader.read = read
+pke.base.LoadFile.get_n_best = get_n_best
+
+def reset(self):
+    self.sentences = []
+    self.candidates = defaultdict(Candidate)
+    self.weights = {}
+    #self.graph = nx.Graph()
+    self.graph.clear()
 
 import utils_comerst as utils
 
@@ -101,6 +233,61 @@ for name in nlp.pipe_names:
     if name not in components:
         nlp.remove_pipe(name)
 
+class EmbeddingRstPos(nn.Module):
+    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
+                    ):
+        super(EmbeddingRstPos, self).__init__()
+
+        self.max_rst_index = max_rst_index
+        self.max_rst_level = max_rst_level
+        self.left_right_seq_from_root_to_edu_pos = lr_func
+
+        self.fixed_rst_encoding = self.make_rst_encoding( )
+        self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=False )
+        
+        self.padding_idx = self.fixed_rst_encoding.padding_idx
+
+    def forward(self, x ):
+        while x.max() >= self.max_rst_index:
+            x = torch.where( x<self.max_rst_index,x, torch.ceil( (x-2)/2 ).long() )
+        x = self.fixed_rst_encoding(x)
+        x = self.ffd( x )
+        return x
+    
+    def make_rst_encoding(self):
+        
+        embedding_weight = torch.zeros( 
+                                (self.max_rst_index, self.max_rst_level ),
+                                dtype = torch.float )
+        
+        # zero index embedding vector
+        zero_embedding = np.zeros( [self.max_rst_level] )
+
+        split_dir_numb = {'L':-1, 'R':1}
+        
+        # for each embedding
+        for idx in range(self.max_rst_index):
+            
+            idx_embedding = copy.deepcopy( zero_embedding )
+            
+            # Determine the sequence of lefts and rights to reach node    
+            left_rights_from_root_to_pos = self.left_right_seq_from_root_to_edu_pos( idx )
+            
+            # Convert sequence of LRs to a sequence of -1 and 1s and 0s
+            for idx1, val in enumerate(left_rights_from_root_to_pos):
+                idx_embedding[idx1] = split_dir_numb[val]
+
+            # set this as the new embedding
+            embedding_weight[idx] = torch.FloatTensor( idx_embedding )
+
+        fixed_rst_encoding = torch.nn.Embedding.from_pretrained( embedding_weight ,
+                                    freeze=True, padding_idx=0)
+
+        return fixed_rst_encoding
+    
+
+#
+
 
 #region COMERST model and tokenizer
 class COMERST(nn.Module):
@@ -113,10 +300,10 @@ class COMERST(nn.Module):
                     max_edu_nodes_to_select=-1,
                     filter_atomic_rels=False,
                     dict_embed_mnorms = {},
-                    init_std_var = 0.005,
                     relation_embedding = "flattened",
                     attention_type = 1,
                     freeze_embeds=False,
+                    rst_pos_embed_type = 1
                     ):
         super(COMERST, self).__init__()
 
@@ -129,29 +316,37 @@ class COMERST(nn.Module):
         
         self.transformer = utils.load_pretrained_transformer(self.base_model_name, transformer=True)['transformer']
         self.transformer.comerst = lambda : self
-        
+        self.rst_pos_embed_type = rst_pos_embed_type
+
         self.tokenizer = COMERST_tokenizer(self.base_model_name,
                                             os.path.join( ("./models"), f"{model_name}_tokenizer"),
                                             max_len_head, max_len_tail,
                                             max_edu_nodes_to_select,
                                             filter_atomic_rels,
                                             self.relation_embedding,
-                                            attention_type=self.attention_type )
+                                            attention_type=self.attention_type,
+                                            rst_pos_embed_type=rst_pos_embed_type )
         
         self.transformer.resize_token_embeddings( len(self.tokenizer.base_tokenizer) )
 
         # region Extra embedding layers
-         
+        
+            # The rst_parent_nodes can go up to N, but the edu_positions can then go up to N*2 +2
+                #+1+1 here because max_node =N, but our node data is 0 indexed  padding index is final node
+        if self.rst_pos_embed_type == 1:
+            self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
+                                    padding_idx=(2*self.tokenizer.rst_pos_maxidx+2)+1 , scale_grad_by_freq=self.scale_grad_by_freq )
 
-            # The rst_parent_nodes can go up to 30, but the edu_positions can then go up to 30*2 +2
-                #+1+1 here because max_node =30, but our node data is 0 indexed  padding index is final node
-        self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
-                                    padding_idx=(2*self.tokenizer.rst_pos_maxidx +2 ) + 1   , scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=init_std_var)
+        elif self.rst_pos_embed_type == 2:
+            
+            self.embedding_rst_pos = EmbeddingRstPos(  self.tokenizer.left_right_seq_from_root_to_edu_pos,
+                                                    max_rst_index=self.tokenizer.rst_pos_maxidx,
+                                                        max_rst_level = self.tokenizer.node_level(self.tokenizer.rst_pos_maxidx),
+                                                rst_encoding_ndim=self.transformer.config.d_model)
+            
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.5*init_std_var)
 
         # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005)
@@ -161,7 +356,6 @@ class COMERST(nn.Module):
             rel_embed_len = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx = len(self.tokenizer.rst_rel_li ) + len(self.tokenizer.atomic_rel_li ) 
             self.embedding_rels = torch.nn.Embedding( rel_embed_len, self.transformer.config.d_model, padding_idx=rel_pad_idx, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels.weight.data.normal_(mean=0.0, std=1.0*init_std_var) 
             with torch.no_grad():
                 self.embedding_rels.weight[ self.embedding_rels.padding_idx ].fill_(0)
                 
@@ -173,13 +367,11 @@ class COMERST(nn.Module):
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
             self.embedding_rels_rst = torch.nn.Embedding( rel_embed_len_rst, rel_embed_len_atomic , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             with torch.no_grad():
                 self.embedding_rels_atomic.weight[ self.embedding_rels_atomic.padding_idx ].fill_(0)
@@ -191,13 +383,11 @@ class COMERST(nn.Module):
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.atomic_rel_li ) + 1
             rel_pad_idx_rst = len(self.tokenizer.atomic_rel_li )
             self.embedding_rels_rst_l1 = torch.nn.Embedding( rel_embed_len_rst, 80 , padding_idx=rel_pad_idx_rst, scale_grad_by_freq=self.scale_grad_by_freq   )            
-            self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=1.0*init_std_var)
 
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
@@ -311,8 +501,6 @@ class COMERST(nn.Module):
             self.pad_values['rst_rel_ids'] = self.embedding_rels_rst[0].padding_idx
 
 
-
-
     def forward(self, input_, return_dict=None):
 
         return_dict = return_dict if return_dict is not None else self.transformer.config.use_return_dict
@@ -400,7 +588,6 @@ class COMERST(nn.Module):
                 s1s_output['comet'] = s1s_output_comet
             
             return s1s_output 
-
 
     def forward_embed_rst(self,  
                             head_ids,
@@ -548,8 +735,8 @@ class COMERST(nn.Module):
         keys = ['base_model_name','max_len_head', 'max_len_tail',
                         'scale_grad_by_freq','model_name',
                         'filter_atomic_rels','max_edu_nodes_to_select',
-                        'init_std_var','relation_embedding','attention_type',
-                        'freeze_embeds']
+                        'relation_embedding','attention_type',
+                        'freeze_embeds','rst_pos_embed_type']
 
         json_keys = ['dict_embed_mnorms']
         
@@ -731,13 +918,13 @@ class COMERST(nn.Module):
         #TODO: this is not implemented yet - the maximum lengths
         parser.add_argument('-mlh','--max_len_head', type= int, default=20 )
         parser.add_argument('-mlt','--max_len_tail', type= int, default=20 )
-        parser.add_argument('-ments','--max_edu_nodes_to_select', type=int, default=-1, )
+        parser.add_argument('-mnts','--max_edu_nodes_to_select', type=int, default=4, )
         parser.add_argument('-far','--filter_atomic_rels', type=lambda x: bool(int(x)), default=False, )
-        parser.add_argument('-isv','--init_std_var', type=float, default=0.005)
         parser.add_argument('-dem','--dict_embed_mnorms', type=lambda x: ujson.decode(x), default={})
         parser.add_argument('-re', '--relation_embedding', type=str, choices=['flattened','hierarchical1','hierarchical2'], default='flattened' )
         parser.add_argument('-at','--attention_type',type=int, choices=[1,2,3], default=1)
         parser.add_argument('-fe','--freeze_embeds',type=lambda x: bool(int(x)), default=False)
+        parser.add_argument('-rpet','--rst_pos_embed_type', type=int, default=1)
         
         parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=True, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -765,7 +952,8 @@ class COMERST_tokenizer():
                  relation_embedding = "flattened",
                  randomize_comet_pronouns=False,
                  remove_to=False,
-                 attention_type=1,
+                 attention_type=1, 
+                 rst_pos_embed_type = 1,
                  **kwargs ):
         
         #TOdo: ensure max_lens are being used
@@ -820,16 +1008,17 @@ class COMERST_tokenizer():
 
         #endregion
 
-        # region Setting up NS encoding 
+        # region Setting up RST NS encoding 
         self.rst_ns_li = ['NN','NS','SN','a'] 
         self.rst_ns_labeler = sklp.LabelEncoder()
         self.rst_ns_labeler.fit( self.rst_ns_li  )
 
         # rst_pos
-        #self.rst_pos_maxidx = 2*30 + 2  #original
-        #self.rst_pos_maxidx =2*( 2*30 + 2 )  #original
-        self.rst_pos_maxidx = 30  #same as in train_nlg. Our model can only, model sentences with 5 rst tree depth
+        if rst_pos_embed_type == 1:
+            self.rst_pos_maxidx = 30  #same as in train_nlg. Our model can only, model sentences with 5 rst tree depth
         
+        elif rst_pos_embed_type == 2:
+            self.rst_pos_maxidx = 4094
         #endregion
 
         # region Initalising base tokenzier
@@ -843,6 +1032,10 @@ class COMERST_tokenizer():
         self.token_eos = "</s>"
         self.token_edu = self.token_bos
         # endregion 
+
+        # region Initialise base keyphrase extractor
+        self.setup_keyphrase_extractor()
+        # endregion
 
         #region properties and methods to be used when randomly swapping PersonX/PersonY for name/pronoun
         self.pattern_personx = re.compile("person[ ]*x", re.IGNORECASE)
@@ -882,11 +1075,6 @@ class COMERST_tokenizer():
         li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
 
             #removing rst tree information for nodes that are too deep
-            # Not needed since we only have positions lower than self.rst_pos_maxidx=30 based on restrictions in data_setup
-        # bool_filter =[pos <= self.rst_pos_maxidx for pos in li_rst_pos]
-        # li_rst_rel = [ rel for rel, bool_ in zip( li_rst_rel, bool_filter) if bool_==True]
-        # li_rst_pos = [ pos for pos, bool_ in zip( li_rst_pos, bool_filter) if bool_==True]
-        # li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_==True]
         
 
         # getting a list of all graph posiitons of edus in li_edus
@@ -1054,6 +1242,185 @@ class COMERST_tokenizer():
         labels = tail_ids
         # endregion
 
+        return {
+            #head
+            'head_ids': head_ids ,
+            'head_treepos_ids': head_treepos_ids,
+            #'head_kpscore': head_kpscore,
+
+            #relation: tree information
+            'rst_rel_ids': rst_rel_ids ,
+            'rst_treepos_ids': rst_treepos_ids,
+            'rst_ns_ids': rst_ns_ids,
+
+            #tail
+            'tail_ids': tail_ids.squeeze(),
+            'tail_treepos_ids': tail_treepos_ids ,
+            'tail_kp_score':tail_kp_score,
+
+            'attention_mask_head': attention_mask_head,
+            'attention_mask_rel': attention_mask_rel,
+            'position_ids_head': position_ids_head,
+
+            'labels':labels.squeeze()
+        }
+        
+    def tokenize_rst_v2( self, li_rst, dict_pos_edu, target_edu_kp=None, target_edu_pos=None ):
+        
+        # In this one we will predict the key-phrase for a 3/4edu chunk using information from another 3/4edu chunk
+            # - at first we will only train with one other chunk. so one to one.
+            # Need to select information to make head
+            # Then need to select information that will make tail
+            # If node position numbers are too deep, then need to maybe move them up into higher positions
+                # Allow tree rst position embedding to extend to a larger number. Then put a method in place to clamp the max value
+
+        dict_pos_edu = {int(k):v for k,v in dict_pos_edu.items()}
+        # region prepping rst tree info
+        li_rst_rel = [ rst_node['rel'] for rst_node in li_rst ] 
+        li_rst_pos = [ rst_node['pos'] for rst_node in li_rst ]
+        li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
+
+        # getting a list of all graph posiitons of edus in li_edus
+        li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
+        li_edu_pos.sort(key=self.edukp_pos_sort_function)
+        #endregion
+
+        # region - Selecting a subtree from the  RST tree to focus on
+            
+            # head -> randomly select a span of 3or4 edu nodes at random
+            # tail -> select the following 3 or 4 edu span
+            # rel -> select smallest sub-tree of li_rst that coverse both edus    
+                    # anchor1 = Find parent node for the nodes in the head
+                    # anchor2 = Find parent node for the nodes in the tail                            
+                    #  Find  achor1 parent and check if this is parent for anchor2
+                        # If not then do the same with the grandparent. and repeat
+                    #  Once a n-level parent node is found that connects, this is the ROOT node r 
+                    #  Now retrieve all intermediate parent nodes between ROOT node and each anchor node
+            
+            # remember the input key phrases are shortened text, but the output keyphrase is normal english
+        min_edus_in_chunk = 3
+        edus_in_tail = min_edus_in_chunk
+        count_edus_in_record = len( li_edu_pos )
+
+        if self.max_edu_nodes_to_select==-1:
+            max_edu_nodes_to_select_for_head =  count_edus_in_record - min_edus_in_chunk
+        else:
+            max_edu_nodes_to_select_for_head = min( max( min_edus_in_chunk, self.max_edu_nodes_to_select ), count_edus_in_record - min_edus_in_chunk )
+
+        count_edus_for_head = random.randint(3, max_edu_nodes_to_select_for_head)
+        start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
+        
+        final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
+        tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
+        
+        #TODO: make sure nodes selected arent too far apart
+        li_edu_pos_for_head = li_edu_pos[ start_edu_node_idx_for_head: final_edu_node_idx_for_head ]
+        li_edu_pos_for_tail = li_edu_pos[  final_edu_node_idx_for_head: tail_node_end_idx ]
+        
+            # reduce the rst tree information
+                # to only include the smallest subtree of parent nodes that connect the edu nodes
+        all_nodes_included = li_edu_pos[ start_edu_node_idx_for_head: tail_node_end_idx ]
+        li_rst_pos, li_rst_rel, li_rst_ns = self.smallest_spanning_subtree( all_nodes_included, li_rst_pos, li_rst_rel, li_rst_ns  ) 
+
+        #endregion
+
+
+        #region encoding tail
+            # Extracting keyphrase for tail 
+                # We sample the top two, then select one at random
+                # NOTE: IDEA During inference we can use beam search to sample multiple key phrases
+        tail_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_tail] )
+        li_tailkp_score = self.key_phrase_extract( tail_text, n_best= 2, shorten=False )
+        tail_kp, tail_kpscore = random.choice( li_tailkp_score )
+
+            # Encoded tail information. Adding special tokens
+        tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+            return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+        
+        #TODO: figure out new method for encoding tail info
+            #NOTE: Idea1: we simply past the shared parent node for all edus close to the tail treepos
+                    # Since the edus are consecutive in position. This parent node will definetely represent the phrase position in RST tree
+        tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
+        tail_treepos_ids = tail_ids.new_full( tail_ids.shape , tail_edus_parent_pos )
+        tail_kp_score = torch.full( tail_ids.shape, tail_kpscore , dtype=torch.float32)
+        #endregion
+
+        # region encoding head
+            # Extracting keyphrases for heads
+                # We sample the top three, then select  two at random
+        head_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_head] )
+        li_headkp_score = self.key_phrase_extract( head_text, n_best= 3 ) 
+        li_headkp_score = random.sample( li_headkp_score, k=min(2,len(li_headkp_score)) )
+
+            # encode list of keyphrases and scores that are input to encoder
+            # append edu token to start of each head
+        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, max_length=self.max_len_head  ) for head, score in li_headkp_score ]
+        head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
+        li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
+        #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
+
+            #flattening and converting to tensor
+        head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
+        head_treepos_ids = torch.tensor( sum(li_head_treepos_ids, []), dtype=torch.long)
+        #head_kpscores = torch.tensor( sum( li_headkpscores, []), dtype=torch.long)
+
+        #endregion 
+       
+        # region relation : encoded list of rst parent nodes information
+        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze(dim=-1)
+        rst_treepos_ids = torch.tensor( li_rst_pos, dtype=torch.long )
+        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze(dim=-1)
+        #endregion
+
+        #region attention mask
+            #For rst we require 
+                # 1) bidirectional attention over each keyphrase chunk
+                 # each keyphrase chunk can not attend directly to other keyphrase chunks
+                # 2) all encoder inputs can attend to rst relation tree info
+        
+        attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+
+            # here we implement the diagonal attention for each sub keyphrase
+            # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
+            # it should also refer to the relations
+        curr_bos_token_pos=0
+        
+        for hids in li_head_ids:
+            len_ids = len(hids)
+            _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+
+            attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
+                curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
+
+            curr_bos_token_pos += len_ids
+        
+        # Create the 1dimensional mask representing tail attn. We appnd this later
+        attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
+
+        #endregion
+
+        #region position_ids
+            #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
+                # , and the rest of the tokens have position ids in 
+                # the range (2, seq_length - num_pad_tokens). It's implemented like this to
+                #  match the original implementation in fairseq.
+        
+            #for position ids, it restarts from 1 for every new key phrase edu
+            # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
+            # No positional ids for relation section
+
+        position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
+
+        for head in li_head_ids:
+            new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
+            position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
+
+        #endregion
+                    
+        # region labels
+        labels = tail_ids
+        # endregion
+      
         return {
             #head
             'head_ids': head_ids ,
@@ -1475,18 +1842,54 @@ class COMERST_tokenizer():
 
 # endregion
 
+    def setup_keyphrase_extractor(self):
+        spacy_kwargs = {'disable': ['ner', 'textcat', 'parser']}
+        self.spacy_model = spacy.load('en_core_web_sm', **spacy_kwargs)
+        exceptions = self.spacy_model.Defaults.tokenizer_exceptions
+        filtered_exceptions = {k:v for k,v in exceptions.items() if "'" not in k}
+        self.spacy_model.tokenizer = spacy.tokenizer.Tokenizer(self.spacy_model.vocab, rules = filtered_exceptions)
+        self.spacy_model.add_pipe('sentencizer')
+        self.kp_extractor = pke.unsupervised.TextRank()
         
-    @lru_cache(maxsize=124)
-    def edukp_pos_sort_function(self, edukp_pos: int):
-        # We use a sorting function to know tree leftright order of edukp_pos
-            # sort_function
-            # from root pos find the sequence of left/rights down the tree to each edukp_pos
-            # Then use the 1/2, 1/4 method to calculate edukpos float representtion on flat line
-            # Then retun this float
-            # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
-
-
+        self.kp_extractor.reset = MethodType(reset, self.kp_extractor)
+        self.kp_extractor.pos_set = {'NOUN',  'PROPN' ,'ADJ','VERB','PRON','SYM','ADV','DET', 'PUNCT', 'PART'}
         
+        self.kp_extractor.pos_to_remove_from_kp = ['ADV','DET','X']
+        self.kp_extractor.tags_to_remove = ['VBZ']
+
+    def key_phrase_extract(self, str_utterance, n_best=3, window=4, shorten=True):
+        self.kp_extractor.reset()
+        self.kp_extractor.load_document(input=str_utterance, language='en',normalization=None, spacy_model=self.spacy_model)
+        self.kp_extractor.candidate_selection(pos=self.kp_extractor.pos_set)
+        self.kp_extractor.candidate_weighting(window=window, normalized=True, pos=self.kp_extractor.pos_set)
+
+        li_kp_score = self.kp_extractor.get_n_best(n=n_best, redundancy_removal=True)
+
+        if shorten==True:
+            li_kp_score = [ [ self.key_phrase_shortener(kp) ,score] for kp, score in li_kp_score ]
+        else:
+            li_kp_score = [ [ kp ,score] for kp, score in li_kp_score ]
+        return li_kp_score
+    
+    def key_phrase_shortener(self, key_phrase):
+        #This is akin to extracting the AMR of a sentence
+    
+        doc = self.spacy_model(key_phrase)
+        
+        shortened_kp = ' '.join( [ tkn.text for tkn in doc if ( tkn.pos_ not in self.kp_extractor.pos_to_remove_from_kp) and (tkn.tag_ not in self.kp_extractor.tags_to_remove)  ] )
+        
+        return shortened_kp
+
+    def rst_pos_bounding(self, rst_pos):
+
+        rst_pos = torch.where( rst_pos>self.tokenizer.rst_pos_maxidx, torch.ceil( (rst_pos-2)/2 ).long()  ,rst_pos )
+
+        return rst_pos
+
+    @lru_cache()
+    def left_right_seq_from_root_to_edu_pos(self, edukp_pos: int):
+            # from root_pos find the sequence of left/rights down the tree to each edukp_pos
+
         parent_pos = edukp_pos
         li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
@@ -1503,6 +1906,19 @@ class COMERST_tokenizer():
 
             parent_pos = math.floor(parent_pos)
         
+        return li_leftright_seq
+
+    @lru_cache()
+    def edukp_pos_sort_function(self, edukp_pos: int):
+        # We use a sorting function to know tree leftright order of edukp_pos
+            # sort_function
+            # from root_pos find the sequence of left/rights down the tree to each edukp_pos
+            # Then use the 1/2, 1/4 method to calculate edukpos float representtion on flat line
+            # Then retun this float
+            # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
+
+        li_leftright_seq = self.left_right_seq_from_root_to_edu_pos(edukp_pos) 
+        
         # Now calculate the flattened position using the sequence of left and rights
         _ = {'L':-1, 'R':+1}
         li_flattened_pos_contributions = [  _[direction]*(0.5**(idx+1)) for idx,direction in enumerate(li_leftright_seq)  ]
@@ -1510,29 +1926,27 @@ class COMERST_tokenizer():
 
         return flattened_pos
 
-
-    def smallest_spanning_subtree(self, li_edukp_pos, li_rst_pos, li_rst_rel, li_rst_ns  ):
+    def smallest_spanning_subtree(self, li_edu_pos, li_rst_pos=None, li_rst_rel=None, li_rst_ns=None  ):
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
             Then slice li_rst_pos, li_rst_rel, li_rst_ns to reflect this reduced tree
         """
 
-        smallest_edukp_pos = min(li_edukp_pos)
+        smallest_edu_pos = min(li_edu_pos)
 
         # finding root node
-        #   check if each other edukkp_pos can be reached from the root node
-        
+        # check if each other edukkp_pos can be reached from the root node
         root_found = False
-        candidiate_root_node = self.parent_node_pos(smallest_edukp_pos)
+        candidiate_root_node = self.parent_node_pos(smallest_edu_pos)
 
         while root_found==False:
-            root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edukp_pos )
+            root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edu_pos )
             
             if root_found == False:
                 candidiate_root_node = self.parent_node_pos(candidiate_root_node)
             
             elif root_found == True:
                 #find the nodes that
-                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edukp_pos   ]
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
                 nodes_in_minimum_spanning_tree.sort()
@@ -1544,8 +1958,27 @@ class COMERST_tokenizer():
                     li_rst_ns =  [ ns for ns, bool_ in zip( li_rst_ns, bool_filter) if bool_]
         
         return li_rst_pos, li_rst_rel, li_rst_ns
+
+    def lowest_shared_parent_node(self, li_edupos ):
+        """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
+            Then slice li_rst_pos, li_rst_rel, li_rst_ns to reflect this reduced tree
+        """
+        smallest_edu_pos = min( li_edupos )
+
+        # finding root node
+        # check if each other edukkp_pos can be reached from the root node
+        root_found = False
+        candidiate_root_node = self.parent_node_pos(smallest_edu_pos)
+
+        while root_found==False:
+            root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edupos )
+            
+            if root_found == False:
+                candidiate_root_node = self.parent_node_pos(candidiate_root_node)
         
-    @lru_cache(maxsize=62)
+        return candidiate_root_node
+        
+    @lru_cache(maxsize=1024)
     def parent_node_pos(self, node_pos):
         """Gets the parent node position for any node_pos
 
@@ -1604,8 +2037,6 @@ class COMERST_tokenizer():
         
         return reachable, parent_path
         
-
-
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
@@ -1678,7 +2109,7 @@ class TrainingModule(pl.LightningModule):
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data_rst', default="./dataset_keyphrase", help="Relative directory path of rst data")
+        parser.add_argument('--dir_data_rst', default="./dataset_keyphrase_v2", help="Relative directory path of rst data")
         parser.add_argument('--dir_data_atomic2020', default="./dataset_atomic2020", help="Relative directory path for atomic2020data")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('-me','--max_epochs', default=28, type=int)
@@ -1727,8 +2158,7 @@ class TrainingModule(pl.LightningModule):
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_tokenizer_name','model_name','max_len_head','max_len_tail'
-                    ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select',
-                    'init_std_var', 'relation_embedding']} )
+                    ,'scale_grad_by_freq','filter_atomic_rels','max_edu_nodes_to_select', 'relation_embedding']} )
                 
                 mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'dict_embed_mnorms'] }
@@ -1967,7 +2397,7 @@ class TrainingModule(pl.LightningModule):
         mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
             'base_tokenizer_name','loss_type','model_name','max_len_head','max_len_tail',
             'frst_version','scale_grad_by_freq','max_edu_nodes_to_select','filter_atomic_rels',
-            'relation_embedding','attention_type','freeze_embeds']}
+            'relation_embedding','attention_type','freeze_embeds','rst_pos_embed_type']}
         
         mparams_json = {k:json.loads(v) for k,v in checkpoint['hyper_parameters'].items() if k in [] }
 
@@ -2342,14 +2772,14 @@ class DataLoaderGenerator():
             line_ends =  files_sizes
             shuffle = False
 
-        li_dsets = [ SingleDataset_rst(_f, self.tokenizer, line_start, line_end) 
+        li_dsets = [ SingleDataset_rst_v2(_f, self.tokenizer, line_start, line_end) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
         
         # remove invalid dataset
         li_dsets = [dset for dset in li_dsets if dset.valid_dset==True]
 
         if split_name == 'inference':
-            li_dsets = random.sample(li_dsets,20)
+            li_dsets = random.sample(li_dsets,min(20,len(li_dsets)) )
             bs = 1
         else:
             bs = self.bs
@@ -2528,6 +2958,104 @@ class SingleDataset_rst(torch.utils.data.Dataset):
 
         return [kp, kp_score]
 
+class SingleDataset_rst_v2(torch.utils.data.Dataset):
+    """creates a dataloader given a directory of text files each containing a conversation
+
+    """
+    def __init__(self, file_path, tokenizer, line_start, line_end ):
+        self.fp = file_path
+        self.tokenizer = tokenizer
+        self.line_start = line_start
+        self.line_end = line_end
+                
+        skiprows = self.line_start if self.line_start!=0 else None
+        with open(self.fp, 'r') as f:
+            if self.line_start == 0:
+                
+                #TODO: remove nrows
+                self.data = pd.read_csv(file_path, sep=',', header=0, 
+                    skiprows=skiprows,
+                    nrows=(self.line_end-self.line_start),
+                    #nrows=100
+                    )
+
+            else: 
+                
+                names = open(file_path,"r").readline().strip().split(',')
+                            
+                self.data = pd.read_csv(file_path, sep=',', 
+                    names=names, skiprows=skiprows,
+                    nrows=(self.line_end-self.line_start)
+                    #nrows=100
+                    ) 
+                        
+        # filtering out lines which relate to long texts        
+        if 'dict_pos_edu' in self.data.columns:
+            self.valid_dset = True
+            # filtering out long lines
+            self.data  = self.data[ ~self.data['dict_pos_edu'].isnull() ]
+            
+        else:
+            self.valid_dset = False
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index, pad_utterance=True):
+
+        li_rst, dict_pos_edu = self.getitem_extract_datum(index)
+        
+        encoded = self.tokenizer.tokenize_rst_v2( li_rst = li_rst ,
+                                                     dict_pos_edu = dict_pos_edu )
+
+            # encoded May include some of the following
+            #    return {
+            #         #'input_ids': , 
+
+            #         'li_head_ids': li_head_ids ,
+            #         'li_head_pos_ids': li_head_pos_ids,
+            #         'li_head_kpscore': li_head_kpscore,
+
+            #         'tail_ids': tail_ids,
+            #         'tail_pos_id': tail_pos_id ,
+            #         'tail_kp_score': target_edu_kpscore
+
+            #         'li_rst_rel_ids': li_rst_rel_ids ,
+            #         'li_rst_pos_ids': li_rst_pos_ids,
+            #         'li_rst_pos_ids': li_rst_ns_ids
+
+            #     }   
+
+        return encoded
+
+    def getitem_extract_datum(self, index):
+
+        datum = self.data[index:index+1]
+        
+        li_rst = ujson.loads( datum['rst'].values[0] )
+        
+        dict_pos_edu = ujson.loads( datum['dict_pos_edu'].values[0] )
+
+        return li_rst, dict_pos_edu
+    
+    def pos_type_chooser(self, _dict ):
+        # This method chooses which part of speech annotation to choose for the keyphrase
+
+        #_dict = {""pos1"": [[""first thing"", 0.4650969919261783], [""'s"", 0.06980608614764326]], ""pos0"": [[""That's the first thing"", 0.19999999999999993]] } 
+
+        # Criteria for choosing: 
+        #   For both pos options we select the first key_phrase, score couple
+        #   Base on overlap
+        
+        # For Now just take the keyphrase given by pos1
+        # TODO: implement choosing version
+                
+        kp = _dict['pos0'][0][0]
+        kp_score = _dict['pos0'][0][1]
+
+        return [kp, kp_score]
+
+
 class SingleDataset_atomic2020(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
@@ -2680,3 +3208,6 @@ if __name__ == '__main__':
 
 # 6 - Same as 6 but fixed embedding 
 # CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
+
+# 101 - New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded
+# CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -far 0 -agb 1 --gpus 1 --workers 6 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 40 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
