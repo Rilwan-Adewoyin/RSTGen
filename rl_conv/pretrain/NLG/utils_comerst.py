@@ -83,7 +83,6 @@ def get_path(_path,_dir=False):
 
     return _path
 
-
 def load_pretrained_transformer( model_name='bart', transformer=True, 
                                     tokenizer=False):
     _dir_transformer = os.path.join( get_path("./models"), model_name )
@@ -363,10 +362,9 @@ def BART_forward(
         encoder_attentions=encoder_outputs.attentions,
     )
 
-
 def transform_patch( self, val ):
     encoded = self.transform(val)
-    encoded  = encoded + self.starting_idx
+    encoded = encoded + self.starting_idx
     return encoded
 
 def inverse_transform_patch(self, val):
@@ -377,12 +375,9 @@ def inverse_transform_patch(self, val):
     val = [v for v in val if v< len(self.classes_) ]
     decoded = self.inverse_transform( val )
     
-    
     return decoded
 
-
 #region Mixin Classes to override
-
 def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
@@ -419,7 +414,6 @@ def prepare_inputs_for_generation(
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
         }
-
 
 def greedy_search(
     self,
@@ -710,8 +704,6 @@ def freeze_params(model: nn.Module):
         par.requires_grad = False
 # endregion
 
-
-
 def use_task_specific_params(model, task):
     """Update config with summarization specific params."""
     task_specific_params = model.config.task_specific_params
@@ -720,7 +712,6 @@ def use_task_specific_params(model, task):
         pars = task_specific_params.get(task, {})
         logger.info(f"using task specific params for {task}: {pars}")
         model.config.update(pars)
-
 
 def flatten_list(summary_ids: List[List]):
     return [x for x in itertools.chain.from_iterable(summary_ids)]
@@ -822,13 +813,8 @@ def calculate_bertscore(output_lns: List[str], reference_lns: List[str],
     
     return output
 
-    
+# endregion    
 
-
-
-
-
-#endregion
 
 #region Dataprocessing
 comet_tail_to_ignore1 = [ "none", "NONE" ,np.nan, '?',
