@@ -20,9 +20,10 @@ def main(data_dir):
     li_fps = [fn for fn in li_fps if os.path.split(fn)[-1]!="lock"]
     
     for idx, fp in enumerate(li_fps):
-        process_and_save(fp )
         if idx % 10 == 0:
             print(f"Operating on file {idx} of {len(li_fps)}")
+        process_and_save(fp )
+
 
 
 
@@ -37,18 +38,20 @@ def process_and_save( fp ):
     li_dict_pos_edu = [ujson.decode(val) for val in li_dict_pos_edu ]
 
     # Creating a filter to check all pos0's are larger than length 0
-        
+    
     bool_filter = [len(_dict)>=6 for _dict in li_dict_pos_edu]
-
-    # remove rows
-    data = data[  bool_filter  ]
+    
+    if all(bool_filter) != True: 
+        # remove rows
+        data = data[  bool_filter  ]
+            
+        #saving fixed files
+        new_fp = f"{fp[:-10]}{len(data):010d}"
         
-    #saving fixed files
-    new_fp = f"{fp[:-10]}{len(data):010d}"
+        os.remove(fp)
+        data.to_csv(new_fp, index=False) #, quoting=csv.QUOTE_NONE)
     
-    os.remove(fp)
-    data.to_csv(new_fp, index=False) #, quoting=csv.QUOTE_NONE)
-    
+    return True
 
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
