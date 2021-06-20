@@ -13,6 +13,7 @@ import os
 import json
 import torch
 import argparse
+from torch._C import Value
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Tuple
@@ -294,9 +295,9 @@ def clamp_values(x, max):
     # we use this since the rst positions in our tree are often too large 
     # for torch.long to handle
     while x.max() >= max:
-        x = np.where( x<=max, x, np.ceil( (x-2)/2 ) )
+        x = np.where( x<=max, x, np.floor_divide(x-1,2) )
     
-    return x
+    return x.astype( int )
 
 MAX_LONG_VALUE = torch.iinfo(torch.long).max
 
@@ -491,7 +492,7 @@ class COMERST(nn.Module):
 
                         'tail_ids': self.transformer.model.shared.padding_idx , 
                         'tail_treepos_ids':self.embedding_rst_pos.padding_idx ,
-                        'tail_kp_score': 0,
+                        #'tail_kp_score': 0,
 
                         'attention_mask': 0, 
                         'attention_mask_head': 0, 
@@ -610,7 +611,7 @@ class COMERST(nn.Module):
                             rst_ns_ids,
                             tail_ids,
                             tail_treepos_ids,
-                            tail_kp_score,
+                            #tail_kp_score,
                             attention_mask_head,
                             attention_mask_rel, 
 
@@ -1175,9 +1176,8 @@ class COMERST_tokenizer():
         # Encoded tail information. Adding special tokens
         # line beow list indicesq
         tail_ids = self.base_tokenizer.encode( target_edu_kp , add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
-        #tail_treepos_id = torch.tensor( [ target_edu_pos ]*tail_ids.shape[-1] , type=torch.long )
         tail_treepos_ids = tail_ids.new_full( tail_ids.shape , target_edu_pos )
-        tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
+        #tail_kp_score = torch.full( tail_ids.shape, target_edu_kpscore , dtype=torch.float32)
         #endregion
 
 
@@ -1268,7 +1268,7 @@ class COMERST_tokenizer():
             #tail
             'tail_ids': tail_ids.squeeze(),
             'tail_treepos_ids': tail_treepos_ids ,
-            'tail_kp_score':tail_kp_score,
+            #'tail_kp_score':tail_kp_score,
 
             'attention_mask_head': attention_mask_head,
             'attention_mask_rel': attention_mask_rel,
@@ -1317,58 +1317,69 @@ class COMERST_tokenizer():
 
 
         if self.max_edu_nodes_to_select==-1:
-            max_edu_nodes_to_select_for_head =  count_edus_in_record - min_edus_in_chunk
+            max_edu_nodes_to_select_for_head =  count_edus_in_record - edus_in_tail
         else:
-            max_edu_nodes_to_select_for_head = min( max( min_edus_in_chunk, self.max_edu_nodes_to_select ), count_edus_in_record - min_edus_in_chunk )
+            max_edu_nodes_to_select_for_head = min(  self.max_edu_nodes_to_select , count_edus_in_record - edus_in_tail )
 
-        count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
-        start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head+1 )
+        li_tailkp_score = []
+        li_headkp_score = []
+        attempts = 0
         
-        final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
-        tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
-        
-        #TODO: make sure nodes selected arent too far apart
-        li_edu_pos_for_head = li_edu_pos[ start_edu_node_idx_for_head: final_edu_node_idx_for_head ]
-        li_edu_pos_for_tail = li_edu_pos[  final_edu_node_idx_for_head: tail_node_end_idx ]
-        
-            # reduce the rst tree information
-                # to only include the smallest subtree of parent nodes that connect the edu nodes
-        all_nodes_included = li_edu_pos[ start_edu_node_idx_for_head: tail_node_end_idx ]
-        li_rst_pos, li_rst_rel, li_rst_ns = self.smallest_spanning_subtree( all_nodes_included, li_rst_pos, li_rst_rel, li_rst_ns  ) 
+        # Extracting list of tailkp and headkp. repeat until adequate keyphrases are selected
+        while len(li_tailkp_score)==0 or len(li_headkp_score)==0:
 
-        #endregion
+            if attempts>10:
+                raise ValueError("tail utterance can not be selected that produces a long enough tail text")
 
-        #region encoding tail
-            # Extracting keyphrase for tail 
+            count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
+            start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
+            
+            final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
+            tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
+            
+            #TODO: make sure nodes selected arent too far apart
+            li_edu_pos_for_head = li_edu_pos[ start_edu_node_idx_for_head: final_edu_node_idx_for_head ]
+            li_edu_pos_for_tail = li_edu_pos[  final_edu_node_idx_for_head: tail_node_end_idx ]
+            
+                # reduce the rst tree information
+                    # to only include the smallest subtree of parent nodes that connect the edu nodes
+            all_nodes_included = li_edu_pos[ start_edu_node_idx_for_head: tail_node_end_idx ]
+            li_rst_pos, li_rst_rel, li_rst_ns = self.smallest_spanning_subtree( all_nodes_included, li_rst_pos, li_rst_rel, li_rst_ns  ) 
+            
+            # Extracting keyphrases for  tails 
                 # We sample the top two, then select one at random
                 # NOTE: IDEA During inference we can use beam search to sample multiple key phrases
-        tail_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_tail] )
-        li_tailkp_score = self.key_phrase_extract( tail_text, n_best= 2, shorten=False )
+            tail_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_tail] )
+            li_tailkp_score = self.key_phrase_extract( tail_text, n_best= 2, shorten=False )
+
+            # Extracting keyphrases for heads
+                # We sample the top three, then select  two at random
+            head_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_head] )
+            li_headkp_score = self.key_phrase_extract( head_text, n_best= 3 ) 
+
+            attempts += 1
+
+        #region encoding tail
         tail_kp, tail_kpscore = random.choice( li_tailkp_score )
 
             # Encoded tail information. Adding special tokens
         tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
             return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
         
-        #TODO: figure out new method for encoding tail info
-            #NOTE: Idea1: we simply past the shared parent node for all edus close to the tail treepos
-                    # Since the edus are consecutive in position. This parent node will definetely represent the phrase position in RST tree
         tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
         tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
         tail_treepos_ids = tail_ids.new_full( tail_ids.shape , tail_edus_parent_pos )
-        tail_kp_score = torch.full( tail_ids.shape, tail_kpscore , dtype=torch.float32)
+        #tail_kp_score = torch.full( tail_ids.shape, tail_kpscore , dtype=torch.float32)
         #endregion
 
         # region encoding head
-            # Extracting keyphrases for heads
-                # We sample the top three, then select  two at random
-        head_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_head] )
-        li_headkp_score = self.key_phrase_extract( head_text, n_best= 3 ) 
+                # We sample two keyphrases from the 3 best ones
         li_headkp_score = random.sample( li_headkp_score, k=min(2,len(li_headkp_score)) )
 
             # encode list of keyphrases and scores that are input to encoder
             # append edu token to start of each head
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, max_length=self.max_len_head  ) for head, score in li_headkp_score ]
+        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
+                        max_length=self.max_len_head  ) for head, score in li_headkp_score ]
         head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
         li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
         #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
@@ -1451,7 +1462,7 @@ class COMERST_tokenizer():
             #tail
             'tail_ids': tail_ids.squeeze(),
             'tail_treepos_ids': tail_treepos_ids ,
-            'tail_kp_score':tail_kp_score,
+            #'tail_kp_score':tail_kpscore,
 
             'attention_mask_head': attention_mask_head,
             'attention_mask_rel': attention_mask_rel,
@@ -1893,7 +1904,9 @@ class COMERST_tokenizer():
         doc = self.spacy_model(key_phrase)
         
         shortened_kp = ' '.join( [ tkn.text for tkn in doc if ( tkn.pos_ not in self.kp_extractor.pos_to_remove_from_kp) and (tkn.tag_ not in self.kp_extractor.tags_to_remove)  ] )
-        
+        if len(shortened_kp) == 0:
+            return key_phrase
+            
         return shortened_kp
 
     def rst_pos_bounding(self, rst_pos):
@@ -1965,7 +1978,7 @@ class COMERST_tokenizer():
                 nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
-                nodes_in_minimum_spanning_tree.sort()
+                nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
 
                 if not nodes_in_minimum_spanning_tree == li_rst_pos:
                     bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
@@ -2002,7 +2015,7 @@ class COMERST_tokenizer():
         
         return candidiate_root_node
         
-    @lru_cache(maxsize=2024)
+    @lru_cache(maxsize=4000)
     def parent_node_pos(self, node_pos):
         """Gets the parent node position for any node_pos
 
@@ -2015,7 +2028,14 @@ class COMERST_tokenizer():
         if node_pos == 0:
             return node_pos
 
-        parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )    
+        #parent_node = int( math.ceil( ( node_pos -2 ) /2 ) )    
+        
+        parent_node =  (node_pos -1) // 2 
+        #Integer division to avoid erroneos approximations
+        #   # it automatically rounds down
+        #   therefore we use node_pos -1 
+        #   $ therefore we do'nt math.ceil anymore  
+
         return parent_node
     
     @lru_cache()
@@ -2028,18 +2048,18 @@ class COMERST_tokenizer():
     def node_x_reachable_from_node_y(self, nodex, nodey):
         """returns (bool, [sequence showing path from nodex down tre to nodey])
 
-        Args:
-            nodex ([type]): [description]
-            nodey ([type]): [description]
+            Args:
+                nodex ([type]): [description]
+                nodey ([type]): [description]
 
-        Raises:
-            ValueError: [description]
-            NotImplementedError: [description]
-            NotImplementedError: [description]
-            Exception: [description]
+            Raises:
+                ValueError: [description]
+                NotImplementedError: [description]
+                NotImplementedError: [description]
+                Exception: [description]
 
-        Returns:
-            [type]: [description]
+            Returns:
+                [type]: [description]
         """
 
         #Find path by calculating the sequence of Left and Rights between a nodey and node x
@@ -2049,6 +2069,9 @@ class COMERST_tokenizer():
         parent_path = []
         curr_node = nodey
         reachable=True
+
+        if nodex == nodey:
+            return ( True, [] )
 
         while reachable==True and nodex not in parent_path:
         
@@ -3240,4 +3263,4 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=5 python3 train_comerst.py -isv 0.005 -fe 1 -sgbf 1 -isv 0.005 -rmto 1 -at 2 -re hierarchical2 -1wr 0.4 -lwc 0.6 -mlh 20 -mlt 20 -bs 260 -ments 5 -far 1 -agb 1 --gpus 1 --workers 6 --version 6 --precision 16 --mode train_new -lr 5e-5 -me 40 --tag "Map the relations from RST onto the COMET embedding space - using embedding matrix, slp and tanh layer to map, with fixed attention and 'to' removed from comet"
 
 # 101 - New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded
-# CUDA_VISIBLE_DEVICES=2 python3 train_comerst.py -rpet 2 -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 280 -far 0 -agb 1 --gpus 1 --workers 12 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 20 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
+# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -rpet 2 -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 280 -far 0 -agb 1 --gpus 1 --workers 12 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 20 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
