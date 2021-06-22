@@ -613,7 +613,7 @@ def default_collate_pad(batch, pad_values=None):
     elif isinstance(elem, collections.abc.Mapping):
         dict_output = {}
         for key in elem:
-            li_ = [d[key] for d in batch]
+            li_ = [d[key] for d in batch if d[key]!=None]
 
             #it = iter(batch)
             elem_size = len(li_[0])

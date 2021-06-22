@@ -31,6 +31,8 @@ from types import MethodType
 from collections import defaultdict
 import pke
 from pke.data_structures import Candidate, Document
+from timeout_timer import timeout, TimeoutInterrupt
+
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -1285,169 +1287,220 @@ class COMERST_tokenizer():
             # Then need to select information that will make tail
             # If node position numbers are too deep, then need to maybe move them up into higher positions
                 # Allow tree rst position embedding to extend to a larger number. Then put a method in place to clamp the max value
+        try:
+            with timeout(seconds=5):
+                dict_pos_edu = {int(k):v for k,v in dict_pos_edu.items()}
 
-        dict_pos_edu = {int(k):v for k,v in dict_pos_edu.items()}
+                # region prepping rst tree info
+                li_rst_rel = [ rst_node['rel'] for rst_node in li_rst ] 
+                li_rst_pos = [ rst_node['pos'] for rst_node in li_rst ]
+                li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
 
-        # region prepping rst tree info
-        li_rst_rel = [ rst_node['rel'] for rst_node in li_rst ] 
-        li_rst_pos = [ rst_node['pos'] for rst_node in li_rst ]
-        li_rst_ns =  [ rst_node['ns'] for rst_node in li_rst ]
+                    # getting a list of all graph posiitons of edus in li_edus
+                li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
+                li_edu_pos.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
+                #endregion
 
-            # getting a list of all graph posiitons of edus in li_edus
-        li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
-        li_edu_pos.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
-        #endregion
-
-        # region - Selecting a subtree from the  RST tree to focus on
-            
-            # head -> randomly select a span of 3or4 edu nodes at random
-            # tail -> select the following 3 or 4 edu span
-            # rel -> select smallest sub-tree of li_rst that coverse both edus    
-                    # anchor1 = Find parent node for the nodes in the head
-                    # anchor2 = Find parent node for the nodes in the tail                            
-                    #  Find  achor1 parent and check if this is parent for anchor2
-                        # If not then do the same with the grandparent. and repeat
-                    #  Once a n-level parent node is found that connects, this is the ROOT node r 
-                    #  Now retrieve all intermediate parent nodes between ROOT node and each anchor node
-            
-            # remember the input key phrases are shortened text, but the output keyphrase is normal english
-        min_edus_in_chunk = 3
-        edus_in_tail = min_edus_in_chunk
-        count_edus_in_record = len( li_edu_pos )
-
-
-        if self.max_edu_nodes_to_select==-1:
-            max_edu_nodes_to_select_for_head =  count_edus_in_record - edus_in_tail
-        else:
-            max_edu_nodes_to_select_for_head = min(  self.max_edu_nodes_to_select , count_edus_in_record - edus_in_tail )
-
-        li_tailkp_score = []
-        li_headkp_score = []
-        attempts = 0
-        
-        # Extracting list of tailkp and headkp. repeat until adequate keyphrases are selected
-        while len(li_tailkp_score)==0 or len(li_headkp_score)==0:
-
-            if attempts>10:
-                raise ValueError("tail utterance can not be selected that produces a long enough tail text")
-
-            count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
-            start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
-            
-            final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
-            tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
-            
-            #TODO: make sure nodes selected arent too far apart
-            li_edu_pos_for_head = li_edu_pos[ start_edu_node_idx_for_head: final_edu_node_idx_for_head ]
-            li_edu_pos_for_tail = li_edu_pos[  final_edu_node_idx_for_head: tail_node_end_idx ]
-            
-                # reduce the rst tree information
-                    # to only include the smallest subtree of parent nodes that connect the edu nodes
-            all_nodes_included = li_edu_pos[ start_edu_node_idx_for_head: tail_node_end_idx ]
-            li_rst_pos, li_rst_rel, li_rst_ns = self.smallest_spanning_subtree( all_nodes_included, li_rst_pos, li_rst_rel, li_rst_ns  ) 
-            
-            # Extracting keyphrases for  tails 
-                # We sample the top two, then select one at random
-                # NOTE: IDEA During inference we can use beam search to sample multiple key phrases
-            tail_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_tail] )
-            li_tailkp_score = self.key_phrase_extract( tail_text, n_best= 2, shorten=False )
-
-            # Extracting keyphrases for heads
-                # We sample the top three, then select  two at random
-            head_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_head] )
-            li_headkp_score = self.key_phrase_extract( head_text, n_best= 3 ) 
-
-            attempts += 1
-
-        #region encoding tail
-        tail_kp, tail_kpscore = random.choice( li_tailkp_score )
-
-            # Encoded tail information. Adding special tokens
-        tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
-            return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
-        
-        tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
-        tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
-        tail_treepos_ids = tail_ids.new_full( tail_ids.shape , tail_edus_parent_pos )
-        #tail_kp_score = torch.full( tail_ids.shape, tail_kpscore , dtype=torch.float32)
-        #endregion
-
-        # region encoding head
-                # We sample two keyphrases from the 3 best ones
-        li_headkp_score = random.sample( li_headkp_score, k=min(2,len(li_headkp_score)) )
-
-            # encode list of keyphrases and scores that are input to encoder
-            # append edu token to start of each head
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
-                        max_length=self.max_len_head  ) for head, score in li_headkp_score ]
-        head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
-        li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
-        #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
-
-            #flattening and converting to tensor
-        head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
-        li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
-        li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
-        head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
-        #head_kpscores = torch.tensor( sum( li_headkpscores, []), dtype=torch.long)
-
-        #endregion 
-       
-        # region relation : encoded list of rst parent nodes information
-        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel ], dtype=torch.long).squeeze(dim=-1)
-        rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos),MAX_LONG_VALUE), dtype=torch.long )
-        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns ], dtype=torch.long).squeeze(dim=-1)
-        #endregion
-
-        #region attention mask
-            #For rst we require 
-                # 1) bidirectional attention over each keyphrase chunk
-                 # each keyphrase chunk can not attend directly to other keyphrase chunks
-                # 2) all encoder inputs can attend to rst relation tree info
-        
-        attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
-
-            # here we implement the diagonal attention for each sub keyphrase
-            # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
-            # it should also refer to the relations
-        curr_bos_token_pos=0
-        
-        for hids in li_head_ids:
-            len_ids = len(hids)
-            _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
-
-            attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
-                curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
-
-            curr_bos_token_pos += len_ids
-        
-        # Create the 1dimensional mask representing tail attn. We appnd this later
-        attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
-
-        #endregion
-
-        #region position_ids
-            #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
-                # , and the rest of the tokens have position ids in 
-                # the range (2, seq_length - num_pad_tokens). It's implemented like this to
-                #  match the original implementation in fairseq.
-        
-            #for position ids, it restarts from 1 for every new key phrase edu
-            # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
-            # No positional ids for relation section
-
-        position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
-
-        for head in li_head_ids:
-            new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
-            position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
-
-        #endregion
+                # region - Selecting a subtree from the  RST tree to focus on
                     
-        # region labels
-        labels = tail_ids
-        # endregion
-      
+                    # head -> randomly select a span of 3or4 edu nodes at random
+                    # tail -> select the following 3 or 4 edu span
+                    # rel -> select smallest sub-tree of li_rst that coverse both edus    
+                            # anchor1 = Find parent node for the nodes in the head
+                            # anchor2 = Find parent node for the nodes in the tail                            
+                            #  Find  achor1 parent and check if this is parent for anchor2
+                                # If not then do the same with the grandparent. and repeat
+                            #  Once a n-level parent node is found that connects, this is the ROOT node r 
+                            #  Now retrieve all intermediate parent nodes between ROOT node and each anchor node
+                    
+                    # remember the input key phrases are shortened text, but the output keyphrase is normal english
+                min_edus_in_chunk = 3
+                edus_in_tail = min_edus_in_chunk
+                count_edus_in_record = len( li_edu_pos )
+
+
+                if self.max_edu_nodes_to_select==-1:
+                    max_edu_nodes_to_select_for_head =  count_edus_in_record - edus_in_tail
+                else:
+                    max_edu_nodes_to_select_for_head = min(  self.max_edu_nodes_to_select , count_edus_in_record - edus_in_tail )
+
+                li_tailkp_score = []
+                li_headkp_score = []
+                #attempts = 1
+                
+                # Extracting list of tailkp and headkp. repeat until adequate keyphrases are selected
+                #while len(li_tailkp_score)==0 or len(li_headkp_score)==0 and attempts<=5:
+                
+                #for attempt in range(3):
+                count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
+                start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
+                
+                final_edu_node_idx_for_head = start_edu_node_idx_for_head+count_edus_for_head
+                tail_node_end_idx = final_edu_node_idx_for_head + edus_in_tail
+                
+                #TODO: make sure nodes selected arent too far apart
+                li_edu_pos_for_head = li_edu_pos[ start_edu_node_idx_for_head: final_edu_node_idx_for_head ]
+                li_edu_pos_for_tail = li_edu_pos[  final_edu_node_idx_for_head: tail_node_end_idx ]
+                
+                    # reduce the rst tree information
+                        # to only include the smallest subtree of parent nodes that connect the edu nodes
+                all_nodes_included = li_edu_pos[ start_edu_node_idx_for_head: tail_node_end_idx ]
+                li_rst_pos_, li_rst_rel_, li_rst_ns_ = self.smallest_spanning_subtree( all_nodes_included, li_rst_pos, li_rst_rel, li_rst_ns  ) 
+                
+                # Extracting keyphrases for  tails and ehads
+                    # We sample the top two, then select one at random
+                    # NOTE: IDEA During inference we can use beam search to sample multiple key phrases
+                tail_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_tail] )
+                    
+                    # We sample the top three, then select  two at random
+                head_text = ' '.join( [ dict_pos_edu[pos] for pos in li_edu_pos_for_head] )
+                
+                li_tailkp_score = self.key_phrase_extract( tail_text, n_best= 2, shorten=False )
+                li_headkp_score = self.key_phrase_extract( head_text, n_best= 3 ) 
+
+                # Checking non empty kps are returned
+
+                if len(li_tailkp_score)==0 or len(li_headkp_score)==0:
+                    return {
+                        #head
+                        'head_ids': None ,
+                        'head_treepos_ids': None,
+                        #'head_kpscore': head_kpscore,
+
+                        #relation: tree information
+                        'rst_rel_ids': None ,
+                        'rst_treepos_ids': None,
+                        'rst_ns_ids': None,
+
+                        #tail
+                        'tail_ids': None,
+                        'tail_treepos_ids': None ,
+                        #'tail_kp_score':tail_kpscore,
+
+                        'attention_mask_head': None,
+                        'attention_mask_rel': None,
+                        'position_ids_head': None,
+
+                        'labels':None
+                    }
+
+                #region encoding tail
+
+                tail_kp, tail_kpscore = random.choice( li_tailkp_score )
+
+                    # Encoded tail information. Adding special tokens
+                tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+                    return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+                
+                
+
+                tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
+                tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
+                tail_treepos_ids = tail_ids.new_full( tail_ids.shape , tail_edus_parent_pos )
+
+                #tail_kp_score = torch.full( tail_ids.shape, tail_kpscore , dtype=torch.float32)
+                #endregion
+
+                # region encoding head
+                # We sample two keyphrases from the 3 best ones
+
+                li_headkp_score = random.sample( li_headkp_score, k=min(2,len(li_headkp_score)) )
+
+                    # encode list of keyphrases and scores that are input to encoder
+                    # append edu token to start of each head
+                li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
+                                max_length=self.max_len_head  ) for head, score in li_headkp_score ]
+                head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
+                li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
+                #li_head_kpscore =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_kp_score, li_head_ids ) ]
+
+                    #flattening and converting to tensor
+                head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
+                li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
+                li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
+                head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
+                #head_kpscores = torch.tensor( sum( li_headkpscores, []), dtype=torch.long)
+
+                #endregion 
+            
+                # region relation : encoded list of rst parent nodes information
+                rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel_ ], dtype=torch.long).squeeze(dim=-1)[:10]
+                rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos_),MAX_LONG_VALUE), dtype=torch.long )[:10]
+                rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns_], dtype=torch.long).squeeze(dim=-1)[:10]
+                #endregion
+
+                #region attention mask
+                    #For rst we require 
+                        # 1) bidirectional attention over each keyphrase chunk
+                        # each keyphrase chunk can not attend directly to other keyphrase chunks
+                        # 2) all encoder inputs can attend to rst relation tree info
+                
+                attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+
+                    # here we implement the diagonal attention for each sub keyphrase
+                    # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
+                    # it should also refer to the relations
+                curr_bos_token_pos=0
+                
+                for hids in li_head_ids:
+                    len_ids = len(hids)
+                    _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+
+                    attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
+                        curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
+
+                    curr_bos_token_pos += len_ids
+                
+                # Create the 1dimensional mask representing tail attn. We appnd this later
+                attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
+
+                #endregion
+
+                #region position_ids
+                    #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
+                        # , and the rest of the tokens have position ids in 
+                        # the range (2, seq_length - num_pad_tokens). It's implemented like this to
+                        #  match the original implementation in fairseq.
+                
+                    #for position ids, it restarts from 1 for every new key phrase edu
+                    # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
+                    # No positional ids for relation section
+
+                position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
+
+                for head in li_head_ids:
+                    new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
+                    position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
+
+                #endregion
+                            
+                # region labels
+                labels = tail_ids
+                # endregion
+        except TimeoutInterrupt as e:
+            return {
+                #head
+                'head_ids': None ,
+                'head_treepos_ids': None,
+                #'head_kpscore': head_kpscore,
+
+                #relation: tree information
+                'rst_rel_ids': None ,
+                'rst_treepos_ids': None,
+                'rst_ns_ids': None,
+
+                #tail
+                'tail_ids': None,
+                'tail_treepos_ids': None ,
+                #'tail_kp_score':tail_kpscore,
+
+                'attention_mask_head': None,
+                'attention_mask_rel': None,
+                'position_ids_head': None,
+
+                'labels':None
+            }
+
         return {
             #head
             'head_ids': head_ids ,
@@ -1975,7 +2028,8 @@ class COMERST_tokenizer():
             
             elif root_found == True:
                 #find the nodes that
-                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] 
+                                                        for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
                 nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
@@ -2203,6 +2257,7 @@ class TrainingModule(pl.LightningModule):
 
             #restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
+                
                 tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'learning_rate','precision','splits','tag','loss_weight_rst','loss_weight_comet']} )
 
@@ -2585,29 +2640,30 @@ class TrainingModule(pl.LightningModule):
                 li_comet_preds.append(preds)
 
                 # RST Testing
-                batch_rst = batch['rst']
+                    #TODO: update this 
+                # batch_rst = batch['rst']
 
-                preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
-                    generation_kwargs=generation_kwargs )[0]
-                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
-                heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
-                heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
-                heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
+                # preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
+                #     generation_kwargs=generation_kwargs )[0]
+                # heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
+                # heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
+                # heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
+                # heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
                 
 
-                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0)  ).tolist()
+                # rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0)  ).tolist()
 
 
-                rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
-                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
+                # rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
+                # rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
 
-                tails_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
-                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
+                # tails_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
+                # tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
 
-                li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
-                li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
-                li_rst_tails.append( {tail_treepos_ids_rst:tails_rst.strip()} )
-                li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
+                # li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
+                # li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
+                # li_rst_tails.append( {tail_treepos_ids_rst:tails_rst.strip()} )
+                # li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
 
 
             # Adding records from this epoch to files
@@ -2646,38 +2702,38 @@ class TrainingModule(pl.LightningModule):
                     df_comet = df_comet.append(datum_comet, ignore_index=True)
                     df_comet.to_csv( fp_comet, index=False)
 
-                if 'rst' in batch:
-                    fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
-                    # rst - If file for example idx does not exists we add the true observed records
-                    if not os.path.exists(fp_rst):
+                # if 'rst' in batch:
+                #     fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                #     # rst - If file for example idx does not exists we add the true observed records
+                #     if not os.path.exists(fp_rst):
                         
-                        df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                #         df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
                         
-                        head = li_rst_heads[idx]
-                        rels = li_rst_rels[idx]
-                        tail = li_rst_tails[idx]
-                        preds = li_rst_preds[idx]
+                #         head = li_rst_heads[idx]
+                #         rels = li_rst_rels[idx]
+                #         tail = li_rst_tails[idx]
+                #         preds = li_rst_preds[idx]
                                             
-                        datum = { 'epoch': 0,
-                                    'head': head,
-                                    "rels": rels,
-                                    "tail":tail,
-                                    "preds":preds }
+                #         datum = { 'epoch': 0,
+                #                     'head': head,
+                #                     "rels": rels,
+                #                     "tail":tail,
+                #                     "preds":preds }
                     
-                        df_rst = df_rst.append(datum, ignore_index=True)
-                        df_rst.to_csv( fp_rst, index=False)
+                #         df_rst = df_rst.append(datum, ignore_index=True)
+                #         df_rst.to_csv( fp_rst, index=False)
 
-                    # rst - adding to preds
-                    df_rst = pd.read_csv(fp_rst)    
-                    datum_rst = {
-                        'epoch':df_rst['epoch'].max()+1,
-                        'head': '',
-                        'rels':'',
-                        'tail':'',
-                        'preds':li_rst_preds[idx] }
+                #     # rst - adding to preds
+                #     df_rst = pd.read_csv(fp_rst)    
+                #     datum_rst = {
+                #         'epoch':df_rst['epoch'].max()+1,
+                #         'head': '',
+                #         'rels':'',
+                #         'tail':'',
+                #         'preds':li_rst_preds[idx] }
 
-                    df_rst = df_rst.append(datum_rst, ignore_index=True)
-                    df_rst.to_csv( fp_rst, index=False)
+                #     df_rst = df_rst.append(datum_rst, ignore_index=True)
+                #     df_rst.to_csv( fp_rst, index=False)
 
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
@@ -2740,7 +2796,7 @@ class TrainingModule(pl.LightningModule):
         json_keys = ['data_splits']
         
         jparams = {
-            k:ujson.dumps(self.__dict__[k]) for k in keys if k in self.__dict__.keys()
+            k:ujson.dumps(self.__dict__[k]) for k in json_keys if k in self.__dict__.keys()
         }
 
         params = {**params, **jparams}
@@ -2765,8 +2821,8 @@ class DataLoaderGenerator():
         
 
         self.bs = batch_size
-        self.workers_rst = int( workers/2) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
-        self.workers_atomic = int( workers/2) #if workers==0 else max( workers - self.workers_rst, 1 )
+        self.workers_rst = int(  workers/2 ) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
+        self.workers_atomic = int( workers/2 ) #if workers==0 else max( workers - self.workers_rst, 1 )
         self.mode = mode
         self.pad_values = pad_values
         
@@ -2806,21 +2862,25 @@ class DataLoaderGenerator():
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = True
+            pin_memory=True
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
+            pin_memory=False
 
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
             shuffle = False
+            pin_memory=False
 
         elif split_name == 'inference':
             line_starts = [ random.randrange( int(fs*(1-self.splits['test'])), fs) for fs in files_sizes  ]
             line_ends =  files_sizes
             shuffle = False
+            pin_memory=False
 
         li_dsets = [ SingleDataset_rst_v2(_f, self.tokenizer, line_start, line_end) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
@@ -2838,7 +2898,8 @@ class DataLoaderGenerator():
         
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
             shuffle=shuffle, num_workers=self.workers_rst, 
-            collate_fn=lambda batch: utils.default_collate_pad(batch, self.pad_values) )
+            collate_fn=lambda batch: utils.default_collate_pad(batch, self.pad_values),
+            pin_memory=pin_memory, prefetch_factor=1, timeout=30 )
 
         #TODO: change defualt collate to allow padding of elements for batching
         return dataloader
@@ -2889,7 +2950,8 @@ class DataLoaderGenerator():
 
         dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
             shuffle=shuffle, num_workers= self.workers_atomic,
-            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values) )
+            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values),
+            pin_memory=True, prefetch_factor=1, timeout=15 )
         
         return dataloader
 
@@ -3091,24 +3153,6 @@ class SingleDataset_rst_v2(torch.utils.data.Dataset):
 
         return li_rst, dict_pos_edu
     
-    def pos_type_chooser(self, _dict ):
-        # This method chooses which part of speech annotation to choose for the keyphrase
-
-        #_dict = {""pos1"": [[""first thing"", 0.4650969919261783], [""'s"", 0.06980608614764326]], ""pos0"": [[""That's the first thing"", 0.19999999999999993]] } 
-
-        # Criteria for choosing: 
-        #   For both pos options we select the first key_phrase, score couple
-        #   Base on overlap
-        
-        # For Now just take the keyphrase given by pos1
-        # TODO: implement choosing version
-                
-        kp = _dict['pos0'][0][0]
-        kp_score = _dict['pos0'][0][1]
-
-        return [kp, kp_score]
-
-
 class SingleDataset_atomic2020(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
