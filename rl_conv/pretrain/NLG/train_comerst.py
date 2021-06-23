@@ -2641,29 +2641,27 @@ class TrainingModule(pl.LightningModule):
 
                 # RST Testing
                     #TODO: update this 
-                # batch_rst = batch['rst']
-
-                # preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
-                #     generation_kwargs=generation_kwargs )[0]
-                # heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
-                # heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
-                # heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
-                # heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
+                batch_rst = batch['rst']
                 
+                preds = self.model.generate_from_dloaderbatch( batch_rst, comet_or_rst="rst",
+                    generation_kwargs=generation_kwargs )[0]
 
-                # rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0)  ).tolist()
+                heads_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['head_ids'][0],  skip_special_tokens=False ).split('</s><s>') 
+                heads_rst = [ _.strip("<s>").strip("</").strip() for _ in heads_rst ]
+                heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().tolist()[0]
+                heads_treepos_rst = [ key for key, group in groupby(heads_treepos_rst) ]
+                
+                rels_ids_rst = self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( batch_rst['rst_rel_ids'].cpu().squeeze(dim=0)).tolist()
+                rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
+                rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
 
+                tails_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
+                tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
 
-                # rels_treepos_rst = batch_rst['rst_treepos_ids'][0].tolist()
-                # rels_ns_rst = self.model.tokenizer.rst_ns_labeler.inverse_transform(batch_rst['rst_ns_ids'].cpu().squeeze(dim=0)).tolist()
-
-                # tails_rst = self.model.tokenizer.base_tokenizer.decode( batch_rst['tail_ids'][0], skip_special_tokens=True ).strip()
-                # tail_treepos_ids_rst = batch_rst['tail_treepos_ids'].cpu().numpy()[0][0].tolist()
-
-                # li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst)  ] )
-                # li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
-                # li_rst_tails.append( {tail_treepos_ids_rst:tails_rst.strip()} )
-                # li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
+                li_rst_heads.append( [ {pos:head } for pos,head in zip(heads_treepos_rst, heads_rst) ] )
+                li_rst_rels.append( [ {pos:rel} for pos, rel,ns in zip(rels_treepos_rst, rels_ids_rst, rels_ns_rst) ] )
+                li_rst_tails.append( {tail_treepos_ids_rst:tails_rst.strip()} )
+                li_rst_preds.append( {tail_treepos_ids_rst:preds.strip() }  )
 
 
             # Adding records from this epoch to files
@@ -2702,38 +2700,38 @@ class TrainingModule(pl.LightningModule):
                     df_comet = df_comet.append(datum_comet, ignore_index=True)
                     df_comet.to_csv( fp_comet, index=False)
 
-                # if 'rst' in batch:
-                #     fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
-                #     # rst - If file for example idx does not exists we add the true observed records
-                #     if not os.path.exists(fp_rst):
+                if 'rst' in batch:
+                    fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                    # rst - If file for example idx does not exists we add the true observed records
+                    if not os.path.exists(fp_rst):
                         
-                #         df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                        df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
                         
-                #         head = li_rst_heads[idx]
-                #         rels = li_rst_rels[idx]
-                #         tail = li_rst_tails[idx]
-                #         preds = li_rst_preds[idx]
+                        head = li_rst_heads[idx]
+                        rels = li_rst_rels[idx]
+                        tail = li_rst_tails[idx]
+                        preds = li_rst_preds[idx]
                                             
-                #         datum = { 'epoch': 0,
-                #                     'head': head,
-                #                     "rels": rels,
-                #                     "tail":tail,
-                #                     "preds":preds }
+                        datum = { 'epoch': 0,
+                                    'head': head,
+                                    "rels": rels,
+                                    "tail":tail,
+                                    "preds":preds }
                     
-                #         df_rst = df_rst.append(datum, ignore_index=True)
-                #         df_rst.to_csv( fp_rst, index=False)
+                        df_rst = df_rst.append(datum, ignore_index=True)
+                        df_rst.to_csv( fp_rst, index=False)
 
-                #     # rst - adding to preds
-                #     df_rst = pd.read_csv(fp_rst)    
-                #     datum_rst = {
-                #         'epoch':df_rst['epoch'].max()+1,
-                #         'head': '',
-                #         'rels':'',
-                #         'tail':'',
-                #         'preds':li_rst_preds[idx] }
+                    # rst - adding to preds
+                    df_rst = pd.read_csv(fp_rst)    
+                    datum_rst = {
+                        'epoch':df_rst['epoch'].max()+1,
+                        'head': '',
+                        'rels':'',
+                        'tail':'',
+                        'preds':li_rst_preds[idx] }
 
-                #     df_rst = df_rst.append(datum_rst, ignore_index=True)
-                #     df_rst.to_csv( fp_rst, index=False)
+                    df_rst = df_rst.append(datum_rst, ignore_index=True)
+                    df_rst.to_csv( fp_rst, index=False)
 
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
@@ -2933,13 +2931,13 @@ class DataLoaderGenerator():
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
             shuffle = shuffle
             drop_duplicates = False
-            randomize_comet_pronouns = self.randomize_comet_pronouns
+            randomize_comet_pronouns = False
 
         elif split_name == 'inference':
             fn = os.path.join( self.dir_data_atomic2020,"test_v2.csv" )
             shuffle = shuffle
             drop_duplicates = True
-            randomize_comet_pronouns = self.randomize_comet_pronouns
+            randomize_comet_pronouns = False
 
         dset = SingleDataset_atomic2020(fn, self.tokenizer,  drop_duplicates=drop_duplicates )
                 
