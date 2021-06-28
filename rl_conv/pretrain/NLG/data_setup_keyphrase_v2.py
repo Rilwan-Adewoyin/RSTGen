@@ -98,10 +98,12 @@ def main( batch_process_size=20,
             resume_progress=False,
             #subreddit_names = [],
                 #batch du11ducks
-            subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","AskReddit","askscience","AskWomen","asoiaf","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz","DebateReligion","Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive"],
-                
+            #subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","DebateReligion"],
+
                 #batch enigma
             #subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography","pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
+            subreddit_names = ["Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive","AskReddit","askscience","AskWomen","asoiaf","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz"],
+            #subreddit = ["starcraft"],
                 min_rst_len = 6,
             **kwargs):
     """[summary]
@@ -182,7 +184,11 @@ def main( batch_process_size=20,
 
         #region operating in batches
         
+        # pre-filtering all input data based on the actual saved file
+        dset_source = pre_filter(dset_source, subreddit, dir_save_dataset )
+            
         while len(dset_source) > 0 :
+
             
             batch_li_dict_utt =  dset_source.iloc[:batch_process_size].to_dict('records')
             
@@ -197,7 +203,8 @@ def main( batch_process_size=20,
                 batch_li_dict_utt[idx] =  {'rst':rst_, 'txt_preproc':txt_prepoc,
                         'subreddit': srdt } 
 
-            
+
+
             print(f"\n\tOperating on batch {batches_completed[subreddit]+1} of {total_batch_count}")
 
             #region mp.imap EDU and Key Phrase Extraction
@@ -279,19 +286,7 @@ def processing_txt(li_dict_rsttext):
         dict_rsttext = li_dict_rsttext[idx]
         txt_preproc = dict_rsttext['txt_preproc']
 
-        # capitalizing starting letter
-        if not txt_preproc[:1].isupper():
-            txt_preproc = txt_preproc[:1].capitalize() + txt_preproc[1:]
-
-        # removin spaces between punctuation and preceeding word
-        txt_preproc = re.sub(pattern_punctuation_space, r'\1', txt_preproc)
-
-        # Adding correct capitalization to dataset
-        txt_preproc = re.sub(pattern_capitalize_after_punct,               # end of acronym
-             lambda x: x.group().upper(), 
-             txt_preproc)
-
-
+        txt_preproc = format_text(txt_preproc)
         li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
     return li_dict_rsttext
 
@@ -503,7 +498,7 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
             #unlimited batch_siz
             files_ = [ fp for fp in os.listdir(subreddit_dir) if os.path.split(fp)[1] != "lock" ]
             if len(files_)>0:
-                fn = files_[0]
+                fn = sorted( files_, key = lambda fn : int(fn[-10:]))[0]
             else:
                 fn = "0000_0000000000"           
                 with open( os.path.join(subreddit_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
@@ -538,6 +533,57 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
 
         df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
       
+def pre_filter( dset_source, subreddit, dir_save_dataset):
+
+    # After a data source is loaded into memory, check each text preproc
+        # to see if it exists in the preproc file
+        # if it does
+            # replace the rst of that line with a "{'to_remove':to_remove}"
+        # fi it does not
+            #just return dsource
+    
+    subreddit_dir = utils_nlg.get_path( os.path.join(dir_save_dataset,subreddit), _dir=True  )  
+    
+    if not os.path.exists(subreddit_dir):
+        return dset_source
+    
+
+    fns = [ fp for fp in os.listdir(subreddit_dir) if os.path.split(fp)[1] != "lock" ]
+    fn = sorted( fns, key = lambda fn : int(fn[-10:]))[0]
+    dfkp_v2 = pd.read_csv(os.path.join(subreddit_dir,fn) )
+
+    # gettin indices of txt_preproc in dset_source that have already been in processed thorught to keyphrase_v2
+    idxs = [ idx for idx, text_preproc in enumerate( dset_source['txt_preproc'].tolist()) if format_text(text_preproc) in  dfkp_v2['txt_preproc'].tolist() ]
+
+    if len(idxs) > 0 :
+        print(f"{subreddit} contained {len(idxs)} already processed records - Handled")
+        val = ujson.dumps( {'to_be_removed':'to_be_removed'} )
+
+        for idx in idxs:
+            dset_source.iloc[idx]['rst'] = val
+    
+    return dset_source
+
+def format_text(text):
+    
+    # capitalizing starting letter
+    if not text[:1].isupper():
+        text = text[:1].capitalize() + text[1:]
+
+    # removin spaces between punctuation and preceeding word
+    text = re.sub(pattern_punctuation_space, r'\1', text)
+
+    # Adding correct capitalization to dataset
+    text = re.sub(pattern_capitalize_after_punct,               # end of acronym
+            lambda x: x.group().upper(), 
+            text)
+    
+    return text
+
+
+
+
+
 
 class Timer():
     def __init__(self):
@@ -560,7 +606,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=3,
+    parser.add_argument('-bps','--batch_process_size', default=200,
                              help='',type=int)        
    
     parser.add_argument('--mp_count', default=4, type=int)
