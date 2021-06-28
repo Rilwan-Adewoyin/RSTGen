@@ -398,7 +398,9 @@ def prepare_inputs_for_generation(
 
         decoder_inputs_embeds = self.model.shared( decoder_input_ids )
         
+
         self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
+
 
         decoder_inputs_embeds = decoder_inputs_embeds * self.model.decoder.embed_scale
 
@@ -593,7 +595,6 @@ def default_collate_pad(batch, pad_values=None):
 
         return torch.stack(batch, 0, out=out)
 
-
     elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
             and elem_type.__name__ != 'string_':
         if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
@@ -623,8 +624,14 @@ def default_collate_pad(batch, pad_values=None):
                 # it = iter(batch)
                 largest_seq = max( len(elem_) for elem_ in li_ ) 
                 
-                #handling 2d attention mask
-                if li_[0].dim() == 2:
+                
+                if li_[0].dim() == 1:
+                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key,0) ) 
+                    #unstacking
+                    li_ = torch.unbind(padded_li, 0)
+                
+                    #handling 2d attention mask
+                elif li_[0].dim() == 2:
                     
                     for idx in range(len(li_)):
                         elem_ = li_[idx]
@@ -637,14 +644,9 @@ def default_collate_pad(batch, pad_values=None):
                                 mode='constant', value=0.0 )
                             li_[idx] = elem_
                             
-                elif li_[0].dim() == 1:
-                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values[key] ) 
-                    #unstacking
-                    li_ = torch.unbind(padded_li, 0)
+
 
             dict_output[key] = default_collate_pad( li_, pad_values )    
-
-        #dict_output =  {key: default_collate_pad([d[key] for d in batch], pad_values) for key in elem }
         return dict_output
 
     elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
