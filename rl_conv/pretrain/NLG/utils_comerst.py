@@ -627,7 +627,7 @@ def default_collate_pad(batch, pad_values=None):
                 
                 
                 if li_[0].dim() == 1:
-                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key,0) ) 
+                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key) ) 
                     #unstacking
                     li_ = torch.unbind(padded_li, 0)
                 

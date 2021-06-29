@@ -400,6 +400,7 @@ class COMERST(nn.Module):
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
+            #self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=0.0001)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.rst_rel_li ) + 1
@@ -508,7 +509,10 @@ class COMERST(nn.Module):
                         
                         'labels': self.loss_fct.ignore_index,
 
-                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx  
+                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx,
+
+                        'li_edu_pos_for_head':0,
+                        'li_edu_pos_for_tail':0
                         }
         
         if self.relation_embedding == 'flattened':
@@ -1148,7 +1152,8 @@ class COMERST_tokenizer():
             # Encoded tail information. Adding special tokens
         if tailkp_score != None:
             tail_kp, tail_score = tailkp_score
-            tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+
+            tail_ids = self.base_tokenizer.encode( +" "+tail_kp, add_prefix_space=True, 
                 return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
             
 
@@ -1894,6 +1899,10 @@ class COMERST_tokenizer():
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
             Then slice li_rst_pos, li_rst_rel, li_rst_ns to reflect this reduced tree
         """
+        
+        if len(li_edupos)==1:
+            return li_edupos[0]
+
         smallest_edu_pos = min( li_edupos )
 
         # finding root node
