@@ -396,10 +396,8 @@ def prepare_inputs_for_generation(
         
         tti  = kwargs['tail_treepos_ids']
 
-        decoder_inputs_embeds = self.model.shared( decoder_input_ids )
-        
-
-        self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
+        decoder_inputs_embeds = self.model.shared( decoder_input_ids ) + \
+            self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
 
 
         decoder_inputs_embeds = decoder_inputs_embeds * self.model.decoder.embed_scale
@@ -617,7 +615,10 @@ def default_collate_pad(batch, pad_values=None):
             li_ = [d[key] for d in batch if d[key]!=None]
 
             #it = iter(batch)
-            elem_size = len(li_[0])
+            if len(li_)>0:
+                elem_size = len(li_[0])
+            else:
+                elem_size = 0
 
             if not all(len(elem_) == elem_size for elem_ in li_):
                 # raise RuntimeError('each element in list of batch should be of equal size')
