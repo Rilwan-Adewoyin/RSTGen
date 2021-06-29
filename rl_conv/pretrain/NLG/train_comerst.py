@@ -22,6 +22,7 @@ from transformers import get_cosine_schedule_with_warmup
 from pytorch_lightning.trainer.supporters import CombinedLoader
 from pytorch_lightning.utilities.distributed import _get_rank
 from transformers.modeling_outputs import Seq2SeqLMOutput
+from transformers.models.bart.modeling_bart import shift_tokens_right
 from sklearn.utils import shuffle as skl_shuffle
 from itertools import islice
 import math
@@ -441,32 +442,6 @@ class COMERST(nn.Module):
             utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
         
         #endregion
-
-        # region embedding layer normalization
-        mapping = {"word":self.transformer.model.shared,
-        
-            "pe":self.transformer.model.encoder.embed_positions ,
-            "pd":self.transformer.model.decoder.embed_positions ,
-
-            "r_pos": self.embedding_rst_pos ,
-            "r_ns": self.embedding_rst_ns,
-            
-            }
-        if self.relation_embedding == 'flattened':
-            mapping['rels'] = self.embedding_rels
-
-        elif self.relation_embedding == 'hierarchical1':
-            mapping["rels_h1"] = self.embedding_rels_rst
-
-        elif self.relation_embedding == 'hierarchical2':
-            mapping["rels_h2"] = self.embedding_rels_rst[0]
-
-        for key, val in dict_embed_mnorms.items():
-            mapping[key].max_norm = val
-
-        del mapping
-            
-        #end region
 
         self.loss_fct = CrossEntropyLoss()
 
@@ -895,7 +870,7 @@ class COMERST(nn.Module):
                             
                             tailkp_score,
                             li_edu_pos_for_tail )
-        
+                
         for key in encoded:
             encoded[key] = torch.unsqueeze( encoded[key], 0 )
         
@@ -904,7 +879,6 @@ class COMERST(nn.Module):
                                     device=device, generation_kwargs=generation_kwargs )
         
         return tail_predictions
-
 
     def chunks(self, lst, n):
         """Yield successive n-sized chunks from lst."""
@@ -1115,7 +1089,7 @@ class COMERST_tokenizer():
                             li_rst_pos_,
 
                             tailkp_score=None,
-                            li_edu_pos_for_tail=None,
+                            li_edu_pos_for_tail=None
                             ):
         
         if li_headkp_score == None:
@@ -1149,18 +1123,18 @@ class COMERST_tokenizer():
         encoded = {}
         #region encoding tail
 
-            # Encoded tail information. Adding special tokens
+            # Encoded tail information.
         if tailkp_score != None:
             tail_kp, tail_score = tailkp_score
-
-            tail_ids = self.base_tokenizer.encode( +" "+tail_kp, add_prefix_space=True, 
-                return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
             
+            labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+                return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+            tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2)
 
             tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
             encoded['tail_ids'] = tail_ids
             encoded['tail_kpscore'] = tail_kpscore
-            encoded['labels'] = tail_ids
+            encoded['labels'] = labels
                     
         else:
             tail_ids = None
@@ -1277,8 +1251,9 @@ class COMERST_tokenizer():
         rels_ids = torch.tensor( self.atomic_rel_labeler.transform( [rel] ), dtype=torch.long )
         rels_ids = rels_ids
 
-        #tail_ids = self.base_tokenizer.encode( self.token_edu + " " + tail + " " + self.token_eos , add_prefix_space=False, return_tensor='pt')
-        tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
+        labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
+        tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2 )
+        
         #endregion 
 
         #region treepos_ids
@@ -1310,11 +1285,10 @@ class COMERST_tokenizer():
         #attention_mask[ -rels_ids.shape[-1]:,  : head_ids.shape[-1]]  = _
         #endregion
 
-        #region position_ids
+        #region position_ids and labels
         position_ids_head = new_ids = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
 
-        #region labels
-        labels = tail_ids
+        
         #endregion
 
         return {
@@ -1652,7 +1626,7 @@ class COMERST_tokenizer():
         pronoun = random.choice( [ pron for pron in self.personal_pronouns if pron not in exclude_vals ] )
         return pronoun
 
-# endregion
+
 
     def rst_split_into_hrt(self, li_rst, dict_pos_edu):
 
@@ -1899,7 +1873,6 @@ class COMERST_tokenizer():
         """Given a list of edukp_pos, find the smallest spanning subtree that connects these edukp
             Then slice li_rst_pos, li_rst_rel, li_rst_ns to reflect this reduced tree
         """
-        
         if len(li_edupos)==1:
             return li_edupos[0]
 
@@ -1989,7 +1962,8 @@ class COMERST_tokenizer():
 
         
         return reachable, parent_path
-        
+
+# endregion        
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
