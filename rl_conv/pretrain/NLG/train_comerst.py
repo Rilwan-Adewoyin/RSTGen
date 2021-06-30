@@ -253,7 +253,7 @@ class EmbeddingRstPos(nn.Module):
 
     def forward(self, x ):
         while x.max() >= self.max_rst_index:
-            x = torch.where( x<self.max_rst_index, x, torch.ceil( (x-2)/2 ).long() )
+            x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
    
 
         x = self.fixed_rst_encoding(x)
@@ -625,7 +625,7 @@ class COMERST(nn.Module):
             inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) 
 
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
@@ -1120,114 +1120,144 @@ class COMERST_tokenizer():
                 'li_edu_pos_for_tail':None,
             }
 
-        encoded = {}
-        #region encoding tail
+        try:
+            with timeout(seconds=5):        
+                encoded = {}
+                #region encoding tail
 
-            # Encoded tail information.
-        if tailkp_score != None:
-            tail_kp, tail_score = tailkp_score
-            
-            labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
-                return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
-            tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2)
-
-            tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
-            encoded['tail_ids'] = tail_ids
-            encoded['tail_kpscore'] = tail_kpscore
-            encoded['labels'] = labels
+                    # Encoded tail information.
+                if tailkp_score != None:
+                    tail_kp, tail_score = tailkp_score
                     
-        else:
-            tail_ids = None
-            tail_kpscore = None
+                    labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+                        return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+                    tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2).squeeze(0)
 
-        tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
-        tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
-        _shape = tail_ids.shape if tailkp_score!= None else [1]
-        #tail_treepos_ids = tail_ids.new_full( _shape , tail_edus_parent_pos )
-        tail_treepos_ids = torch.full(_shape, tail_edus_parent_pos, dtype=torch.long)
+                    tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
+                    encoded['tail_ids'] = tail_ids
+                    encoded['tail_kpscore'] = tail_kpscore
+                    encoded['labels'] = labels
+                            
+                else:
+                    tail_ids = None
+                    tail_kpscore = None
+
+                tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
+                tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
+                _shape = tail_ids.shape if tailkp_score!= None else [1]
+                tail_treepos_ids = torch.full(_shape, tail_edus_parent_pos, dtype=torch.long)
+                
+                encoded['tail_treepos_ids'] = tail_treepos_ids
+                #endregion
+
+                # region encoding head
+                    # encode list of keyphrases and scores that are input to encoder
+                li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
+                                max_length=self.max_len_head  ) for head, score in li_headkp_score ]
+                head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
+                li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
+                li_headkpscore = [ score for head, score in li_headkp_score ]
+                li_headkpscores =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_headkpscore, li_head_ids ) ]
+
+                    #flattening and converting to tensor
+                head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
+                li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
+                li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
+                head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
+                head_kpscores = torch.tensor( sum( li_headkpscores, []) )
+
+                encoded['head_ids'] = head_ids
+                encoded['head_treepos_ids'] = head_treepos_ids
+                encoded['head_kpscores'] = head_kpscores
+                #endregion 
+            
+                # region relation : encoded list of rst parent nodes information
+                rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel_ ], dtype=torch.long).squeeze(dim=-1)[:10]
+                rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos_),MAX_LONG_VALUE), dtype=torch.long )[:10]
+                rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns_], dtype=torch.long).squeeze(dim=-1)[:10]
+                encoded['rst_rel_ids']= rst_rel_ids
+                encoded['rst_treepos_ids']=rst_treepos_ids
+                encoded['rst_ns_ids']=rst_ns_ids
+                #endregion
+
+                #region attention mask
+                    #For rst we require 
+                        # 1) bidirectional attention over each keyphrase chunk
+                        # each keyphrase chunk can not attend directly to other keyphrase chunks
+                        # 2) all encoder inputs can attend to rst relation tree info
+                
+                attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+
+                    # here we implement the diagonal attention for each sub keyphrase
+                    # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
+                    # it should also refer to the relations
+                curr_bos_token_pos=0
+                
+                for hids in li_head_ids:
+                    len_ids = len(hids)
+                    _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+
+                    attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
+                        curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
+
+                    curr_bos_token_pos += len_ids
+                
+                # Create the 1dimensional mask representing tail attn. We appnd this later
+                attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
+                encoded['attention_mask_head']=attention_mask_head
+                encoded['attention_mask_rel']= attention_mask_rel
+                
+                #endregion
+
+                #region position_ids
+                    #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
+                        # , and the rest of the tokens have position ids in 
+                        # the range (2, seq_length - num_pad_tokens). It's implemented like this to
+                        #  match the original implementation in fairseq.
+                
+                    #for position ids, it restarts from 1 for every new key phrase edu
+                    # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
+                    # No positional ids for relation section
+
+                position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
+
+                for head in li_head_ids:
+                    new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
+                    position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
+                encoded['position_ids_head']= position_ids_head
+                #endregion      
+                
+                encoded['li_edu_pos_for_head']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_head), max=MAX_LONG_VALUE ), dtype=torch.long)
+                encoded['li_edu_pos_for_tail']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_tail), max=MAX_LONG_VALUE), dtype=torch.long)
         
-        encoded['tail_treepos_ids'] = tail_treepos_ids
-        #endregion
+        except TimeoutInterrupt as e:
+            return {
+                #head
+                'head_ids': None ,
+                'head_treepos_ids': None,
+                'head_kpscores': None,
 
-        # region encoding head
-            # encode list of keyphrases and scores that are input to encoder
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
-                        max_length=self.max_len_head  ) for head, score in li_headkp_score ]
-        head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
-        li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
-        li_headkpscore = [ score for head, score in li_headkp_score ]
-        li_headkpscores =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_headkpscore, li_head_ids ) ]
+                #relation: tree information
+                'rst_rel_ids': None ,
+                'rst_treepos_ids': None,
+                'rst_ns_ids': None,
 
-            #flattening and converting to tensor
-        head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
-        li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
-        li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
-        head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
-        head_kpscores = torch.tensor( sum( li_headkpscores, []) )
+                #tail
+                'tail_ids': None,
+                'tail_treepos_ids': None ,
+                'tail_kpscore':None,
 
-        encoded['head_ids'] = head_ids
-        encoded['head_treepos_ids'] = head_treepos_ids
-        encoded['head_kpscores'] = head_kpscores
-        #endregion 
-    
-        # region relation : encoded list of rst parent nodes information
-        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel_ ], dtype=torch.long).squeeze(dim=-1)[:10]
-        rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos_),MAX_LONG_VALUE), dtype=torch.long )[:10]
-        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns_], dtype=torch.long).squeeze(dim=-1)[:10]
-        encoded['rst_rel_ids']= rst_rel_ids
-        encoded['rst_treepos_ids']=rst_treepos_ids
-        encoded['rst_ns_ids']=rst_ns_ids
-        #endregion
+                'attention_mask_head': None,
+                'attention_mask_rel': None,
+                'position_ids_head': None,
 
-        #region attention mask
-            #For rst we require 
-                # 1) bidirectional attention over each keyphrase chunk
-                # each keyphrase chunk can not attend directly to other keyphrase chunks
-                # 2) all encoder inputs can attend to rst relation tree info
-        
-        attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+                'labels':None,
 
-            # here we implement the diagonal attention for each sub keyphrase
-            # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
-            # it should also refer to the relations
-        curr_bos_token_pos=0
-        
-        for hids in li_head_ids:
-            len_ids = len(hids)
-            _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+                #vars used during inference,
+                'li_edu_pos_for_head':None,
+                'li_edu_pos_for_tail':None,
+            }
 
-            attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
-                curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
-
-            curr_bos_token_pos += len_ids
-        
-        # Create the 1dimensional mask representing tail attn. We appnd this later
-        attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
-        encoded['attention_mask_head']=attention_mask_head
-        encoded['attention_mask_rel']= attention_mask_rel
-        
-        #endregion
-
-        #region position_ids
-            #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
-                # , and the rest of the tokens have position ids in 
-                # the range (2, seq_length - num_pad_tokens). It's implemented like this to
-                #  match the original implementation in fairseq.
-        
-            #for position ids, it restarts from 1 for every new key phrase edu
-            # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
-            # No positional ids for relation section
-
-        position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
-
-        for head in li_head_ids:
-            new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
-            position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
-        encoded['position_ids_head']= position_ids_head
-        #endregion      
-         
-        encoded['li_edu_pos_for_head']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_head), max=MAX_LONG_VALUE ), dtype=torch.long)
-        encoded['li_edu_pos_for_tail']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_tail), max=MAX_LONG_VALUE), dtype=torch.long)
         return encoded
 
     def tokenize_comet( self, head, rel, tail  ):
@@ -1252,7 +1282,7 @@ class COMERST_tokenizer():
         rels_ids = rels_ids
 
         labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
-        tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2 )
+        tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2 ).squeeze(0)
         
         #endregion 
 
@@ -1674,12 +1704,7 @@ class COMERST_tokenizer():
 
                 li_tailkp_score = []
                 li_headkp_score = []
-                #attempts = 1
-                
-                # Extracting list of tailkp and headkp. repeat until adequate keyphrases are selected
-                #while len(li_tailkp_score)==0 or len(li_headkp_score)==0 and attempts<=5:
-                
-                #for attempt in range(3):
+                                
                 count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
                 start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
                 
@@ -1883,7 +1908,7 @@ class COMERST_tokenizer():
         root_found = False
         candidiate_root_node = self.parent_node_pos(smallest_edu_pos)
 
-        while root_found==False:
+        while root_found==False and candidiate_root_node>=0:
             root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edupos )
             
             if root_found == False:
@@ -1964,6 +1989,7 @@ class COMERST_tokenizer():
         return reachable, parent_path
 
 # endregion        
+
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
@@ -2168,9 +2194,9 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',
                         accelerator=accelerator,
-                        limit_train_batches =10,
-                        limit_val_batches = 5,
-                        #val_check_interval=0.3,
+                        # limit_train_batches =10,
+                        # limit_val_batches = 5,
+                        val_check_interval=0.3,
                         num_sanity_val_steps=0, 
                         #overfit_batches=25,
                         #reload_dataloaders_every_epoch=True,
@@ -2834,8 +2860,6 @@ class SingleDataset_rst(torch.utils.data.Dataset):
             self.valid_dset = True
             # filtering out long lines
             self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 225 ) & (~ self.data['li_edus'].isnull()) ]
-
-            # only select columns that have at least two non null phrases in li_edus
 
             
         else:
