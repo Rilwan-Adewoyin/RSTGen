@@ -239,6 +239,19 @@ def main( batch_process_size=20,
             # format = subreddit/convo_code
             if len(batch_li_dict_utt) > 0:
                 _save_data(batch_li_dict_utt, dir_save_dataset, batches_completed[subreddit], batch_process_size )
+            else:
+                new_record = { 'batch_process_size':batch_process_size, 'last_batch':batches_completed[subreddit] }
+                if os.path.exists( os.path.join(dir_save_dataset,'last_batch_record') ):
+                    df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+                else:
+                    df_records = pd.DataFrame( columns=['last_batch','batch_process_size'] )
+                    df_records.index.names = ['subreddit']
+
+                #df_records = df_records.append(new_record, ignore_index=True)
+                for k,v in new_record.items():
+                    df_records.loc[ subreddit, [k] ] =  v
+
+                df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
 
             dset_source = dset_source[batch_process_size:]
             batches_completed[subreddit] += 1
