@@ -2160,12 +2160,16 @@ class TrainingModule(pl.LightningModule):
         
         # Creating Callbacks
         callbacks = []        
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+        # checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+        #     mode='min', dirpath=dir_checkpoints, 
+        #     filename='{epoch:03d}_{val_loss:.5f}')
+        #NOTE: debugging
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=0, 
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
         
+        
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model, checkpoint_callback) #monkey patch
-        #checkpoint_callback._monitor_candidates = types.MethodType(utils._monitor_candidates, checkpoint_callback) # monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
@@ -3079,6 +3083,8 @@ def main(tparams={}, mparams={}):
                     name = mparams['model_name'],
                     version = tparams['version'] )
     tparams['version'] =  tb_logger.version
+    #NOTE: debugging
+    tb_logger = None
     
     tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
     
