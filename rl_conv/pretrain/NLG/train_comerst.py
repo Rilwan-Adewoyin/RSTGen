@@ -13,7 +13,6 @@ import os
 import json
 import torch
 import argparse
-from torch._C import Value
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Tuple
@@ -311,7 +310,7 @@ class COMERST(nn.Module):
     def __init__(self, 
                     base_model_name='bart_base', model_name="COMERST",
                     scale_grad_by_freq=False,
-                    max_len_head=20,
+                    max_len_head=80,
                     max_len_tail=20,
                     max_edu_nodes_to_select=-1,
                     filter_atomic_rels=False,
@@ -354,6 +353,7 @@ class COMERST(nn.Module):
         if self.rst_pos_embed_type == 1:
             self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
                                     padding_idx=(2*self.tokenizer.rst_pos_maxidx+2)+1 , scale_grad_by_freq=self.scale_grad_by_freq )
+            #self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.001)
 
         elif self.rst_pos_embed_type == 2:
             
@@ -365,6 +365,7 @@ class COMERST(nn.Module):
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
+        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.001)
 
         # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005
@@ -431,15 +432,15 @@ class COMERST(nn.Module):
 
         #TODO: freezing weights
         if self.freeze_embeds:
-            utils.freeze_params( self.transformer.model.shared)
+            utils.freeze_params(self.transformer.model.shared)
             utils.freeze_params( self.transformer.lm_head )
 
             for d in [self.transformer.model.encoder, self.transformer.model.decoder]:
                 utils.freeze_params(d.embed_positions)
                 utils.freeze_params(d.embed_tokens)
             
-            utils.freeze_params( self.transformer.model.decoder.layers )
-            utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
+            # utils.freeze_params( self.transformer.model.decoder.layers )
+            # utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
         
         #endregion
 
@@ -463,13 +464,13 @@ class COMERST(nn.Module):
 
         self.generate = self.transformer.generate
         self.config = self.transformer.config
+        #self.config.force_bos_token_to_be_generated = True
         self.get_encoder = self.transformer.get_encoder
         self.get_decoder = self.transformer.get_decoder
 
         self.pad_values = {'head_ids':self.transformer.model.shared.padding_idx , 
                         'head_treepos_ids':self.embedding_rst_pos.padding_idx, 
                         'head_kpscores':0.0,
-
                         
                         'rst_treepos_ids': self.embedding_rst_pos.padding_idx,
                         'rst_ns_ids': self.embedding_rst_ns.padding_idx, 
@@ -484,7 +485,8 @@ class COMERST(nn.Module):
                         
                         'labels': self.loss_fct.ignore_index,
 
-                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx,
+                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
+                                        self.transformer.model.encoder.embed_positions.padding_idx else 0, 
 
                         'li_edu_pos_for_head':0,
                         'li_edu_pos_for_tail':0
@@ -498,6 +500,8 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical2":
             self.pad_values['rst_rel_ids'] = self.embedding_rels_rst[0].padding_idx
+
+
 
 
     def forward(self, input_, return_dict=None):
@@ -533,13 +537,22 @@ class COMERST(nn.Module):
             #the labels are automatically aligned as per the GPT2 code
             #TODO: reevaluate whether bos or eos is the best method to use as start of output
                 # right now we use the edu token to start sentences. The EDU token is just the bos token
+            
             shift_logits_comet = lm_logits_comet[..., :-1, :].contiguous()
             shift_labels_comet = labels_comet[..., 1:].contiguous() 
+
+            # shift_logits_comet = lm_logits_comet.contiguous()
+            # shift_labels_comet = labels_comet.contiguous()
+
             lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
 
         if  labels_rst is not None:
             shift_logits_rst = lm_logits_rst[..., :-1, :].contiguous()
             shift_labels_rst = labels_rst[..., 1:].contiguous() 
+
+            # shift_logits_rst = lm_logits_rst.contiguous()
+            # shift_labels_rst = labels_rst.contiguous()
+
             lm_loss_rst = self.loss_fct(shift_logits_rst.view(-1, self.transformer.config.vocab_size), shift_labels_rst.view(-1))
         #endregion
 
@@ -591,7 +604,7 @@ class COMERST(nn.Module):
     def forward_embed_rst(self,  
                             head_ids,
                             head_treepos_ids,
-                            head_kpscores,
+                            #head_kpscores,
                             rst_rel_ids,
                             rst_treepos_ids,
                             rst_ns_ids,
@@ -600,7 +613,7 @@ class COMERST(nn.Module):
                             attention_mask_rel, 
                             position_ids_head,
                             tail_ids=None,
-                            tail_kpscore=None,
+                            #tail_kpscore=None,
                             labels = None,
                             **kwargs
                             ):
@@ -625,7 +638,7 @@ class COMERST(nn.Module):
             inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) 
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
 
         inputs_embed_rel += self.embedding_rst_pos( rst_treepos_ids )
         inputs_embed_rel += self.embedding_rst_ns( rst_ns_ids )
@@ -643,7 +656,7 @@ class COMERST(nn.Module):
         if self.attention_type == 1:
             attention_mask[:, -attention_mask_rel.shape[1]:, :] = 1 
 
-        elif self.attention_type == 2:
+        elif self.attention_type==2:
             attention_mask[  : , -attention_mask_rel.shape[1]: , -attention_mask_rel.shape[1]: ] = 1
         # endregion
 
@@ -825,7 +838,7 @@ class COMERST(nn.Module):
             _ = input_.pop('labels',None)
             _ = input_.pop('decoder_inputs_embeds',None)
 
-            # inserting decoder_input_ids
+            #inserting decoder_input_ids
             decoder_start_token_id = self.config.eos_token_id
             bos_token_id = self.config.bos_token_id
             decoder_start_token_id = self.transformer._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
@@ -834,6 +847,7 @@ class COMERST(nn.Module):
                 torch.ones(( input_['inputs_embeds'].shape[0], 1), dtype=torch.long, device=input_['inputs_embeds'].device) * decoder_start_token_id
                 )
             input_['decoder_input_ids'] = decoder_input_ids
+
 
             summaries = self.transformer.generate(
                 decoder_start_token_id=decoder_start_token_id,
@@ -1129,9 +1143,12 @@ class COMERST_tokenizer():
                 if tailkp_score != None:
                     tail_kp, tail_score = tailkp_score
                     
-                    labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
-                        return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
-                    tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2).squeeze(0)
+                    # labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+                    #     return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+                    #tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2).squeeze(0)
+
+                    tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze(0)
+                    labels = tail_ids.squeeze(0)
 
                     tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
                     encoded['tail_ids'] = tail_ids
@@ -1281,8 +1298,11 @@ class COMERST_tokenizer():
         rels_ids = torch.tensor( self.atomic_rel_labeler.transform( [rel] ), dtype=torch.long )
         rels_ids = rels_ids
 
-        labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
-        tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2 ).squeeze(0)
+        # labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
+        # tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2 ).squeeze(0)
+        
+        tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze(0)
+        labels = tail_ids
         
         #endregion 
 
@@ -2068,7 +2088,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--max_epochs', default=28, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-s','--batch_size', default=100, type=int)
-        parser.add_argument('-l','--learning_rate', default=5e-4, type=float)
+        parser.add_argument('-l','--learning_rate', default=5e-5, type=float)
         parser.add_argument('--warmup_proportion', default=0.25)
         parser.add_argument('--workers', default=12, type=int) 
         parser.add_argument('--gpus', default=1, type=int)
@@ -2194,10 +2214,10 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',
                         accelerator=accelerator,
-                        # limit_train_batches =10,
-                        # limit_val_batches = 5,
-                        val_check_interval=0.3,
-                        num_sanity_val_steps=0, 
+                        limit_train_batches =20,
+                        limit_val_batches = 5,
+                        #val_check_interval=0.3,
+                        #num_sanity_val_steps=0, 
                         #overfit_batches=25,
                         #reload_dataloaders_every_epoch=True,
                         reload_dataloaders_every_epoch=False,
@@ -2217,10 +2237,9 @@ class TrainingModule(pl.LightningModule):
                     callbacks=callbacks,
                     #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
-                    #limit_train_batches = 0.4,
-                    #val_check_interval=0.5,
-                    #limit_val_batches = ,
-                    val_check_interval=0.3,
+                        limit_train_batches =20,
+                        limit_val_batches = 5,
+                    #val_check_interval=0.3,
                     num_sanity_val_steps=0,
                     #track_grad_norm = True,
                     #overfit_batches=5
@@ -2453,7 +2472,7 @@ class TrainingModule(pl.LightningModule):
             
             generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
                                 'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                'num_return_sequences':1,
                                 'min_length':3, 'max_length':20 }
                     
                     # At end of validation loop produce some quantitative examples of model's performance
