@@ -439,8 +439,8 @@ class COMERST(nn.Module):
                 utils.freeze_params(d.embed_positions)
                 utils.freeze_params(d.embed_tokens)
             
-            # utils.freeze_params( self.transformer.model.decoder.layers )
-            # utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
+            utils.freeze_params( self.transformer.model.decoder.layers )
+            utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
         
         #endregion
 
@@ -842,7 +842,6 @@ class COMERST(nn.Module):
             decoder_start_token_id = self.config.eos_token_id
             bos_token_id = self.config.bos_token_id
             decoder_start_token_id = self.transformer._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
-
             decoder_input_ids = (
                 torch.ones(( input_['inputs_embeds'].shape[0], 1), dtype=torch.long, device=input_['inputs_embeds'].device) * decoder_start_token_id
                 )
@@ -1676,8 +1675,6 @@ class COMERST_tokenizer():
         pronoun = random.choice( [ pron for pron in self.personal_pronouns if pron not in exclude_vals ] )
         return pronoun
 
-
-
     def rst_split_into_hrt(self, li_rst, dict_pos_edu):
 
         # - at first we will only train with one other chunk. so one to one.
@@ -1828,7 +1825,7 @@ class COMERST_tokenizer():
 
     def rst_pos_bounding(self, rst_pos):
 
-        rst_pos = torch.where( rst_pos>self.tokenizer.rst_pos_maxidx, torch.ceil( (rst_pos-2)/2 ).long()  ,rst_pos )
+        rst_pos = torch.where( rst_pos>self.tokenizer.rst_pos_maxidx, torch.ceil( (rst_pos-2)/2 ).long(), rst_pos )
 
         return rst_pos
 
@@ -1892,8 +1889,7 @@ class COMERST_tokenizer():
             
             elif root_found == True:
                 #find the nodes that
-                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] 
-                                                        for pos in li_edu_pos   ]
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
                 nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
@@ -1965,7 +1961,7 @@ class COMERST_tokenizer():
         
         return val
 
-    @lru_cache(maxsize=4000)
+    @lru_cache(maxsize=None)
     def node_x_reachable_from_node_y(self, nodex, nodey):
         """returns (bool, [sequence showing path from nodex down tre to nodey])
 
@@ -2036,6 +2032,7 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.model = COMERST( **model_params )
+        #self.model.requires_grad_(False)
         self.randomize_comet_pronouns = randomize_comet_pronouns
         self.model.tokenizer.randomize_comet_pronouns = self.randomize_comet_pronouns
         self.remove_to = remove_to
@@ -2088,7 +2085,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--max_epochs', default=28, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-s','--batch_size', default=100, type=int)
-        parser.add_argument('-l','--learning_rate', default=5e-5, type=float)
+        parser.add_argument('-l','--learning_rate', default=1e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.25)
         parser.add_argument('--workers', default=12, type=int) 
         parser.add_argument('--gpus', default=1, type=int)
@@ -2219,9 +2216,9 @@ class TrainingModule(pl.LightningModule):
                         #val_check_interval=0.3,
                         #num_sanity_val_steps=0, 
                         #overfit_batches=25,
-                        #reload_dataloaders_every_epoch=True,
-                        reload_dataloaders_every_epoch=False,
+                        reload_dataloaders_every_epoch=True,
                         multiple_trainloader_mode='max_size_cycle'
+                        #,gradient_clip_val=0.00001, gradient_clip_algorithm='value'
                         )
 
         elif tparams['mode'] in ["train_cont","inference"]:
@@ -2423,7 +2420,7 @@ class TrainingModule(pl.LightningModule):
         output = {}
         if step_name == 'train':
             output["loss"] = loss
-
+            
         else:       
             self.log( loss_key, loss)
             output[ loss_key ]=loss
@@ -2472,7 +2469,7 @@ class TrainingModule(pl.LightningModule):
             
             generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
                                 'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1,
+                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
                                 'min_length':3, 'max_length':20 }
                     
                     # At end of validation loop produce some quantitative examples of model's performance
@@ -2520,7 +2517,7 @@ class TrainingModule(pl.LightningModule):
                     batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
                     batch_rst_heads = [ [ _.strip("<s>").strip("</").strip() for _ in heads_rst ] for heads_rst in batch_rst_heads ]
                     
-                    batch_heads_treepos_rst =  batch_rst['head_treepos_ids'].cpu().numpy().tolist()
+                    batch_heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().numpy().tolist()
                     batch_heads_treepos_rst = [ [ key for key, group in groupby(treepos) ] for treepos in batch_heads_treepos_rst ]
                     
                     batch_edu_pos_for_head = batch_rst.get('li_edu_pos_for_head',None).cpu().numpy().tolist()
@@ -2531,7 +2528,7 @@ class TrainingModule(pl.LightningModule):
                     batch_ns_rst = [ [ns for ns in rst_ns_ids if ns<len(self.model.tokenizer.rst_ns_labeler.classes_)  ] for rst_ns_ids in batch_rst['rst_ns_ids'].tolist() ]
                     batch_rels_ns_rst = [ self.model.tokenizer.rst_ns_labeler.inverse_transform( rst_ns_id ).tolist() for rst_ns_id in batch_ns_rst ]
 
-                    batch_tails_rst = [ self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
+                    batch_tails_rst = [self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
                     
                     batch_edu_pos_for_tail = batch_rst.get('li_edu_pos_for_tail',None).cpu().numpy().tolist()
                             
@@ -2654,7 +2651,7 @@ class TrainingModule(pl.LightningModule):
     def configure_optimizers(self):
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        
+                
         warmup_steps = int( self.warmup_proportion*self.total_steps() )
 
         lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
@@ -2703,8 +2700,8 @@ class DataLoaderGenerator():
         
 
         self.bs = batch_size
-        self.workers_rst = int(  workers/2 ) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
-        self.workers_atomic = int( workers/2 ) #if workers==0 else max( workers - self.workers_rst, 1 )
+        self.workers_rst = int( workers/2) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
+        self.workers_atomic = int( workers/2) #if workers==0 else max( workers - self.workers_rst, 1 )
         self.mode = mode
         self.pad_values = pad_values
         
@@ -2744,25 +2741,21 @@ class DataLoaderGenerator():
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = True
-            pin_memory=True
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
-            pin_memory=False
 
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
             shuffle = False
-            pin_memory=False
 
         elif split_name == 'inference':
             line_starts = [ random.randrange( int(fs*(1-self.splits['test'])), fs) for fs in files_sizes  ]
             line_ends =  files_sizes
             shuffle = False
-            pin_memory=False
 
         li_dsets = [ SingleDataset_rst_v2(_f, self.tokenizer, line_start, line_end) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
@@ -2778,13 +2771,11 @@ class DataLoaderGenerator():
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
         
-        
         timeout = 0 if self.workers_rst in [0,1] else 15
-        
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
             shuffle=shuffle, num_workers=self.workers_rst, 
             collate_fn=lambda batch: utils.default_collate_pad(batch, self.pad_values),
-            pin_memory=pin_memory, timeout=timeout )
+            timeout=timeout )
 
         #TODO: change defualt collate to allow padding of elements for batching
         return dataloader
@@ -2836,8 +2827,8 @@ class DataLoaderGenerator():
         timeout = 0 if self.workers_rst in [0,1] else 60
         dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
             shuffle=shuffle, num_workers= self.workers_atomic,
-            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values),
-            pin_memory=True, timeout=timeout )
+            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values)
+            , timeout=timeout )
         
         return dataloader
 
