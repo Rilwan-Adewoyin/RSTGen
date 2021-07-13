@@ -268,7 +268,7 @@ class EmbeddingRstPos(nn.Module):
         # zero index embedding vector
         zero_embedding = np.zeros( [self.max_rst_level] )
 
-        split_dir_numb = {'L':-1, 'R':1}
+        split_dir_numb = {'L':-0.05, 'R':0.05}
         
         # for each embedding
         for idx in range(self.max_rst_index):
@@ -382,9 +382,9 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical1":
             # This is the normal embedding layer for COMET model
-                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST - essentially a bias term
-            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
-            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+                # NOTE: cancelled We allow one extra embedding position to act as a domain shift embedding position from COMET to RST - essentially a bias term
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) 
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
@@ -398,11 +398,10 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical2":
             # This is the normal embedding layer for COMET model
-                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
-            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
-            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+                # NOTE: cancelled -> We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li )
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
-            #self.embedding_rels_atomic.weight.data.normal_(mean=0.0, std=0.0001)
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
             rel_embed_len_rst = len(self.tokenizer.rst_rel_li ) + 1
@@ -411,9 +410,11 @@ class COMERST(nn.Module):
 
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
-                torch.nn.Linear( 80, 80 , bias=rst_embed_bias ) ,
-                torch.nn.Tanh(),
-                torch.nn.Linear( 80, rel_embed_len_atomic , bias=rst_embed_bias ) ,
+                torch.nn.Linear( 80, 160 , bias=rst_embed_bias ) ,
+                torch.nn.LeakyReLU(),
+                torch.nn.Linear( 160, 80 , bias=rst_embed_bias ) ,
+                torch.nn.LeakyReLU(),
+                torch.nn.Linear( 80, rel_embed_len_atomic, bias=rst_embed_bias ) ,
                 torch.nn.Tanh(),
             )
             self.embedding_rels_rst.padding_idx = self.embedding_rels_rst[0].padding_idx
@@ -432,15 +433,15 @@ class COMERST(nn.Module):
 
         #TODO: freezing weights
         if self.freeze_embeds:
-            utils.freeze_params(self.transformer.model.shared)
+            utils.freeze_params( self.transformer.model.shared)
             utils.freeze_params( self.transformer.lm_head )
 
             for d in [self.transformer.model.encoder, self.transformer.model.decoder]:
                 utils.freeze_params(d.embed_positions)
                 utils.freeze_params(d.embed_tokens)
             
-            utils.freeze_params( self.transformer.model.decoder.layers )
-            utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
+            # utils.freeze_params( self.transformer.model.decoder.layers )
+            # utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
         
         #endregion
 
@@ -625,7 +626,7 @@ class COMERST(nn.Module):
             # embed kpscore
             # add positional encoding
         
-        inputs_embed_head = self.transformer.model.shared( head_ids )
+        inputs_embed_head = self.transformer.model.shared( head_ids )*self.transformer.model.encoder.embed_scale
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
         #inputs_embed_head += self.embedding_kp_score( head_kpscores )
@@ -635,7 +636,7 @@ class COMERST(nn.Module):
             inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         elif self.relation_embedding == "hierarchical1":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
             inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
@@ -645,7 +646,6 @@ class COMERST(nn.Module):
 
         inputs_embeds = torch.cat( [ inputs_embed_head, inputs_embed_rel ], axis=-2)
         
-        inputs_embeds *= self.transformer.model.encoder.embed_scale
         #endregion
 
         # region reforming attention mask
@@ -682,13 +682,11 @@ class COMERST(nn.Module):
             # adding a conditioning token at start of sequence to indicate 
             # note we don't add token type ids to output since, the tti for head and tail entities is the padding vector of 0s
         if tail_ids != None:
-            decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
-                                self.embedding_rst_pos( tail_treepos_ids ) 
-
-                            
-            #TODO: think of way to incorporate a keyphrase score prediction
-        
-            decoder_inputs_embeds = decoder_inputs_embeds * self.transformer.model.decoder.embed_scale
+            decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) * self.transformer.model.decoder.embed_scale
+            
+            decoder_inputs_embeds += self.embedding_rst_pos( tail_treepos_ids )                             
+                    
+            decoder_inputs_embeds = decoder_inputs_embeds 
             output['decoder_inputs_embeds'] = decoder_inputs_embeds
         #endregion
 
@@ -714,10 +712,10 @@ class COMERST(nn.Module):
             # embed head_ids and 
             # emed rels_ids and tail_treepos_ids
             
-        inputs_embed_head = self.transformer.model.shared( head_ids )
+        inputs_embed_head = self.transformer.model.shared( head_ids ) * self.transformer.model.encoder.embed_scale
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
-
+            
         if self.relation_embedding == "flattened":
             inputs_embed_rel = self.embedding_rels( rels_ids )
         else:
@@ -739,7 +737,7 @@ class COMERST(nn.Module):
                                                      attention_mask=attention_mask  )
         #endregion
         
-        #region decoderinputs_embeds
+        #region decoder inputs_embeds
             #token type ids does not have to be added to decoder input embeds
         decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
                                 self.embedding_rst_pos( tail_treepos_ids ) 
@@ -839,9 +837,9 @@ class COMERST(nn.Module):
             _ = input_.pop('decoder_inputs_embeds',None)
 
             #inserting decoder_input_ids
-            decoder_start_token_id = self.config.eos_token_id
-            bos_token_id = self.config.bos_token_id
-            decoder_start_token_id = self.transformer._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+            # decoder_start_token_id = self.config.eos_token_id
+            # bos_token_id = self.config.bos_token_id
+            decoder_start_token_id = self.transformer._get_decoder_start_token_id()  #  decoder_start_token_id, bos_token_id)
             decoder_input_ids = (
                 torch.ones(( input_['inputs_embeds'].shape[0], 1), dtype=torch.long, device=input_['inputs_embeds'].device) * decoder_start_token_id
                 )
@@ -1335,7 +1333,7 @@ class COMERST_tokenizer():
         #endregion
 
         #region position_ids and labels
-        position_ids_head = new_ids = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
+        position_ids_head = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
 
         
         #endregion
@@ -1345,14 +1343,14 @@ class COMERST_tokenizer():
             'head_treepos_ids':head_treepos_ids,
             'position_ids_head': position_ids_head,
 
-            'tail_ids':tail_ids.squeeze(),
+            'tail_ids':tail_ids,
             'tail_treepos_ids':tail_treepos_ids,
             
             'rels_ids':rels_ids,
             'rels_treepos_ids': rels_treepos_ids,
 
             'attention_mask': attention_mask,
-            'labels':labels.squeeze()
+            'labels':labels
         }
 
     def tokenize_comet_person_randomizer(self, head, rel, tail):
@@ -2086,7 +2084,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-s','--batch_size', default=100, type=int)
         parser.add_argument('-l','--learning_rate', default=1e-4, type=float)
-        parser.add_argument('--warmup_proportion', default=0.25)
+        parser.add_argument('--warmup_proportion', default=0.1)
         parser.add_argument('--workers', default=12, type=int) 
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
@@ -2211,7 +2209,7 @@ class TrainingModule(pl.LightningModule):
                         precision=tparams['precision'], callbacks=callbacks,
                         #accelerator='ddp2', amp_level='O2',
                         accelerator=accelerator,
-                        limit_train_batches =20,
+                        limit_train_batches =10,
                         limit_val_batches = 5,
                         #val_check_interval=0.3,
                         #num_sanity_val_steps=0, 
