@@ -2469,10 +2469,15 @@ class TrainingModule(pl.LightningModule):
             bad_words = ['"']
             bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words ]
             
-            generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+            generation_kwargs_comet = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
                                 'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
                                 'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
-                                'min_length':3, 'max_length':20 }
+                                'min_length':3, 'max_length':18 }
+
+            generation_kwargs_rst = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                'min_length':3, 'max_length':10 }
                     
                     # At end of validation loop produce some quantitative examples of model's performance
 
@@ -2501,7 +2506,7 @@ class TrainingModule(pl.LightningModule):
                     batch_comet_rels =  [ self.model.tokenizer.atomic_rel_labeler.inverse_transform( rels_ids ) for rels_ids in batch_comet['rels_ids'].cpu().numpy().tolist() ]
                     batch_tails_comet = [  self.model.tokenizer.base_tokenizer.decode( tail_ids , skip_special_tokens=True  ).strip()  for tail_ids in batch_comet['tail_ids'] ]
 
-                    preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )
+                    preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs_comet )
                     
                     li_comet_heads.extend(batch_comet_heads)
                     li_comet_rels.extend(batch_comet_rels)
@@ -2513,7 +2518,7 @@ class TrainingModule(pl.LightningModule):
                     batch_rst = batch['rst']
                             
                     # RST -  prediction for every elem in batch
-                    preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs )
+                    preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs_rst )
                                     
                     #batch decoding to get original data for each elem in batch
                     batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
