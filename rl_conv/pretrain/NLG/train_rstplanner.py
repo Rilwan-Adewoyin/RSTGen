@@ -17,15 +17,9 @@ from collections import defaultdict, Counter, ChainMap
 def nested_dd():
     return defaultdict(nested_dd)
 
-#TODO: write script v1
-#TODO: add ability to condition on source dataset
-#TODO: add ability to sample
-#TODO: add ability to sample with conditions
-
-
 class RSTPlanner():
 
-    def __init__(self, model_name, dirs_rst_convo,
+    def __init__(self, model_name='rst_planner', dirs_rst_convo="./dataset_v2",
                     maximum_child_node_pos=30, **kwargs ):
 
         self.model_name = model_name
@@ -611,7 +605,6 @@ class RSTPlanner():
 
         return cond_distr
        
-
     def generation_filter(self, rst_chunk_decoded, rel_filt=None, ns_filt=None):
         """[Returns True/False depending on whether an RSTchunk satistifies the rst filters]
 
@@ -639,9 +632,10 @@ class RSTPlanner():
         parser.add_argument( '-mn', '--model_name', default='rst_planner', required=False)
         parser.add_argument('-drc', '--dirs_rst_convo', default=os.path.abspath("./dataset_v2"), required=False)
         parser.add_argument('-mcnp', '--maximum_child_node_pos', default=30)
-        parser.add_argument('-df','--data_filters', default="{}" )
+        parser.add_argument('-df','--data_filters', default="{}",help="filters related to input dataset" )
         parser.add_argument('-sm','--sampling_params',
-                                default= "{ \"sampling_method\":\"random\", \"cond_subreddit\":\"aggregated\", \"cond_rstlength\":7, \"reduce_rel_space\":True }")
+                                default= "{ \"sampling_method\":\"random\", \"cond_subreddit\":\"aggregated\", \"cond_rstlength\":2, \"reduce_rel_space\":True }",
+                                help="Used at each sampling step to control output of model")
         
         mparams = parser.parse_known_args( )[0]
 

@@ -6,8 +6,6 @@
 #region imports 
 import os
 #os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
-#os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
-#os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
 #os.environ['NCCL_IB_DISABLE'] ="1"#
 #os.environ['CUDA_LAUNCH_BLOCKING']='1' 
 import json
@@ -237,7 +235,7 @@ for name in nlp.pipe_names:
         nlp.remove_pipe(name)
 
 class EmbeddingRstPos(nn.Module):
-    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
+    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
                     ):
         super(EmbeddingRstPos, self).__init__()
 
@@ -245,11 +243,13 @@ class EmbeddingRstPos(nn.Module):
         self.max_rst_level = max_rst_level
         self.left_right_seq_from_root_to_edu_pos = lr_func
 
+        self.init_val = init_val
         self.fixed_rst_encoding = self.make_rst_encoding( )
         self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=False )
         
         self.padding_idx = self.fixed_rst_encoding.padding_idx
-
+        
+        
     def forward(self, x ):
         while x.max() >= self.max_rst_index:
             x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
@@ -268,7 +268,7 @@ class EmbeddingRstPos(nn.Module):
         # zero index embedding vector
         zero_embedding = np.zeros( [self.max_rst_level] )
 
-        split_dir_numb = {'L':-0.05, 'R':0.05}
+        split_dir_numb = {'L':-self.init_val, 'R':self.init_val}
         
         # for each embedding
         for idx in range(self.max_rst_index):
@@ -276,7 +276,7 @@ class EmbeddingRstPos(nn.Module):
             idx_embedding = copy.deepcopy( zero_embedding )
             
             # Determine the sequence of lefts and rights to reach node    
-            left_rights_from_root_to_pos = self.left_right_seq_from_root_to_edu_pos( idx )
+            left_rights_from_root_to_pos = COMERST_tokenizer.left_right_seq_from_root_to_edu_pos( idx )
             
             # Convert sequence of LRs to a sequence of -1 and 1s and 0s
             for idx1, val in enumerate(left_rights_from_root_to_pos):
@@ -357,10 +357,10 @@ class COMERST(nn.Module):
 
         elif self.rst_pos_embed_type == 2:
             
-            self.embedding_rst_pos = EmbeddingRstPos(  self.tokenizer.left_right_seq_from_root_to_edu_pos,
-                                                    max_rst_index=self.tokenizer.rst_pos_maxidx,
-                                                        max_rst_level = self.tokenizer.node_level(self.tokenizer.rst_pos_maxidx),
-                                                rst_encoding_ndim=self.transformer.config.d_model)
+            self.embedding_rst_pos = EmbeddingRstPos(  COMERST_tokenizer.left_right_seq_from_root_to_edu_pos,
+                                                        max_rst_index=self.tokenizer.rst_pos_maxidx,
+                                                        max_rst_level = COMERST_tokenizer.node_level(self.tokenizer.rst_pos_maxidx),
+                                                        rst_encoding_ndim=self.transformer.config.d_model)
             
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
@@ -501,9 +501,6 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical2":
             self.pad_values['rst_rel_ids'] = self.embedding_rels_rst[0].padding_idx
-
-
-
 
     def forward(self, input_, return_dict=None):
 
@@ -909,12 +906,11 @@ class COMERST(nn.Module):
     def compress_padding( self,
         input_ids, pad_token_id, inputs_embeds, attention_mask):
         """ First for each datum remove all padding due to the head parts
-            Then use pad sequence to ensure they are all the same elnght"""
+            Then use pad sequence to ensure they are all the same length"""
         
         """Remove columns that are populated exclusively by pad_token_id"""
         keep_column_mask = input_ids.ne(pad_token_id)
         
-
         inputs_embeds = self.compress_padding_inner(inputs_embeds, 1, keep_column_mask)
         attention_mask = self.compress_padding_inner(attention_mask, 2, keep_column_mask)
         
@@ -1691,7 +1687,7 @@ class COMERST_tokenizer():
 
                     # getting a list of all graph posiitons of edus in li_edus
                 li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
-                li_edu_pos.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
+                li_edu_pos.sort(key=lambda edu_pos: ( COMERST_tokenizer.edukp_pos_sort_function(edu_pos), edu_pos ) )
                 #endregion
 
                 # region - Selecting a subtree from the  RST tree to focus on
@@ -1827,8 +1823,9 @@ class COMERST_tokenizer():
 
         return rst_pos
 
+    @staticmethod
     @lru_cache()
-    def left_right_seq_from_root_to_edu_pos(self, edukp_pos: int):
+    def left_right_seq_from_root_to_edu_pos( edukp_pos: int):
             # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
         parent_pos = edukp_pos
@@ -1848,9 +1845,10 @@ class COMERST_tokenizer():
             parent_pos = math.floor(parent_pos)
         
         return li_leftright_seq
-
+    
+    @staticmethod
     @lru_cache()
-    def edukp_pos_sort_function(self, edukp_pos: int):
+    def edukp_pos_sort_function(edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
             # sort_function
             # from root_pos find the sequence of left/rights down the tree to each edukp_pos
@@ -1858,7 +1856,7 @@ class COMERST_tokenizer():
             # Then retun this float
             # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
 
-        li_leftright_seq = self.left_right_seq_from_root_to_edu_pos(edukp_pos) 
+        li_leftright_seq = COMERST_tokenizer.left_right_seq_from_root_to_edu_pos(edukp_pos) 
         
         # Now calculate the flattened position using the sequence of left and rights
         _ = {'L':-1, 'R':+1}
@@ -1890,7 +1888,7 @@ class COMERST_tokenizer():
                 nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
-                nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
+                nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( COMERST_tokenizer.edukp_pos_sort_function(edu_pos), edu_pos ) )
 
                 if not nodes_in_minimum_spanning_tree == li_rst_pos:
                     bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
@@ -1903,7 +1901,7 @@ class COMERST_tokenizer():
             # This is to match the rst pos embedding  embedding layer behaviour which only 
             # models rst_pos up to a certain level
         if max(li_rst_pos) > self.rst_pos_maxidx:
-            l = [ [rel, pos, ns] for rel, pos, ns in zip(li_rst_rel, li_rst_pos, li_rst_ns) if self.node_level(pos)<=self.rst_pos_maxidx ] 
+            l = [ [rel, pos, ns] for rel, pos, ns in zip(li_rst_rel, li_rst_pos, li_rst_ns) if COMERST_tokenizer.node_level(pos)<=self.rst_pos_maxidx ] 
             li_rst_rel, li_rst_pos, li_rst_ns = [ list(t) for t in zip( *l ) ]
 
         return li_rst_pos, li_rst_rel, li_rst_ns
@@ -1953,8 +1951,9 @@ class COMERST_tokenizer():
 
         return parent_node
     
+    @staticmethod
     @lru_cache()
-    def node_level(self, node_pos):
+    def node_level(node_pos):
         val = math.floor( math.log( node_pos+1 , 2 ) )
         
         return val
@@ -1996,7 +1995,7 @@ class COMERST_tokenizer():
 
             # Check if new curr node is on same level as nodex.
                 # if yes At which point we know nodex is not directly reachable if curr_node is not nodex
-            if self.node_level(curr_node) == self.node_level(nodex):
+            if COMERST_tokenizer.node_level(curr_node) == COMERST_tokenizer.node_level(nodex):
                 reachable = (curr_node == nodex)
 
         
@@ -2082,7 +2081,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=28, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
-        parser.add_argument('-s','--batch_size', default=100, type=int)
+        parser.add_argument('-s','--batch_size', default=5, type=int)
         parser.add_argument('-l','--learning_rate', default=1e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.1)
         parser.add_argument('--workers', default=12, type=int) 
@@ -2298,8 +2297,14 @@ class TrainingModule(pl.LightningModule):
     
     @staticmethod
     def get_ckpt_file(_dir_checkpoint,mode='best'):
+        
         if mode=='best':
             checkpoint_yaml_file = os.path.join( _dir_checkpoint,"best_k_models.yaml" )
+            
+            ckpt_exists = os.path.exists(checkpoint_yaml_file)
+            if ckpt_exists == False:
+                return None
+            
             scores_dict = yaml.load( open(checkpoint_yaml_file,"r"), Loader = yaml.FullLoader ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
