@@ -1,32 +1,31 @@
+#This script makes the second version of data for the NLG model
+# This script uses data made by data_setup_v2 and extends it to include the edu position of each key phrase.
+# As such the model trained with data from this script should be able to place the keyphrases that it is using
+
 import sys, os
 
 import traceback
-
+import string 
 import math
-from types import MethodType
-import numpy
+from difflib import SequenceMatcher
+from operator import itemgetter
+
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from itertools import groupby
 
 import argparse
 import utils_nlg
-import random
 
 import math
 import itertools
 import pandas as pd
-import nltk
-#nltk.download('stopwords')
+
 import glob
 from collections import defaultdict
 
-
+import copy 
 import json 
-import spacy
-import en_core_web_sm
-import pke
-from pke.data_structures import Candidate
 
 import regex as re
 pattern_punctuation_space = re.compile(r'\s([?.!"](?:\s|$))')
@@ -38,30 +37,9 @@ pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start
              )
  
 
-# sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
-# #making spacy model #spedding up textrank processing
-# spacy_kwargs = {'disable': ['ner', 'textcat', 'parser']}
-# spacy_model = spacy.load('en_core_web_sm', **spacy_kwargs)
-# exceptions = spacy_model.Defaults.tokenizer_exceptions
-# filtered_exceptions = {k:v for k,v in exceptions.items() if "'" not in k}
-# spacy_model.tokenizer = spacy.tokenizer.Tokenizer(spacy_model.vocab, rules = filtered_exceptions)
-# spacy_model.add_pipe('sentencizer')
-# extractor = pke.unsupervised.TextRank()
-#     #install using python -m spacy download en_core_web_sm
-
-# def reset(self):
-#     self.sentences = []
-#     self.candidates = defaultdict(Candidate)
-#     self.weights = {}
-#     #self.graph = nx.Graph()
-#     self.graph.clear()
-
-# extractor.reset = MethodType(reset, extractor)
-
 import csv
-import pickle
+
 import time
-import torch
 
 from filelock import Timeout, FileLock
 
@@ -73,8 +51,6 @@ import ujson
 #batches_completed = 0
 batches_completed = {}
 subreddit = None
-
-from urllib3.exceptions import InsecureRequestWarning
 
 # Docker Images Parser and RST tree labeller
 mp1 = os.path.abspath(os.path.join('..'))
@@ -96,28 +72,31 @@ from data_setup import _tree_to_rst_code, _parse_trees
 def main( batch_process_size=20,
             mp_count=4,
             resume_progress=False,
-            #subreddit_names = [],
-                #batch du11ducks
-            subreddit_names = ["AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars","DebateReligion"],
-                            
-                #batch enigma
-            #subreddit_names = ["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography","pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
-            #subreddit_names = ["Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive","AskReddit","askscience","AskWomen","asoiaf",,"CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz"]
-                min_rst_len = 6,
+            subset_no=1,
+                min_rst_len = 1,
             **kwargs):
     """[summary]
 
-    Args:
+        Args:
         batch_process_size (int, optional): [description]. Defaults to 20.
         subreddit_names (str, optional): List of subreddit names to filter through
     """
     
-    #region  Setup    
-        
+    #region  Setup 
+    dict_subredditnames_sets = {
+                #batch warwick desktop
+        1: ["DebateReligion","AdviceAnimals","AmItheAsshole","Android","anime","apple","AskMen","atheism","australia","aww","baseball","Bitcoin","books","buildapc","business","canada","cars"],
+                #batch dullducks
+        2:["fantasyfootball","Fitness","Frugal","funny","Games","gaming","gifs","gonewild","Guildwars2","guns","hiphopheads","IAmA","last_batch_record","leagueoflegends","Libertarian","LifeProTips","magicTCG","MakeupAddiction","malefashionadvice","Marvel","MensRights","Minecraft","MMA","motorcycles","MovieDetails","movies","Music","Naruto","nba","news","nfl","NoFap","offbeat","OkCupid","photography","pics","pokemon","pokemontrades","POLITIC","PoliticalDiscussion","politics","programming","Random_Acts_Of_Amazon","relationship_advice","relationships","rupaulsdragrace","science","sex","ShingekiNoKyojin","singapore","skyrim","soccer","SquaredCircle","starcraft","technology","techsupport","teenagers","tf2","tifu","todayilearned","travel","trees","TwoXChromosomes","unitedkingdom","videos","worldnews","wow","WritingPrompts","WTF"],
+                #batch enigma
+        3: ["Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive","AskReddit","askscience","AskWomen","asoiaf","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz"]
+    }
+
+    subreddit_names = dict_subredditnames_sets[subset_no]
     #Creating Save directory
-    dir_save_dataset = utils_nlg.get_path("./dataset_keyphrase_v2/",_dir=True)
+    dir_save_dataset = utils_nlg.get_path("./dataset_v3/",_dir=True)
     
-    # setting up subreddit data
+    # setting up source subreddit data
     dirs_rst_conv = "./dataset_v2/reddit_large_annotated/"
     li_subreddit_names = list( filter( lambda name: name!="last_batch_record", os.listdir( dirs_rst_conv ) ) )
 
@@ -136,10 +115,9 @@ def main( batch_process_size=20,
         print(f"\nOperating on Subreddit: {subreddit}. {li_subreddit_fp.index((subreddit,li_fp))} of {len(li_subreddit_fp)}")
         
         #Should only be one file in li_fp
-        #assert len(li_fp) == 1
         fp = li_fp[0]
 
-        dset_source = pd.read_csv( fp, usecols=['rst','txt_preproc','subreddit'] )
+        dset_source = pd.read_csv( fp, usecols=['rst','txt_preproc','subreddit','topic_textrank'] )
         
         total_batch_count = math.ceil(len(dset_source)/batch_process_size)
 
@@ -192,16 +170,17 @@ def main( batch_process_size=20,
             for idx in range(len(batch_li_dict_utt)-1, -1, -1):
                 
                 rst_ = ujson.loads(batch_li_dict_utt[idx]['rst'])  
-
                 txt_prepoc = ujson.loads(batch_li_dict_utt[idx]['txt_preproc'])
                 srdt  = ujson.loads(batch_li_dict_utt[idx]['subreddit'])
+                tpc_txtrank = ujson.loads( batch_li_dict_utt[idx]['topic_textrank'] )
+
                 batch_li_dict_utt[idx] =  {'rst':rst_, 'txt_preproc':txt_prepoc,
-                        'subreddit': srdt } 
+                        'subreddit': srdt, 'topic_textrank':tpc_txtrank } 
 
             
             print(f"\n\tOperating on batch {batches_completed[subreddit]+1} of {total_batch_count}")
 
-            #region mp.imap EDU and Key Phrase Extraction
+            
             timer.start()
             
             with mp.Pool(mp_count) as pool:
@@ -219,13 +198,15 @@ def main( batch_process_size=20,
                 res = pool.imap( filtering_out_records, res)
 
                 res = pool.imap( position_edus, res)
+
+                res = pool.imap( position_kp, res)
                               
                 batch_li_dict_utt = list(res)
                 batch_li_dict_utt = sum(batch_li_dict_utt, [])
 
             timer.end("\t\tEDU parsing, RST correction and EDU position labelling")
 
-            #endregion
+            
 
             #region Saving Batches
             timer.start()
@@ -247,16 +228,15 @@ def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
         
-def filtering_out_records(li_dict_rsttext, min_rst_len=5):
-    # Notice we are aiming to parse long texts only with 3 or more EDUs
+def filtering_out_records(li_dict_rsttext ):
     
     for idx in range( len(li_dict_rsttext)-1 ,-1 , -1 ):
 
         dict_rsttext = li_dict_rsttext[idx]
-        rst_ = dict_rsttext['rst']
 
-        # removing entry if too short
-        if len(rst_)<=min_rst_len:
+        # Removing cases where relation is 'a' i.e. a our rst labeller could not classifiy relation        
+        rst_ = dict_rsttext['rst']
+        if len(rst_)==1 and rst_[0]['rel']=="n":
             li_dict_rsttext.pop(idx)
             continue
 
@@ -264,7 +244,7 @@ def filtering_out_records(li_dict_rsttext, min_rst_len=5):
             # in reddit '>' is used to indicate a qouted text
         txt_preproc = dict_rsttext['txt_preproc']
         #TODO: noticed that there are still /n in the txt_preproc datasets
-        if ">" in txt_preproc or "edit :" in txt_preproc.lower():
+        if ">" in txt_preproc or bool(re.search('edit[ 0-9]{0,4}:', txt_preproc.lower())):
             li_dict_rsttext.pop(idx)
             continue
     
@@ -292,12 +272,16 @@ def processing_txt(li_dict_rsttext):
              lambda x: x.group().upper(), 
              txt_preproc)
 
-
         li_dict_rsttext[idx]['txt_preproc'] = txt_preproc
+
+        # removing repeat keyphrases #TODO: add to original text mining script
+        key_phrases = dict_rsttext['topic_textrank']
+        key_phrases = [ [kp,score] for kp,score in key_phrases if all( ( (kp==kp1 or kp not in kp1) for kp1, score in key_phrases) ) ]
+        dict_rsttext['topic_textrank'] = key_phrases
     return li_dict_rsttext
 
 # region edu processing     
-def edu_segmenter(li_dict_rsttext):
+def edu_segmenter(li_dict_rsttext, use_kp_ds=True):
     """[summary]
 
         Args:
@@ -308,9 +292,31 @@ def edu_segmenter(li_dict_rsttext):
     """
     if len(li_dict_rsttext) == 0:
         return li_dict_rsttext
-         
-    li_text = [ _dict['txt_preproc'] for _dict in li_dict_rsttext ]
+    
+    subreddit = li_dict_rsttext[0]['subreddit']
 
+    if use_kp_ds and os.path.exists( os.path.join("./dataset_keyphrase_v2",subreddit) ) :
+        #try to find all records that have already been processed and saved in kp ds
+        fp_kp = [ fp  for fp in glob.glob( os.path.join("./dataset_keyphrase_v2",subreddit,"*") )  if "lock" not in fp ][0]
+        df_kp = pd.read_csv( fp_kp, usecols=['txt_preproc',"dict_pos_edu"]  )
+        df_kp['txt_preproc'] = df_kp['txt_preproc'].apply( ujson.loads )
+        #df_kp['dict_pos_edu'] = df_kp['dict_pos_edu'].apply( ujson.loads )
+
+        for idx in range(len(li_dict_rsttext)):
+            txt_to_find = li_dict_rsttext[idx]['txt_preproc']
+            idxs_in_kpdf = df_kp.index[ df_kp['txt_preproc'] == txt_to_find  ]
+            
+            if len(idxs_in_kpdf) == 1:
+                idx_record = idxs_in_kpdf[0]
+                li_dict_rsttext[idx]['dict_pos_edu'] = ujson.loads( df_kp['dict_pos_edu'].loc[idx_record] )
+                li_dict_rsttext[idx]['li_edus'] = list(li_dict_rsttext[idx]['dict_pos_edu'].values())
+
+    _ = [ [_dict['txt_preproc'], idx] for idx, _dict in enumerate(li_dict_rsttext) if 'dict_pos_edu' not in _dict ]
+
+    if len(_)==0:
+        return li_dict_rsttext
+
+    li_text, li_idx_segmented_records = zip(*_)
     # returns list of words for each utterance with edu tokens place between different edu segments
     li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_text]), 
                                                 skip_parsing=True, redirect_output=True)
@@ -328,10 +334,11 @@ def edu_segmenter(li_dict_rsttext):
         # random spaces due to converting brakcests to - LRB - and - RRB - codes
     #TODO: try to stop these changes being made in parser_wrapper
     li_li_edus = [ [edutxt.replace(" n't", "n't").replace(" / ", "/").replace(" '", "'").replace("- LRB -", "(").replace("- RRB -", ")").replace("-LRB-", "(").replace("-RRB-", ")")
-                     if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_text) ]
+                    if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_text) ]
 
-    for idx in range(len(li_dict_rsttext)):
-        li_dict_rsttext[idx]['li_edus'] = li_li_edus[idx]
+    #for idx in range(len(li_dict_rsttext)):
+    for idx1,idx2 in enumerate(li_idx_segmented_records):
+        li_dict_rsttext[idx2]['li_edus'] = li_li_edus[idx1]
 
     return li_dict_rsttext
 
@@ -362,12 +369,13 @@ def split(sequence, sep):
     yield chunk
 #endregion
 
-def check_full_rst(li_dict_rsttext):
+def check_full_rst(li_dict_rsttext, use_kp_ds=False):
+
+    #If the extracted RST tree (from dataset_v2) has been truncated, we extract the full RST tree
+    #Here we can check the keyphrase dataset and extract the full parsed trees from there.
 
     if len(li_dict_rsttext) == 0:
         return li_dict_rsttext
-         
-    #If the extracted RST tree (from dataset_v2) has been truncated, we extract the full RST tree 
     
     li_edus_len = [ len(_dict['li_edus']) for _dict in li_dict_rsttext ]
     li_rst_len = [ len(_dict['rst']) for _dict in li_dict_rsttext ]
@@ -377,24 +385,50 @@ def check_full_rst(li_dict_rsttext):
 
     if len(idxs_w_shrtnd_rst) == 0:
         return li_dict_rsttext
-
-    li_text = [ li_dict_rsttext[idx]['txt_preproc'] for idx in idxs_w_shrtnd_rst ]
-
-    li_li_unparsed_tree = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_text]), 
-                                                skip_parsing=False, redirect_output=True)
-    li_unparsed_tree = sum( li_li_unparsed_tree, [] )
-    li_subtrees = _parse_trees(li_unparsed_tree)
     
-    li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
+    #Here we extract the full rst tree from the keyphrase dataset if it can be found, otherwise we use our parser
 
-    # Attaching the new rst codes to the dataset
-        # and removing trees which could not be parsed
-    for idx1, idx2 in reversed(list(enumerate(idxs_w_shrtnd_rst))):
-        if li_rst_dict[idx1] == None:
-            li_dict_rsttext.pop(idx2)
-        else:
-            li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
+    # for each record in idxs_w_shrtned , check for txt_preproc record in dataset_kp_v2
+    # if exists just copy the rst record over and remove that idx from idxs_w_shrtned_rst
+    # note: the keyphrase dataset was already processed to include the full keyphrases
+    subreddit = li_dict_rsttext[0]['subreddit']
+    if os.path.exists(os.path.join("./dataset_keyphrase_v2",subreddit)):
+        fp_kp = [fp  for fp in glob.glob( os.path.join("./dataset_keyphrase_v2",subreddit,"*") )  if "lock" not in fp][0]
+        df_kp = pd.read_csv( fp_kp, usecols=['rst','txt_preproc']  )
+        df_kp['txt_preproc'] = df_kp['txt_preproc'].apply( ujson.loads )
 
+        idxs_w_shrtnd_rst_copy = copy.deepcopy( idxs_w_shrtnd_rst ) #idxs of handled cases will be removed from this
+
+        for idx1, idx2 in  reversed( list( enumerate( idxs_w_shrtnd_rst ) ) ) :
+            txt_to_find = li_dict_rsttext[idx2]['txt_preproc']
+            idxs_in_kpdf = df_kp.index[ df_kp['txt_preproc'] == txt_to_find  ]
+
+            if len(idxs_in_kpdf) == 1:
+                idx_record = idxs_in_kpdf[0]
+                li_dict_rsttext[idx2]['rst'] = ujson.loads(df_kp['rst'].loc[idx_record])
+
+                idxs_w_shrtnd_rst_copy.pop(idx1)
+        
+        idxs_w_shrtnd_rst = idxs_w_shrtnd_rst_copy
+
+    #if any records remain in idxs_w_shrtnd_rst then use simply use the parsing method
+    if len(idxs_w_shrtnd_rst) > 0:
+        li_text = [ li_dict_rsttext[idx]['txt_preproc'] for idx in idxs_w_shrtnd_rst ]
+
+        li_li_unparsed_tree = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_text]), 
+                                                    skip_parsing=False, redirect_output=True)
+        li_unparsed_tree = sum( li_li_unparsed_tree, [] )
+        li_subtrees = _parse_trees(li_unparsed_tree)
+        
+        li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
+
+        # Attaching the new rst codes to the dataset
+            # and removing trees which could not be parsed
+        for idx1, idx2 in reversed(list(enumerate(idxs_w_shrtnd_rst))):
+            if li_rst_dict[idx1] == None:
+                li_dict_rsttext.pop(idx2)
+            else:
+                li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
 
     return li_dict_rsttext
 
@@ -403,6 +437,10 @@ def position_edus(li_dict_rsttext):
         return li_dict_rsttext
          
     for idx in range(len(li_dict_rsttext)):
+        
+        if 'dict_pos_edu' in li_dict_rsttext[idx]:
+            li_dict_rsttext[idx].pop('li_edus')
+            continue
 
         li_rst_pos = [ rst_node['pos'] for rst_node in li_dict_rsttext[idx]['rst'] ]
         li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
@@ -423,6 +461,44 @@ def find_child_edus(pos_parentnode, li_rst_pos):
         li_child_edu_pos = [ pos for pos in li_child_pos if pos not in li_rst_pos]
 
         return li_child_edu_pos 
+
+def position_kp(li_dict_rsttext):
+    # For Each Keyphrase we now add information which edu posiiton it occurs in on the RST Tree
+    if len(li_dict_rsttext) == 0:
+        return li_dict_rsttext
+
+    for idx in range(len(li_dict_rsttext)):
+        
+        li_dict_rsttext[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
+
+        key_phrases = li_dict_rsttext[idx]['topic_textrank']
+        dict_pos_edu = li_dict_rsttext[idx]['dict_pos_edu']
+        
+        for li_kp_score in key_phrases:
+            kp = li_kp_score[0]
+            
+            try:
+                raise StopIteration
+                kp_pos = next( ( pos for pos, edu in  dict_pos_edu.items() if kp in edu ) )
+            except StopIteration: 
+                # kp spans two different EDUs. So finding length, in words, of longest common substring
+                li_pos_coveragecount = []
+                for pos, edu in dict_pos_edu.items():
+                    kp_split = kp.split()
+                    edu_split = [ w for w in edu.translate(str.maketrans('', '', string.punctuation)).split() if w!= " "]
+
+                    match = SequenceMatcher(None, kp_split, edu_split).find_longest_match(0, len(kp_split) ,0, len(edu_split) )
+                    li_pos_coveragecount.append( [pos, match.size] )
+                
+                kp_pos, coverage_count = max( li_pos_coveragecount, key=itemgetter(1))
+                
+                #raise ValueError("keyphrase not found in edus")              
+
+            li_dict_rsttext[idx]['li_pos_kp'].append( [kp_pos,kp] ) 
+        
+        li_dict_rsttext[idx].pop('topic_textrank')
+    
+    return li_dict_rsttext
 
 # region key_phrase_extraction
 def _key_phrase(li_li_edusegment):
@@ -537,7 +613,6 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
 
         df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
       
-
 class Timer():
     def __init__(self):
         self.start_time = None
@@ -562,11 +637,12 @@ if __name__ == '__main__':
     parser.add_argument('-bps','--batch_process_size', default=3,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=4, type=int)
+    parser.add_argument('--mp_count', default=1, type=int)
+    
+    parser.add_argument('--subset_no', default=1, type=int)
     
     parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
-
 
     args = parser.parse_args()
     
@@ -594,4 +670,4 @@ if __name__ == '__main__':
             # time.sleep(3)
             pass
 
-# python3 data_setup_keyphrase2.py -bps 60 -rp 1  --mp_count 8  
+# python3 data_setup_v3.py -bps 240 -rp 1  --mp_count 8  --subset_no 1
