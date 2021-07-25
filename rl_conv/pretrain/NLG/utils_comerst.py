@@ -362,9 +362,10 @@ def BART_forward(
         encoder_attentions=encoder_outputs.attentions,
     )
 
+
 def transform_patch( self, val ):
     encoded = self.transform(val)
-    encoded = encoded + self.starting_idx
+    encoded  = encoded + self.starting_idx
     return encoded
 
 def inverse_transform_patch(self, val):
@@ -375,9 +376,12 @@ def inverse_transform_patch(self, val):
     val = [v for v in val if v< len(self.classes_) ]
     decoded = self.inverse_transform( val )
     
+
     return decoded
 
+
 #region Mixin Classes to override
+
 def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
@@ -395,12 +399,8 @@ def prepare_inputs_for_generation(
             decoder_input_ids = decoder_input_ids[:, -1:]
         
         tti  = kwargs['tail_treepos_ids']
-
-        decoder_inputs_embeds = self.model.shared( decoder_input_ids ) + \
-            self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) ) 
-
-
-        decoder_inputs_embeds = decoder_inputs_embeds * self.model.decoder.embed_scale
+        decoder_inputs_embeds = self.model.shared( decoder_input_ids ) * self.model.decoder.embed_scale
+        decoder_inputs_embeds +=   self.comerst().embedding_rst_pos( tti.repeat(1, decoder_input_ids.shape[-1] ) )   
 
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
@@ -414,6 +414,7 @@ def prepare_inputs_for_generation(
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
         }
+
 
 def greedy_search(
     self,
@@ -593,6 +594,7 @@ def default_collate_pad(batch, pad_values=None):
 
         return torch.stack(batch, 0, out=out)
 
+
     elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
             and elem_type.__name__ != 'string_':
         if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
@@ -627,7 +629,7 @@ def default_collate_pad(batch, pad_values=None):
                 
                 
                 if li_[0].dim() == 1:
-                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values[key] ) 
+                    padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key,0) ) 
                     #unstacking
                     li_ = torch.unbind(padded_li, 0)
                 
@@ -707,6 +709,8 @@ def freeze_params(model: nn.Module):
         par.requires_grad = False
 # endregion
 
+
+
 def use_task_specific_params(model, task):
     """Update config with summarization specific params."""
     task_specific_params = model.config.task_specific_params
@@ -715,6 +719,7 @@ def use_task_specific_params(model, task):
         pars = task_specific_params.get(task, {})
         logger.info(f"using task specific params for {task}: {pars}")
         model.config.update(pars)
+
 
 def flatten_list(summary_ids: List[List]):
     return [x for x in itertools.chain.from_iterable(summary_ids)]

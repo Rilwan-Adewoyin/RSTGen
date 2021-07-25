@@ -5,7 +5,7 @@
 
 #region imports 
 import os
-#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
 #os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
 #os.environ['NCCL_IB_DISABLE'] ="1"#
@@ -13,7 +13,6 @@ import os
 import json
 import torch
 import argparse
-from torch._C import Value
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, Tuple
@@ -238,7 +237,7 @@ for name in nlp.pipe_names:
         nlp.remove_pipe(name)
 
 class EmbeddingRstPos(nn.Module):
-    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
+    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
                     ):
         super(EmbeddingRstPos, self).__init__()
 
@@ -246,14 +245,16 @@ class EmbeddingRstPos(nn.Module):
         self.max_rst_level = max_rst_level
         self.left_right_seq_from_root_to_edu_pos = lr_func
 
+        self.init_val = init_val
         self.fixed_rst_encoding = self.make_rst_encoding( )
         self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=False )
         
         self.padding_idx = self.fixed_rst_encoding.padding_idx
-
+        
+        
     def forward(self, x ):
         while x.max() >= self.max_rst_index:
-            x = torch.where( x<self.max_rst_index, x, torch.ceil( (x-2)/2 ).long() )
+            x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
    
 
         x = self.fixed_rst_encoding(x)
@@ -269,7 +270,7 @@ class EmbeddingRstPos(nn.Module):
         # zero index embedding vector
         zero_embedding = np.zeros( [self.max_rst_level] )
 
-        split_dir_numb = {'L':-1, 'R':1}
+        split_dir_numb = {'L':-self.init_val, 'R':self.init_val}
         
         # for each embedding
         for idx in range(self.max_rst_index):
@@ -277,7 +278,7 @@ class EmbeddingRstPos(nn.Module):
             idx_embedding = copy.deepcopy( zero_embedding )
             
             # Determine the sequence of lefts and rights to reach node    
-            left_rights_from_root_to_pos = self.left_right_seq_from_root_to_edu_pos( idx )
+            left_rights_from_root_to_pos = COMERST_tokenizer.left_right_seq_from_root_to_edu_pos( idx )
             
             # Convert sequence of LRs to a sequence of -1 and 1s and 0s
             for idx1, val in enumerate(left_rights_from_root_to_pos):
@@ -311,7 +312,7 @@ class COMERST(nn.Module):
     def __init__(self, 
                     base_model_name='bart_base', model_name="COMERST",
                     scale_grad_by_freq=False,
-                    max_len_head=20,
+                    max_len_head=80,
                     max_len_tail=20,
                     max_edu_nodes_to_select=-1,
                     filter_atomic_rels=False,
@@ -354,17 +355,19 @@ class COMERST(nn.Module):
         if self.rst_pos_embed_type == 1:
             self.embedding_rst_pos = torch.nn.Embedding( (2*self.tokenizer.rst_pos_maxidx +2 ) + 1 +1 , self.transformer.config.d_model, 
                                     padding_idx=(2*self.tokenizer.rst_pos_maxidx+2)+1 , scale_grad_by_freq=self.scale_grad_by_freq )
+            #self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.001)
 
         elif self.rst_pos_embed_type == 2:
             
-            self.embedding_rst_pos = EmbeddingRstPos(  self.tokenizer.left_right_seq_from_root_to_edu_pos,
-                                                    max_rst_index=self.tokenizer.rst_pos_maxidx,
-                                                        max_rst_level = self.tokenizer.node_level(self.tokenizer.rst_pos_maxidx),
-                                                rst_encoding_ndim=self.transformer.config.d_model)
+            self.embedding_rst_pos = EmbeddingRstPos(  COMERST_tokenizer.left_right_seq_from_root_to_edu_pos,
+                                                        max_rst_index=self.tokenizer.rst_pos_maxidx,
+                                                        max_rst_level = COMERST_tokenizer.node_level(self.tokenizer.rst_pos_maxidx),
+                                                        rst_encoding_ndim=self.transformer.config.d_model)
             
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.tokenizer.rst_ns_li )+1, self.transformer.config.d_model,
                                     padding_idx=len(self.tokenizer.rst_ns_li ), scale_grad_by_freq=self.scale_grad_by_freq )
+        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.001)
 
         # self.embedding_kp_score = torch.nn.Conv1d( 1, self.transformer.config.d_model , kernel_size=1, bias=False)
         # self.embedding_kp_score.weight.data.normal_(mean=0.0, std=0.005
@@ -381,9 +384,9 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical1":
             # This is the normal embedding layer for COMET model
-                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST - essentially a bias term
-            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
-            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
+                # NOTE: cancelled We allow one extra embedding position to act as a domain shift embedding position from COMET to RST - essentially a bias term
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) 
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
@@ -397,7 +400,7 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical2":
             # This is the normal embedding layer for COMET model
-                # We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
+                # NOTE: cancelled -> We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
             rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
             rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
@@ -409,9 +412,11 @@ class COMERST(nn.Module):
 
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
-                torch.nn.Linear( 80, 80 , bias=rst_embed_bias ) ,
-                torch.nn.Tanh(),
-                torch.nn.Linear( 80, rel_embed_len_atomic , bias=rst_embed_bias ) ,
+                torch.nn.Linear( 80, 160 , bias=rst_embed_bias ) ,
+                torch.nn.GELU(),
+                torch.nn.Linear( 160, 80 , bias=rst_embed_bias ) ,
+                torch.nn.GELU(),
+                torch.nn.Linear( 80, rel_embed_len_atomic, bias=rst_embed_bias ) ,
                 torch.nn.Tanh(),
             )
             self.embedding_rels_rst.padding_idx = self.embedding_rels_rst[0].padding_idx
@@ -437,8 +442,8 @@ class COMERST(nn.Module):
                 utils.freeze_params(d.embed_positions)
                 utils.freeze_params(d.embed_tokens)
             
-            utils.freeze_params( self.transformer.model.decoder.layers )
-            utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
+            # utils.freeze_params( self.transformer.model.decoder.layers )
+            # utils.freeze_params( self.transformer.model.decoder.layernorm_embedding )
         
         #endregion
 
@@ -462,13 +467,13 @@ class COMERST(nn.Module):
 
         self.generate = self.transformer.generate
         self.config = self.transformer.config
+        #self.config.force_bos_token_to_be_generated = True
         self.get_encoder = self.transformer.get_encoder
         self.get_decoder = self.transformer.get_decoder
 
         self.pad_values = {'head_ids':self.transformer.model.shared.padding_idx , 
                         'head_treepos_ids':self.embedding_rst_pos.padding_idx, 
                         'head_kpscores':0.0,
-
                         
                         'rst_treepos_ids': self.embedding_rst_pos.padding_idx,
                         'rst_ns_ids': self.embedding_rst_ns.padding_idx, 
@@ -483,7 +488,11 @@ class COMERST(nn.Module):
                         
                         'labels': self.loss_fct.ignore_index,
 
-                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx  
+                        'position_ids_head':self.transformer.model.encoder.embed_positions.padding_idx if 
+                                        self.transformer.model.encoder.embed_positions.padding_idx else 0, 
+
+                        'li_edu_pos_for_head':0,
+                        'li_edu_pos_for_tail':0
                         }
         
         if self.relation_embedding == 'flattened':
@@ -494,7 +503,6 @@ class COMERST(nn.Module):
         
         elif self.relation_embedding == "hierarchical2":
             self.pad_values['rst_rel_ids'] = self.embedding_rels_rst[0].padding_idx
-
 
     def forward(self, input_, return_dict=None):
 
@@ -529,13 +537,22 @@ class COMERST(nn.Module):
             #the labels are automatically aligned as per the GPT2 code
             #TODO: reevaluate whether bos or eos is the best method to use as start of output
                 # right now we use the edu token to start sentences. The EDU token is just the bos token
+            
             shift_logits_comet = lm_logits_comet[..., :-1, :].contiguous()
             shift_labels_comet = labels_comet[..., 1:].contiguous() 
+
+            # shift_logits_comet = lm_logits_comet.contiguous()
+            # shift_labels_comet = labels_comet.contiguous()
+
             lm_loss_comet = self.loss_fct(shift_logits_comet.view(-1, self.transformer.config.vocab_size), shift_labels_comet.view(-1))
 
         if  labels_rst is not None:
             shift_logits_rst = lm_logits_rst[..., :-1, :].contiguous()
             shift_labels_rst = labels_rst[..., 1:].contiguous() 
+
+            # shift_logits_rst = lm_logits_rst.contiguous()
+            # shift_labels_rst = labels_rst.contiguous()
+
             lm_loss_rst = self.loss_fct(shift_logits_rst.view(-1, self.transformer.config.vocab_size), shift_labels_rst.view(-1))
         #endregion
 
@@ -587,7 +604,7 @@ class COMERST(nn.Module):
     def forward_embed_rst(self,  
                             head_ids,
                             head_treepos_ids,
-                            head_kpscores,
+                            #head_kpscores,
                             rst_rel_ids,
                             rst_treepos_ids,
                             rst_ns_ids,
@@ -596,7 +613,7 @@ class COMERST(nn.Module):
                             attention_mask_rel, 
                             position_ids_head,
                             tail_ids=None,
-                            tail_kpscore=None,
+                            #tail_kpscore=None,
                             labels = None,
                             **kwargs
                             ):
@@ -608,7 +625,7 @@ class COMERST(nn.Module):
             # embed kpscore
             # add positional encoding
         
-        inputs_embed_head = self.transformer.model.shared( head_ids )
+        inputs_embed_head = self.transformer.model.shared( head_ids )*self.transformer.model.encoder.embed_scale
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
         #inputs_embed_head += self.embedding_kp_score( head_kpscores )
@@ -618,7 +635,7 @@ class COMERST(nn.Module):
             inputs_embed_rel = self.embedding_rels( rst_rel_ids )
         elif self.relation_embedding == "hierarchical1":
             _ = self.embedding_rels_rst( rst_rel_ids )
-            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) # embedding vector times all the embedding vectors from the comet things
+            inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight ) # embedding vector times all the embedding vectors from the comet things
         elif self.relation_embedding == "hierarchical2":
             _ = self.embedding_rels_rst( rst_rel_ids )
             inputs_embed_rel = torch.matmul( _, self.embedding_rels_atomic.weight.detach() ) 
@@ -628,7 +645,6 @@ class COMERST(nn.Module):
 
         inputs_embeds = torch.cat( [ inputs_embed_head, inputs_embed_rel ], axis=-2)
         
-        inputs_embeds *= self.transformer.model.encoder.embed_scale
         #endregion
 
         # region reforming attention mask
@@ -639,7 +655,7 @@ class COMERST(nn.Module):
         if self.attention_type == 1:
             attention_mask[:, -attention_mask_rel.shape[1]:, :] = 1 
 
-        elif self.attention_type == 2:
+        elif self.attention_type==2:
             attention_mask[  : , -attention_mask_rel.shape[1]: , -attention_mask_rel.shape[1]: ] = 1
         # endregion
 
@@ -665,13 +681,11 @@ class COMERST(nn.Module):
             # adding a conditioning token at start of sequence to indicate 
             # note we don't add token type ids to output since, the tti for head and tail entities is the padding vector of 0s
         if tail_ids != None:
-            decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
-                                self.embedding_rst_pos( tail_treepos_ids ) 
-
-                            
-            #TODO: think of way to incorporate a keyphrase score prediction
-        
-            decoder_inputs_embeds = decoder_inputs_embeds * self.transformer.model.decoder.embed_scale
+            decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) * self.transformer.model.decoder.embed_scale
+            
+            decoder_inputs_embeds += self.embedding_rst_pos( tail_treepos_ids )                             
+                    
+            decoder_inputs_embeds = decoder_inputs_embeds 
             output['decoder_inputs_embeds'] = decoder_inputs_embeds
         #endregion
 
@@ -697,10 +711,10 @@ class COMERST(nn.Module):
             # embed head_ids and 
             # emed rels_ids and tail_treepos_ids
             
-        inputs_embed_head = self.transformer.model.shared( head_ids )
+        inputs_embed_head = self.transformer.model.shared( head_ids ) * self.transformer.model.encoder.embed_scale
         inputs_embed_head += self.embedding_rst_pos( head_treepos_ids )
         inputs_embed_head += nn.Embedding.forward(self.transformer.model.encoder.embed_positions, position_ids_head )
-
+            
         if self.relation_embedding == "flattened":
             inputs_embed_rel = self.embedding_rels( rels_ids )
         else:
@@ -722,7 +736,7 @@ class COMERST(nn.Module):
                                                      attention_mask=attention_mask  )
         #endregion
         
-        #region decoderinputs_embeds
+        #region decoder inputs_embeds
             #token type ids does not have to be added to decoder input embeds
         decoder_inputs_embeds = self.transformer.model.shared( tail_ids ) + \
                                 self.embedding_rst_pos( tail_treepos_ids ) 
@@ -821,15 +835,15 @@ class COMERST(nn.Module):
             _ = input_.pop('labels',None)
             _ = input_.pop('decoder_inputs_embeds',None)
 
-            # inserting decoder_input_ids
-            decoder_start_token_id = self.config.eos_token_id
-            bos_token_id = self.config.bos_token_id
-            decoder_start_token_id = self.transformer._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
-
+            #inserting decoder_input_ids
+            # decoder_start_token_id = self.config.eos_token_id
+            # bos_token_id = self.config.bos_token_id
+            decoder_start_token_id = self.transformer._get_decoder_start_token_id()  #  decoder_start_token_id, bos_token_id)
             decoder_input_ids = (
                 torch.ones(( input_['inputs_embeds'].shape[0], 1), dtype=torch.long, device=input_['inputs_embeds'].device) * decoder_start_token_id
                 )
             input_['decoder_input_ids'] = decoder_input_ids
+
 
             summaries = self.transformer.generate(
                 decoder_start_token_id=decoder_start_token_id,
@@ -894,12 +908,11 @@ class COMERST(nn.Module):
     def compress_padding( self,
         input_ids, pad_token_id, inputs_embeds, attention_mask):
         """ First for each datum remove all padding due to the head parts
-            Then use pad sequence to ensure they are all the same elnght"""
+            Then use pad sequence to ensure they are all the same length"""
         
         """Remove columns that are populated exclusively by pad_token_id"""
         keep_column_mask = input_ids.ne(pad_token_id)
         
-
         inputs_embeds = self.compress_padding_inner(inputs_embeds, 1, keep_column_mask)
         attention_mask = self.compress_padding_inner(attention_mask, 2, keep_column_mask)
         
@@ -1116,114 +1129,147 @@ class COMERST_tokenizer():
                 'li_edu_pos_for_tail':None,
             }
 
-        encoded = {}
-        #region encoding tail
+        try:
+            with timeout(seconds=5):        
+                encoded = {}
+                #region encoding tail
 
-            # Encoded tail information.
-        if tailkp_score != None:
-            tail_kp, tail_score = tailkp_score
-            
-            labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
-                return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
-            tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2)
-
-            tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
-            encoded['tail_ids'] = tail_ids
-            encoded['tail_kpscore'] = tail_kpscore
-            encoded['labels'] = labels
+                    # Encoded tail information.
+                if tailkp_score != None:
+                    tail_kp, tail_score = tailkp_score
                     
-        else:
-            tail_ids = None
-            tail_kpscore = None
+                    # labels =  self.base_tokenizer.encode( tail_kp, add_prefix_space=True, 
+                    #     return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze()
+                    #tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2).squeeze(0)
 
-        tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
-        tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
-        _shape = tail_ids.shape if tailkp_score!= None else [1]
-        #tail_treepos_ids = tail_ids.new_full( _shape , tail_edus_parent_pos )
-        tail_treepos_ids = torch.full(_shape, tail_edus_parent_pos, dtype=torch.long)
+                    tail_ids = self.base_tokenizer.encode( tail_kp, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze(0)
+                    labels = tail_ids.squeeze(0)
+
+                    tail_kpscore = torch.full( tail_ids.shape, tail_score , dtype=torch.float32)
+                    encoded['tail_ids'] = tail_ids
+                    encoded['tail_kpscore'] = tail_kpscore
+                    encoded['labels'] = labels
+                            
+                else:
+                    tail_ids = None
+                    tail_kpscore = None
+
+                tail_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_tail)
+                tail_edus_parent_pos = clamp_values( np.asarray(tail_edus_parent_pos),  MAX_LONG_VALUE ).item()
+                _shape = tail_ids.shape if tailkp_score!= None else [1]
+                tail_treepos_ids = torch.full(_shape, tail_edus_parent_pos, dtype=torch.long)
+                
+                encoded['tail_treepos_ids'] = tail_treepos_ids
+                #endregion
+
+                # region encoding head
+                    # encode list of keyphrases and scores that are input to encoder
+                li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
+                                max_length=self.max_len_head  ) for head, score in li_headkp_score ]
+                head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
+                li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
+                li_headkpscore = [ score for head, score in li_headkp_score ]
+                li_headkpscores =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_headkpscore, li_head_ids ) ]
+
+                    #flattening and converting to tensor
+                head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
+                li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
+                li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
+                head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
+                head_kpscores = torch.tensor( sum( li_headkpscores, []) )
+
+                encoded['head_ids'] = head_ids
+                encoded['head_treepos_ids'] = head_treepos_ids
+                encoded['head_kpscores'] = head_kpscores
+                #endregion 
+            
+                # region relation : encoded list of rst parent nodes information
+                rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel_ ], dtype=torch.long).squeeze(dim=-1)[:10]
+                rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos_),MAX_LONG_VALUE), dtype=torch.long )[:10]
+                rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns_], dtype=torch.long).squeeze(dim=-1)[:10]
+                encoded['rst_rel_ids']= rst_rel_ids
+                encoded['rst_treepos_ids']=rst_treepos_ids
+                encoded['rst_ns_ids']=rst_ns_ids
+                #endregion
+
+                #region attention mask
+                    #For rst we require 
+                        # 1) bidirectional attention over each keyphrase chunk
+                        # each keyphrase chunk can not attend directly to other keyphrase chunks
+                        # 2) all encoder inputs can attend to rst relation tree info
+                
+                attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+
+                    # here we implement the diagonal attention for each sub keyphrase
+                    # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
+                    # it should also refer to the relations
+                curr_bos_token_pos=0
+                
+                for hids in li_head_ids:
+                    len_ids = len(hids)
+                    _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+
+                    attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
+                        curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
+
+                    curr_bos_token_pos += len_ids
+                
+                # Create the 1dimensional mask representing tail attn. We appnd this later
+                attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
+                encoded['attention_mask_head']=attention_mask_head
+                encoded['attention_mask_rel']= attention_mask_rel
+                
+                #endregion
+
+                #region position_ids
+                    #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
+                        # , and the rest of the tokens have position ids in 
+                        # the range (2, seq_length - num_pad_tokens). It's implemented like this to
+                        #  match the original implementation in fairseq.
+                
+                    #for position ids, it restarts from 1 for every new key phrase edu
+                    # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
+                    # No positional ids for relation section
+
+                position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
+
+                for head in li_head_ids:
+                    new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
+                    position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
+                encoded['position_ids_head']= position_ids_head
+                #endregion      
+                
+                encoded['li_edu_pos_for_head']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_head), max=MAX_LONG_VALUE ), dtype=torch.long)
+                encoded['li_edu_pos_for_tail']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_tail), max=MAX_LONG_VALUE), dtype=torch.long)
         
-        encoded['tail_treepos_ids'] = tail_treepos_ids
-        #endregion
+        except TimeoutInterrupt as e:
+            return {
+                #head
+                'head_ids': None ,
+                'head_treepos_ids': None,
+                'head_kpscores': None,
 
-        # region encoding head
-            # encode list of keyphrases and scores that are input to encoder
-        li_head_ids = [ self.base_tokenizer.encode( head, add_prefix_space=True, truncation=True, 
-                        max_length=self.max_len_head  ) for head, score in li_headkp_score ]
-        head_edus_parent_pos = self.lowest_shared_parent_node(li_edu_pos_for_head)
-        li_li_head_treepos_ids = [ [head_edus_parent_pos]*len(ids) for  ids in li_head_ids  ] #creating a li of li of graph pos indexes for each keyphrase
-        li_headkpscore = [ score for head, score in li_headkp_score ]
-        li_headkpscores =  [ [kpscore]*len(ids) for kpscore, ids in zip( li_headkpscore, li_head_ids ) ]
+                #relation: tree information
+                'rst_rel_ids': None ,
+                'rst_treepos_ids': None,
+                'rst_ns_ids': None,
 
-            #flattening and converting to tensor
-        head_ids = torch.tensor( sum(li_head_ids,[]), dtype=torch.long)
-        li_head_treepos_ids = sum(li_li_head_treepos_ids, [])
-        li_head_treepos_ids = clamp_values( np.asarray(li_head_treepos_ids), MAX_LONG_VALUE)
-        head_treepos_ids = torch.tensor( li_head_treepos_ids, dtype=torch.long)
-        head_kpscores = torch.tensor( sum( li_headkpscores, []) )
+                #tail
+                'tail_ids': None,
+                'tail_treepos_ids': None ,
+                'tail_kpscore':None,
 
-        encoded['head_ids'] = head_ids
-        encoded['head_treepos_ids'] = head_treepos_ids
-        encoded['head_kpscores'] = head_kpscores
-        #endregion 
-    
-        # region relation : encoded list of rst parent nodes information
-        rst_rel_ids = torch.tensor(  [self.rst_rel_labeler.transform_patch([rel]) for rel in li_rst_rel_ ], dtype=torch.long).squeeze(dim=-1)[:10]
-        rst_treepos_ids = torch.tensor( clamp_values(np.asarray(li_rst_pos_),MAX_LONG_VALUE), dtype=torch.long )[:10]
-        rst_ns_ids =  torch.tensor( [ self.rst_ns_labeler.transform([ns]) for ns in li_rst_ns_], dtype=torch.long).squeeze(dim=-1)[:10]
-        encoded['rst_rel_ids']= rst_rel_ids
-        encoded['rst_treepos_ids']=rst_treepos_ids
-        encoded['rst_ns_ids']=rst_ns_ids
-        #endregion
+                'attention_mask_head': None,
+                'attention_mask_rel': None,
+                'position_ids_head': None,
 
-        #region attention mask
-            #For rst we require 
-                # 1) bidirectional attention over each keyphrase chunk
-                # each keyphrase chunk can not attend directly to other keyphrase chunks
-                # 2) all encoder inputs can attend to rst relation tree info
-        
-        attention_mask_head = torch.zeros( [head_ids.shape[-1], head_ids.shape[-1]], dtype=torch.long  )
+                'labels':None,
 
-            # here we implement the diagonal attention for each sub keyphrase
-            # NOTE: here each edu keyphrase ony refers to itself in a bidirectional manner, It does not refer to other keyphrases
-            # it should also refer to the relations
-        curr_bos_token_pos=0
-        
-        for hids in li_head_ids:
-            len_ids = len(hids)
-            _ =  attention_mask_head.new_ones( [len_ids, len_ids] )
+                #vars used during inference,
+                'li_edu_pos_for_head':None,
+                'li_edu_pos_for_tail':None,
+            }
 
-            attention_mask_head[ curr_bos_token_pos:curr_bos_token_pos+len_ids, 
-                curr_bos_token_pos : curr_bos_token_pos+len_ids   ] = _
-
-            curr_bos_token_pos += len_ids
-        
-        # Create the 1dimensional mask representing tail attn. We appnd this later
-        attention_mask_rel = torch.ones( [rst_rel_ids.shape[-1]] , dtype=torch.long )
-        encoded['attention_mask_head']=attention_mask_head
-        encoded['attention_mask_rel']= attention_mask_rel
-        
-        #endregion
-
-        #region position_ids
-            #RoBERTa never uses 0 and 1 positional ids, in ROBERTa, all pad tokens have position id of 1
-                # , and the rest of the tokens have position ids in 
-                # the range (2, seq_length - num_pad_tokens). It's implemented like this to
-                #  match the original implementation in fairseq.
-        
-            #for position ids, it restarts from 1 for every new key phrase edu
-            # the 2 offset is explained here https://github.com/huggingface/transformers/issues/10736
-            # No positional ids for relation section
-
-        position_ids_head = head_ids.new_full( (0,), 0.0, dtype=torch.long )
-
-        for head in li_head_ids:
-            new_ids = torch.arange( len( head ), dtype=torch.long ) + 2
-            position_ids_head = torch.cat( [ position_ids_head, new_ids ]  )
-        encoded['position_ids_head']= position_ids_head
-        #endregion      
-         
-        encoded['li_edu_pos_for_head']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_head), max=MAX_LONG_VALUE ), dtype=torch.long)
-        encoded['li_edu_pos_for_tail']=torch.tensor( clamp_values( np.asarray(li_edu_pos_for_tail), max=MAX_LONG_VALUE), dtype=torch.long)
         return encoded
 
     def tokenize_comet( self, head, rel, tail  ):
@@ -1247,8 +1293,11 @@ class COMERST_tokenizer():
         rels_ids = torch.tensor( self.atomic_rel_labeler.transform( [rel] ), dtype=torch.long )
         rels_ids = rels_ids
 
-        labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
-        tail_ids = shift_tokens_right(labels, pad_token_id=1, decoder_start_token_id=2 )
+        # labels = self.base_tokenizer.encode(  tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail )
+        # tail_ids = shift_tokens_right(labels.unsqueeze(0), pad_token_id=1, decoder_start_token_id=2 ).squeeze(0)
+        
+        tail_ids = self.base_tokenizer.encode( tail, add_prefix_space=True, return_tensors='pt', truncation=True, max_length=self.max_len_tail ).squeeze(0)
+        labels = tail_ids
         
         #endregion 
 
@@ -1282,7 +1331,7 @@ class COMERST_tokenizer():
         #endregion
 
         #region position_ids and labels
-        position_ids_head = new_ids = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
+        position_ids_head = torch.arange( head_ids.shape[-1] , dtype=torch.long ) + 2
 
         
         #endregion
@@ -1292,14 +1341,14 @@ class COMERST_tokenizer():
             'head_treepos_ids':head_treepos_ids,
             'position_ids_head': position_ids_head,
 
-            'tail_ids':tail_ids.squeeze(),
+            'tail_ids':tail_ids,
             'tail_treepos_ids':tail_treepos_ids,
             
             'rels_ids':rels_ids,
             'rels_treepos_ids': rels_treepos_ids,
 
             'attention_mask': attention_mask,
-            'labels':labels.squeeze()
+            'labels':labels
         }
 
     def tokenize_comet_person_randomizer(self, head, rel, tail):
@@ -1622,8 +1671,6 @@ class COMERST_tokenizer():
         pronoun = random.choice( [ pron for pron in self.personal_pronouns if pron not in exclude_vals ] )
         return pronoun
 
-
-
     def rst_split_into_hrt(self, li_rst, dict_pos_edu):
 
         # - at first we will only train with one other chunk. so one to one.
@@ -1642,7 +1689,7 @@ class COMERST_tokenizer():
 
                     # getting a list of all graph posiitons of edus in li_edus
                 li_edu_pos =  [ pos for pos, edu in dict_pos_edu.items() ]
-                li_edu_pos.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
+                li_edu_pos.sort(key=lambda edu_pos: ( COMERST_tokenizer.edukp_pos_sort_function(edu_pos), edu_pos ) )
                 #endregion
 
                 # region - Selecting a subtree from the  RST tree to focus on
@@ -1670,12 +1717,7 @@ class COMERST_tokenizer():
 
                 li_tailkp_score = []
                 li_headkp_score = []
-                #attempts = 1
-                
-                # Extracting list of tailkp and headkp. repeat until adequate keyphrases are selected
-                #while len(li_tailkp_score)==0 or len(li_headkp_score)==0 and attempts<=5:
-                
-                #for attempt in range(3):
+                                
                 count_edus_for_head = random.randint(min_edus_in_chunk, max_edu_nodes_to_select_for_head)
                 start_edu_node_idx_for_head = random.randint(0, count_edus_in_record-edus_in_tail-count_edus_for_head )
                 
@@ -1779,12 +1821,13 @@ class COMERST_tokenizer():
 
     def rst_pos_bounding(self, rst_pos):
 
-        rst_pos = torch.where( rst_pos>self.tokenizer.rst_pos_maxidx, torch.ceil( (rst_pos-2)/2 ).long()  ,rst_pos )
+        rst_pos = torch.where( rst_pos>self.tokenizer.rst_pos_maxidx, torch.ceil( (rst_pos-2)/2 ).long(), rst_pos )
 
         return rst_pos
 
+    @staticmethod
     @lru_cache()
-    def left_right_seq_from_root_to_edu_pos(self, edukp_pos: int):
+    def left_right_seq_from_root_to_edu_pos( edukp_pos: int):
             # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
         parent_pos = edukp_pos
@@ -1804,9 +1847,10 @@ class COMERST_tokenizer():
             parent_pos = math.floor(parent_pos)
         
         return li_leftright_seq
-
+    
+    @staticmethod
     @lru_cache()
-    def edukp_pos_sort_function(self, edukp_pos: int):
+    def edukp_pos_sort_function(edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
             # sort_function
             # from root_pos find the sequence of left/rights down the tree to each edukp_pos
@@ -1814,7 +1858,7 @@ class COMERST_tokenizer():
             # Then retun this float
             # NOTE: intuition -> imageine binary tree is collapsed to a flatline. root=0 , left/right from parent= +/- 0.5^n
 
-        li_leftright_seq = self.left_right_seq_from_root_to_edu_pos(edukp_pos) 
+        li_leftright_seq = COMERST_tokenizer.left_right_seq_from_root_to_edu_pos(edukp_pos) 
         
         # Now calculate the flattened position using the sequence of left and rights
         _ = {'L':-1, 'R':+1}
@@ -1843,11 +1887,10 @@ class COMERST_tokenizer():
             
             elif root_found == True:
                 #find the nodes that
-                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] 
-                                                        for pos in li_edu_pos   ]
+                nodes_in_minimum_spanning_tree = [ self.node_x_reachable_from_node_y( candidiate_root_node, pos )[1] for pos in li_edu_pos   ]
                 nodes_in_minimum_spanning_tree = sum(nodes_in_minimum_spanning_tree, [])
                 nodes_in_minimum_spanning_tree = list(set(nodes_in_minimum_spanning_tree))
-                nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( self.edukp_pos_sort_function(edu_pos), edu_pos ) )
+                nodes_in_minimum_spanning_tree.sort(key=lambda edu_pos: ( COMERST_tokenizer.edukp_pos_sort_function(edu_pos), edu_pos ) )
 
                 if not nodes_in_minimum_spanning_tree == li_rst_pos:
                     bool_filter = [ pos in nodes_in_minimum_spanning_tree for pos in li_rst_pos ]
@@ -1860,7 +1903,7 @@ class COMERST_tokenizer():
             # This is to match the rst pos embedding  embedding layer behaviour which only 
             # models rst_pos up to a certain level
         if max(li_rst_pos) > self.rst_pos_maxidx:
-            l = [ [rel, pos, ns] for rel, pos, ns in zip(li_rst_rel, li_rst_pos, li_rst_ns) if self.node_level(pos)<=self.rst_pos_maxidx ] 
+            l = [ [rel, pos, ns] for rel, pos, ns in zip(li_rst_rel, li_rst_pos, li_rst_ns) if COMERST_tokenizer.node_level(pos)<=self.rst_pos_maxidx ] 
             li_rst_rel, li_rst_pos, li_rst_ns = [ list(t) for t in zip( *l ) ]
 
         return li_rst_pos, li_rst_rel, li_rst_ns
@@ -1879,7 +1922,7 @@ class COMERST_tokenizer():
         root_found = False
         candidiate_root_node = self.parent_node_pos(smallest_edu_pos)
 
-        while root_found==False:
+        while root_found==False and candidiate_root_node>=0:
             root_found = all( self.node_x_reachable_from_node_y( candidiate_root_node, pos )[0] for pos in li_edupos )
             
             if root_found == False:
@@ -1910,13 +1953,14 @@ class COMERST_tokenizer():
 
         return parent_node
     
+    @staticmethod
     @lru_cache()
-    def node_level(self, node_pos):
+    def node_level(node_pos):
         val = math.floor( math.log( node_pos+1 , 2 ) )
         
         return val
 
-    @lru_cache(maxsize=4000)
+    @lru_cache(maxsize=None)
     def node_x_reachable_from_node_y(self, nodex, nodey):
         """returns (bool, [sequence showing path from nodex down tre to nodey])
 
@@ -1953,13 +1997,14 @@ class COMERST_tokenizer():
 
             # Check if new curr node is on same level as nodex.
                 # if yes At which point we know nodex is not directly reachable if curr_node is not nodex
-            if self.node_level(curr_node) == self.node_level(nodex):
+            if COMERST_tokenizer.node_level(curr_node) == COMERST_tokenizer.node_level(nodex):
                 reachable = (curr_node == nodex)
 
         
         return reachable, parent_path
 
 # endregion        
+
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 
@@ -1986,6 +2031,7 @@ class TrainingModule(pl.LightningModule):
         self.batch_size = batch_size
         self.gpus =  gpus
         self.model = COMERST( **model_params )
+        #self.model.requires_grad_(False)
         self.randomize_comet_pronouns = randomize_comet_pronouns
         self.model.tokenizer.randomize_comet_pronouns = self.randomize_comet_pronouns
         self.remove_to = remove_to
@@ -2037,9 +2083,9 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=28, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
-        parser.add_argument('-s','--batch_size', default=100, type=int)
-        parser.add_argument('-l','--learning_rate', default=5e-4, type=float)
-        parser.add_argument('--warmup_proportion', default=0.25)
+        parser.add_argument('-s','--batch_size', default=5, type=int)
+        parser.add_argument('-l','--learning_rate', default=1e-4, type=float)
+        parser.add_argument('--warmup_proportion', default=0.1)
         parser.add_argument('--workers', default=12, type=int) 
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
@@ -2135,13 +2181,11 @@ class TrainingModule(pl.LightningModule):
             filename='{epoch:03d}_{val_loss:.5f}')
         
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model, checkpoint_callback) #monkey patch
-        #checkpoint_callback._monitor_candidates = types.MethodType(utils._monitor_candidates, checkpoint_callback) # monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
-            #monitor='val_loss_comet',
             min_delta=0.00,
-            patience=5,
+            patience=7,
             verbose=False,
             mode='min'
         )
@@ -2158,20 +2202,17 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
-                        #check_val_every_n_epoch=1,
+                        
                         logger=tb_logger,
-                        #log_every_n_steps=20,
+                        
                         precision=tparams['precision'], callbacks=callbacks,
-                        #accelerator='ddp2', amp_level='O2',
+                        
                         accelerator=accelerator,
-                        limit_train_batches =10,
-                        limit_val_batches = 5,
-                        #val_check_interval=0.3,
+                        val_check_interval=0.3,
                         num_sanity_val_steps=0, 
-                        #overfit_batches=25,
-                        #reload_dataloaders_every_epoch=True,
-                        reload_dataloaders_every_epoch=False,
+                        reload_dataloaders_every_epoch=True,
                         multiple_trainloader_mode='max_size_cycle'
+                        
                         )
 
         elif tparams['mode'] in ["train_cont","inference"]:
@@ -2185,11 +2226,9 @@ class TrainingModule(pl.LightningModule):
                     #log_every_n_steps=20,   
                     precision=tparams['precision'],
                     callbacks=callbacks,
-                    #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
-                    #limit_train_batches = 0.4,
-                    #val_check_interval=0.5,
-                    #limit_val_batches = ,
+                        # limit_train_batches =20,
+                        # limit_val_batches = 5,
                     val_check_interval=0.3,
                     num_sanity_val_steps=0,
                     #track_grad_norm = True,
@@ -2250,8 +2289,14 @@ class TrainingModule(pl.LightningModule):
     
     @staticmethod
     def get_ckpt_file(_dir_checkpoint,mode='best'):
+        
         if mode=='best':
             checkpoint_yaml_file = os.path.join( _dir_checkpoint,"best_k_models.yaml" )
+            
+            ckpt_exists = os.path.exists(checkpoint_yaml_file)
+            if ckpt_exists == False:
+                return None
+            
             scores_dict = yaml.load( open(checkpoint_yaml_file,"r"), Loader = yaml.FullLoader ) #key= ckptpath, value = val_loss
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
 
@@ -2374,7 +2419,7 @@ class TrainingModule(pl.LightningModule):
         output = {}
         if step_name == 'train':
             output["loss"] = loss
-
+            
         else:       
             self.log( loss_key, loss)
             output[ loss_key ]=loss
@@ -2417,156 +2462,168 @@ class TrainingModule(pl.LightningModule):
                 loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
-        if step_name == "val" and _get_rank() == 0 :
-            bad_words = ['"']
-            bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words ]
-            
-            generation_kwargs = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
-                                'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
-                                'min_length':3, 'max_length':20 }
+        try:
+            with timeout(seconds= 120 ):
+                if step_name == "val" and _get_rank() == 0 :
+                    bad_words = ['"', ' "']
+                    bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words ]
                     
-                    # At end of validation loop produce some quantitative examples of model's performance
+                    generation_kwargs_comet = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                        'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                        'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                        'min_length':4, 'max_length':18 }
 
-            # Making directory for inference testing results
-            dir_infer = os.path.join(self.trainer.log_dir,"inference")
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer,exist_ok=True)
-        
-            # data holders
-            li_comet_heads = []
-            li_comet_rels = []
-            li_comet_preds = []
-            li_comet_tails = []
+                    generation_kwargs_rst = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                        'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                        'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                        'min_length':4, 'max_length':10 }
+                            
+                            # At end of validation loop produce some quantitative examples of model's performance
 
-            li_rst_heads = []
-            li_rst_rels = []
-            li_rst_preds = []
-            li_rst_tails = []
-
-            for idx, batch in enumerate( self.inference_samples ):
+                    # Making directory for inference testing results
+                    dir_infer = os.path.join(self.trainer.log_dir,"inference")
+                    if not os.path.exists(dir_infer):
+                        os.makedirs(dir_infer,exist_ok=True)
                 
-                # COMET testing
-                if 'comet' in batch:
-                    batch_comet =       batch['comet']
-                    batch_comet_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids, skip_special_tokens=True  ).strip() for head_ids in batch_comet['head_ids'] ]
-                    batch_comet_rels =  [ self.model.tokenizer.atomic_rel_labeler.inverse_transform( rels_ids ) for rels_ids in batch_comet['rels_ids'].cpu().numpy().tolist() ]
-                    batch_tails_comet = [  self.model.tokenizer.base_tokenizer.decode( tail_ids , skip_special_tokens=True  ).strip()  for tail_ids in batch_comet['tail_ids'] ]
+                    # data holders
+                    li_comet_heads = []
+                    li_comet_rels = []
+                    li_comet_preds = []
+                    li_comet_tails = []
 
-                    preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs )
-                    
-                    li_comet_heads.extend(batch_comet_heads)
-                    li_comet_rels.extend(batch_comet_rels)
-                    li_comet_tails.extend(batch_tails_comet)
-                    li_comet_preds.extend(preds)
+                    li_rst_heads = []
+                    li_rst_rels = []
+                    li_rst_preds = []
+                    li_rst_tails = []
 
-                # RST Testing
-                if 'rst' in batch:
-                    batch_rst = batch['rst']
+                    for idx, batch in enumerate( self.inference_samples ):
+                        
+                        # COMET testing
+                        if 'comet' in batch:
+                            batch_comet =       batch['comet']
+                            batch_comet_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids, skip_special_tokens=True  ).strip() for head_ids in batch_comet['head_ids'] ]
+                            batch_comet_rels =  [ self.model.tokenizer.atomic_rel_labeler.inverse_transform( rels_ids ) for rels_ids in batch_comet['rels_ids'].cpu().numpy().tolist() ]
+                            batch_tails_comet = [  self.model.tokenizer.base_tokenizer.decode( tail_ids , skip_special_tokens=True  ).strip()  for tail_ids in batch_comet['tail_ids'] ]
+
+                            preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs_comet )
                             
-                    # RST -  prediction for every elem in batch
-                    preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs )
+                            li_comet_heads.extend(batch_comet_heads)
+                            li_comet_rels.extend(batch_comet_rels)
+                            li_comet_tails.extend(batch_tails_comet)
+                            li_comet_preds.extend(preds)
+
+                        # RST Testing
+                        if 'rst' in batch:
+                            batch_rst = batch['rst']
                                     
-                    #batch decoding to get original data for each elem in batch
-                    batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
-                    batch_rst_heads = [ [ _.strip("<s>").strip("</").strip() for _ in heads_rst ] for heads_rst in batch_rst_heads ]
-                    
-                    batch_heads_treepos_rst =  batch_rst['head_treepos_ids'].cpu().numpy().tolist()
-                    batch_heads_treepos_rst = [ [ key for key, group in groupby(treepos) ] for treepos in batch_heads_treepos_rst ]
-                    
-                    batch_edu_pos_for_head = batch_rst.get('li_edu_pos_for_head',None).cpu().numpy().tolist()
-                    
-                    batch_rels_ids_rst = [ self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( rst_rel_ids ).tolist() for rst_rel_ids in batch_rst['rst_rel_ids'].tolist() ]                    
-                    batch_rels_treepos_rst = [ id_ for id_ in batch_rst['rst_treepos_ids'].tolist() if id_!= self.model.embedding_rst_pos.padding_idx]
-                    
-                    batch_ns_rst = [ [ns for ns in rst_ns_ids if ns<len(self.model.tokenizer.rst_ns_labeler.classes_)  ] for rst_ns_ids in batch_rst['rst_ns_ids'].tolist() ]
-                    batch_rels_ns_rst = [ self.model.tokenizer.rst_ns_labeler.inverse_transform( rst_ns_id ).tolist() for rst_ns_id in batch_ns_rst ]
-
-                    batch_tails_rst = [ self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
-                    
-                    batch_edu_pos_for_tail = batch_rst.get('li_edu_pos_for_tail',None).cpu().numpy().tolist()
-                            
-                    # looping through every element in the batch to get head, rel, tail for recording
-                    for idx1 in range(len(preds)):
-                    
-                        head = { ','.join(map(str,batch_edu_pos_for_head[idx1])):  batch_rst_heads[idx1][0] }       
-                        rel = [ {pos:[rel, ns]} for pos, rel,ns in zip(batch_rels_treepos_rst[idx1], batch_rels_ids_rst[idx1], batch_rels_ns_rst[idx1]) ]
-                        tail = {','.join(map(str,batch_edu_pos_for_tail[idx1])):batch_tails_rst[idx1].strip() }
-                                                            
-                        li_rst_heads.append( head )
-                        li_rst_rels.append( rel )
-                        li_rst_tails.append( tail )
-                        li_rst_preds.append( preds[idx1] )
-                            
-
-            # Adding records from this epoch to files
-            for idx in range(len(self.inference_samples)):
-                if 'comet' in batch:
-                    fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
-                    
-                    # comet- If file for example idx does not exists we add the true observed records
-                    if not os.path.exists(fp_comet):
-                        
-                        df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
-                        
-                        head = li_comet_heads[idx]
-                        rels = li_comet_rels[idx]
-                        tail = li_comet_tails[idx]
-                        preds = li_comet_preds[idx]
+                            # RST -  prediction for every elem in batch
+                            preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs_rst )
                                             
-                        datum = { 'epoch': 0,
-                                    'head': head,
-                                    "rels": rels,
-                                    "tail":tail,
-                                    "preds":preds }
-                    
-                        df_comet = df_comet.append(datum, ignore_index=True)
-                        df_comet.to_csv( fp_comet, index=False)
+                            #batch decoding to get original data for each elem in batch
+                            batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
+                            batch_rst_heads = [ [ _.strip("<s>").strip("</").strip() for _ in heads_rst ] for heads_rst in batch_rst_heads ]
+                            
+                            batch_heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().numpy().tolist()
+                            batch_heads_treepos_rst = [ [ key for key, group in groupby(treepos) ] for treepos in batch_heads_treepos_rst ]
+                            
+                            batch_edu_pos_for_head = batch_rst.get('li_edu_pos_for_head',None).cpu().numpy().tolist()
+                            
+                            batch_rels_ids_rst = [ self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( rst_rel_ids ).tolist() for rst_rel_ids in batch_rst['rst_rel_ids'].tolist() ]                    
+                            batch_rels_treepos_rst = [ id_ for id_ in batch_rst['rst_treepos_ids'].tolist() if id_!= self.model.embedding_rst_pos.padding_idx]
+                            
+                            batch_ns_rst = [ [ns for ns in rst_ns_ids if ns<len(self.model.tokenizer.rst_ns_labeler.classes_)  ] for rst_ns_ids in batch_rst['rst_ns_ids'].tolist() ]
+                            batch_rels_ns_rst = [ self.model.tokenizer.rst_ns_labeler.inverse_transform( rst_ns_id ).tolist() for rst_ns_id in batch_ns_rst ]
 
-                    # comet - adding to preds
-                    df_comet = pd.read_csv(fp_comet)    
-                    datum_comet = {
-                        'epoch':df_comet['epoch'].max()+1,
-                        'head': '',
-                        'rels':'',
-                        'tail':'',
-                        'preds':li_comet_preds[idx] }
+                            batch_tails_rst = [self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
+                            
+                            batch_edu_pos_for_tail = batch_rst.get('li_edu_pos_for_tail',None).cpu().numpy().tolist()
+                                    
+                            # looping through every element in the batch to get head, rel, tail for recording
+                            for idx1 in range(len(preds)):
+                            
+                                head = { ','.join(map(str,batch_edu_pos_for_head[idx1])):  batch_rst_heads[idx1][0] }       
+                                rel = [ {pos:[rel, ns]} for pos, rel,ns in zip(batch_rels_treepos_rst[idx1], batch_rels_ids_rst[idx1], batch_rels_ns_rst[idx1]) ]
+                                tail = {','.join(map(str,batch_edu_pos_for_tail[idx1])):batch_tails_rst[idx1].strip() }
+                                                                    
+                                li_rst_heads.append( head )
+                                li_rst_rels.append( rel )
+                                li_rst_tails.append( tail )
+                                li_rst_preds.append( preds[idx1] )
+                                    
 
-                    df_comet = df_comet.append(datum_comet, ignore_index=True)
-                    df_comet.to_csv( fp_comet, index=False)
+                    # Adding records from this epoch to files
+                    for idx in range(len(self.inference_samples)):
+                        if 'comet' in batch:
+                            fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
+                            
+                            # comet- If file for example idx does not exists we add the true observed records
+                            if not os.path.exists(fp_comet):
+                                
+                                df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                                
+                                head = li_comet_heads[idx]
+                                rels = li_comet_rels[idx]
+                                tail = li_comet_tails[idx]
+                                preds = li_comet_preds[idx]
+                                                    
+                                datum = { 'epoch': 0,
+                                            'head': head,
+                                            "rels": rels,
+                                            "tail":tail,
+                                            "preds":preds }
+                            
+                                df_comet = df_comet.append(datum, ignore_index=True)
+                                df_comet.to_csv( fp_comet, index=False)
 
-                if 'rst' in batch:
-                    fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
-                    # rst - If file for example idx does not exists we add the true observed records
-                    if not os.path.exists(fp_rst):
-                        
-                        df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
-                        
-                        head = li_rst_heads[idx]
-                        rels = li_rst_rels[idx]
-                        tail = li_rst_tails[idx]
-                        preds = li_rst_preds[idx]
-                                            
-                        datum = { 'epoch': 0,
-                                    'head': head,
-                                    "rels": rels,
-                                    "tail":tail,
-                                    "preds":preds }
-                    
-                        df_rst = df_rst.append(datum, ignore_index=True)
-                        df_rst.to_csv( fp_rst, index=False)
+                            # comet - adding to preds
+                            df_comet = pd.read_csv(fp_comet)    
+                            datum_comet = {
+                                'epoch':df_comet['epoch'].max()+1,
+                                'head': '',
+                                'rels':'',
+                                'tail':'',
+                                'preds':li_comet_preds[idx] }
 
-                    # rst - adding to preds
-                    df_rst = pd.read_csv(fp_rst)    
-                    datum_rst = {
-                        'epoch':df_rst['epoch'].max()+1,
-                        'head': '',
-                        'rels':'',
-                        'tail':'',
-                        'preds':li_rst_preds[idx] }
+                            df_comet = df_comet.append(datum_comet, ignore_index=True)
+                            df_comet.to_csv( fp_comet, index=False)
 
-                    df_rst = df_rst.append(datum_rst, ignore_index=True)
-                    df_rst.to_csv( fp_rst, index=False)
+                        if 'rst' in batch:
+                            fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                            # rst - If file for example idx does not exists we add the true observed records
+                            if not os.path.exists(fp_rst):
+                                
+                                df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                                
+                                head = li_rst_heads[idx]
+                                rels = li_rst_rels[idx]
+                                tail = li_rst_tails[idx]
+                                preds = li_rst_preds[idx]
+                                                    
+                                datum = { 'epoch': 0,
+                                            'head': head,
+                                            "rels": rels,
+                                            "tail":tail,
+                                            "preds":preds }
+                            
+                                df_rst = df_rst.append(datum, ignore_index=True)
+                                df_rst.to_csv( fp_rst, index=False)
+
+                            # rst - adding to preds
+                            df_rst = pd.read_csv(fp_rst)    
+                            datum_rst = {
+                                'epoch':df_rst['epoch'].max()+1,
+                                'head': '',
+                                'rels':'',
+                                'tail':'',
+                                'preds':li_rst_preds[idx] }
+
+                            df_rst = df_rst.append(datum_rst, ignore_index=True)
+                            df_rst.to_csv( fp_rst, index=False)
+                else:
+                    pass
+        except TimeoutInterrupt as e:
+            pass
+        
 
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
@@ -2605,7 +2662,7 @@ class TrainingModule(pl.LightningModule):
     def configure_optimizers(self):
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        
+                
         warmup_steps = int( self.warmup_proportion*self.total_steps() )
 
         lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
@@ -2654,8 +2711,8 @@ class DataLoaderGenerator():
         
 
         self.bs = batch_size
-        self.workers_rst = int(  workers/2 ) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
-        self.workers_atomic = int( workers/2 ) #if workers==0 else max( workers - self.workers_rst, 1 )
+        self.workers_rst = int( workers/2) #if workers==0 else max( int( round( workers * (3/4), 0 ) ), 1 )
+        self.workers_atomic = int( workers/2) #if workers==0 else max( workers - self.workers_rst, 1 )
         self.mode = mode
         self.pad_values = pad_values
         
@@ -2695,25 +2752,21 @@ class DataLoaderGenerator():
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = True
-            pin_memory=True
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
-            pin_memory=False
 
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
             shuffle = False
-            pin_memory=False
 
         elif split_name == 'inference':
             line_starts = [ random.randrange( int(fs*(1-self.splits['test'])), fs) for fs in files_sizes  ]
             line_ends =  files_sizes
             shuffle = False
-            pin_memory=False
 
         li_dsets = [ SingleDataset_rst_v2(_f, self.tokenizer, line_start, line_end) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
@@ -2729,13 +2782,11 @@ class DataLoaderGenerator():
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
         
-        
         timeout = 0 if self.workers_rst in [0,1] else 15
-        
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
             shuffle=shuffle, num_workers=self.workers_rst, 
             collate_fn=lambda batch: utils.default_collate_pad(batch, self.pad_values),
-            pin_memory=pin_memory, timeout=timeout )
+            timeout=timeout )
 
         #TODO: change defualt collate to allow padding of elements for batching
         return dataloader
@@ -2787,8 +2838,8 @@ class DataLoaderGenerator():
         timeout = 0 if self.workers_rst in [0,1] else 60
         dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
             shuffle=shuffle, num_workers= self.workers_atomic,
-            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values),
-            pin_memory=True, timeout=timeout )
+            collate_fn=lambda batch: utils.default_collate_pad( batch, self.pad_values)
+            , timeout=timeout )
         
         return dataloader
 
@@ -2831,8 +2882,6 @@ class SingleDataset_rst(torch.utils.data.Dataset):
             # filtering out long lines
             self.data  = self.data.loc[ (self.data['txt_preproc'].str.len() <= 225 ) & (~ self.data['li_edus'].isnull()) ]
 
-            # only select columns that have at least two non null phrases in li_edus
-
             
         else:
             self.valid_dset = False
@@ -2848,25 +2897,6 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         encoded = self.tokenizer.tokenize_rst( li_edu_kp = li_edu_kp ,
                                                      li_rst = li_rst,
                                                      li_kp_score = li_kp_score)
-
-            # encoded May include some of the following
-            #    return {
-            #         #'input_ids': , 
-
-            #         'li_head_ids': li_head_ids ,
-            #         'li_head_pos_ids': li_head_pos_ids,
-            #         'li_head_kpscore': li_head_kpscore,
-
-            #         'tail_ids': tail_ids,
-            #         'tail_pos_id': tail_pos_id ,
-            #         'tail_kpscore': target_edu_kpscore
-
-            #         'li_rst_rel_ids': li_rst_rel_ids ,
-            #         'li_rst_pos_ids': li_rst_pos_ids,
-            #         'li_rst_pos_ids': li_rst_ns_ids
-
-            #     }   
-
         return encoded
 
     def getitem_extract_datum(self, index):
@@ -3011,21 +3041,7 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
         #encoding
         encoded = self.tokenizer.tokenize_comet( head=head,
                                                 rel=rel,
-                                                tail=tail )
-
-            # encoded May include some of the following
-            # return {
-            #     'li_head_ids':li_head_ids,
-            #     'li_head_pos_ids':None,
-
-            #     'tail_ids':tail_ids,
-            #     'tail_pos_id':None,
-
-            #     'li_rst_rel_ids': None,
-            #     'li_rst_pos_ids': None,
-            #     'li_rst_pos_ids':None,
-
-            # }    
+                                                tail=tail ) 
 
         return encoded
 
@@ -3051,7 +3067,7 @@ def main(tparams={}, mparams={}):
                     name = mparams['model_name'],
                     version = tparams['version'] )
     tparams['version'] =  tb_logger.version
-    
+       
     tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
     
     os.makedirs(tparams['dir_checkpoints'],exist_ok=True)
@@ -3126,4 +3142,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -rpet 2 -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 280 -far 0 -agb 1 --gpus 1 --workers 12 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 20 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
 
 # 102 - Same as 101 - bias removed on rst embedding, larger dataset, 
-# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.0 -c 1.0 -s 220 --gpus 1 --workers 12 --version 117 --precision 16 --mode train_new -l 5e-4 --max_epochs 60 --tag "same as 101 larger dset"
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.5 -c 0.5 -s 220 --gpus 1 --workers 12 --version 102 --precision 16 --mode train_new -l 1e-4 --max_epochs 25 --tag "same as 101 larger dset"
+
+# 103 - Same as 101 - bias removed on rst embedding, larger dataset, without head kp being shortened and without detach() -> allows smoother gradients
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.5 -c 0.5 -s 220 --gpus 1 --workers 13 --version 102 --precision 16 --mode train_new -l 1e-4 --max_epochs 25 --tag "same as 101 larger dset"

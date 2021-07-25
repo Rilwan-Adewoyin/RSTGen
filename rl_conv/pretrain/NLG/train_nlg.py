@@ -1,6 +1,8 @@
 import os
 from typing import Optional, Tuple
 
+from torch._C import Value
+
 #os.environ["NCCL_DEBUG"]="INFO"
 #os.environ["NCCL_DEBUG_SUBSYS"]="ALL"
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -14,12 +16,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import multiprocessing as mp
-
+from pytorch_lightning.utilities.distributed import _get_rank
+from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import warnings
 import sklearn
 import gc
-
+from torch.utils.data import Sampler
 import glob
 import pandas as pd
 import json
@@ -63,6 +66,9 @@ from transformers.generation_logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
+
+from train_comerst import EmbeddingRstPos, COMERST_tokenizer #TODO: convert the static methods to Mixins
+from utils_comerst import default_collate_pad
 
 #Monkey Patching the save module
 #TODO: suggest this change on github pytorch lightning 
@@ -374,6 +380,7 @@ def set_scores_to_inf_for_banned_tokens(scores: torch.Tensor, banned_tokens: Lis
     banned_mask = torch.sparse.LongTensor(banned_mask.t(), indices, scores.size()).to(scores.device).to_dense().bool()
     scores.masked_fill_(banned_mask, -float("inf"))
 
+
 class NLG(nn.Module):
     """NLG unit
     """
@@ -414,14 +421,10 @@ class NLG(nn.Module):
         
         self.config= self.transformer.config
 
-        # Embedding Layers
+        # region Embedding Layers
         self.embd_outp_dim = self.transformer.config.n_embd
-        special_token_count = sum( [self.fda, self.frst, self.ftopic] )
-
-        if self.fda:
-            self.embedding_das = torch.nn.Conv1d( 12, self.embd_outp_dim, kernel_size=1, bias=False )
-            self.embedding_das.weight.data.normal_(mean=0.0, std=0.005) #use smaller start variance to minimize init impact of new info
-        
+        special_token_count = sum( [self.frst, self.ftopic] ) + 1
+        self.special_token_count = special_token_count
 
         if self.frst:
             self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
@@ -431,20 +434,32 @@ class NLG(nn.Module):
             self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ),scale_grad_by_freq=self.scale_grad_by_freq )
             self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.005)
 
-            self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenizer.rst_pos_maxidx + 1 + 1 , self.embd_outp_dim, padding_idx=self.nlg_tokenizer.rst_pos_maxidx + 1 , scale_grad_by_freq=self.scale_grad_by_freq )
-            self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
+            # self.embedding_rst_pos = torch.nn.Embedding( self.nlg_tokenizer.rst_pos_maxidx + 1 + 1 , self.embd_outp_dim, padding_idx=self.nlg_tokenizer.rst_pos_maxidx + 1 , scale_grad_by_freq=self.scale_grad_by_freq )
+            # self.embedding_rst_pos.weight.data.normal_(mean=0.0, std=0.005)
+
+            self.embedding_rst_pos = EmbeddingRstPos(  COMERST_tokenizer.left_right_seq_from_root_to_edu_pos,
+                                                        max_rst_index=self.nlg_tokenizer.rst_pos_maxidx,
+                                                        max_rst_level = COMERST_tokenizer.node_level(self.nlg_tokenizer.rst_pos_maxidx),
+                                                        rst_encoding_ndim=self.embd_outp_dim,
+                                                        init_val=0.01)
+            
+            
 
         if self.ftopic:
             self.embedding_topics_score = torch.nn.Conv1d( 1, self.embd_outp_dim, kernel_size=1, bias=False)
             self.embedding_topics_score.weight.data.normal_(mean=0.0, std=0.005)
 
     
-        self.token_type_embeddings = torch.nn.Embedding( special_token_count + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim, scale_grad_by_freq=self.scale_grad_by_freq) #The maximum value this can take is based on the different types of input
+        self.token_type_embeddings = torch.nn.Embedding( special_token_count + self.nlg_tokenizer.context_len['topics']//2, self.embd_outp_dim,
+                                                        padding_idx=(special_token_count + self.nlg_tokenizer.context_len['topics']//2)-1,
+                                                        scale_grad_by_freq=self.scale_grad_by_freq) #The maximum value this can take is based on the different types of input
+        
         self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.005)
         # 1 for each of da, rst and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
         #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
-
-        self.loss_fct = CrossEntropyLoss()
+        #endregion
+        
+        
 
         if self.freeze_pretrained == 0:
             # Freeze no weights
@@ -456,15 +471,51 @@ class NLG(nn.Module):
             for name, param in self.transformer.transformer.named_parameters(): 
                 if 'wte' not in name:
                     param.requires_grad = False
+            
+            # def hook(module, grad_input, grad_output):
+                
+            #     shape0 = grad_input[0].shape
+            #     # shape1 = grad_input[1].shape
+            #     # shape1[0] -= 3
+            #     # shape2 = grad_input[2].shape
+            #     # shape2[0] -= 3
+                
+            #     # replace gradients with zeros
+            #     #return (torch.zeros(grad_input[0].size()),torch.zeros(grad_input[1].size()),torch.zeros(grad_input[2].size()),)
+            #     outp0 = torch.cat( [ torch.zeros( (shape0[0], shape0[1]-self.special_token_count) , device=grad_output[0].device ) , grad_output[0][:, -self.special_token_count:] ])
+            #     # outp1 = torch.cat( [ torch.zeros(shape1) , grad_output[1][:, -3] ])
+            #     # outp2 = torch.cat( [ torch.zeros(shape1) , grad_output[2][:, -3] ])
+                
+            #     return (outp0,) #grad_output[1], grad_output[2]
 
-        #Initialising the embeddings for new special tokens [da, rst, ta] to the values used for endoftext
-            #TODO: Experiment to what degree this initialisation affects performance
+            #self.transformer.transformer.wte.register_backward_hook(hook)
+                
         with torch.no_grad():
             # initialising to eos token value
-            self.transformer.transformer.wte.weight[-special_token_count:,:] = self.transformer.transformer.wte.weight[-special_token_count-1:-special_token_count,:] 
-
+            self.transformer.transformer.wte.weight[-special_token_count:-1,:] = self.transformer.transformer.wte.weight[-special_token_count-1:-special_token_count,:] 
+            self.transformer.transformer.wte.weight[  -1 ].fill_(0)
+            
         self.transformer.tie_weights()
-
+        
+        self.loss_fct = CrossEntropyLoss()
+        
+        self.pad_values = {'rst_start_token':self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'] , 
+                        'tnsr_rst_rels': self.embedding_rst_rels.padding_idx , 
+                        'tnsr_rst_ns': self.embedding_rst_ns.padding_idx,
+                        'tnsr_rst_pos': self.embedding_rst_pos.padding_idx,
+                            
+                        'tnsr_topics_phrase': self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'] ,
+                        'tnsr_topics_score': 0.0,
+                        
+                        'tknzd_utt':self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'] ,
+                        'attention_mask':0.0,
+                        
+                        'labels':self.loss_fct.ignore_index,
+                        
+                        'position_ids':self.config.n_ctx ,
+                        'token_type_ids':self.token_type_embeddings.padding_idx
+                        
+                        }
     def get_output_embeddings(self):
         return self.transformer.lm_head
 
@@ -1329,32 +1380,32 @@ class NLG(nn.Module):
                 
         parser.add_argument('--base_model_name', default='distilgpt2', required=False)
         parser.add_argument('--reset_base_transformer', default=False, required=False, type=bool)
-        parser.add_argument('-fp','--freeze_pretrained', default=0, required=False, type=int )
+        parser.add_argument('--freeze_pretrained', default=0, required=False, type=int )
 
         parser.add_argument('--model_name', default='NLG', required=False)
         parser.add_argument('--loss_type', default='CrossEntropy', required=False, 
             choices=['CrossEntropy','UtteranceSimilarity']) 
         
-        parser.add_argument( '-fda' ,'--fda', type= lambda x: bool(int(x) )
-             ,help="whether or not to include da in feature", default=True  )
+        parser.add_argument( '--fda', type= lambda x: bool(int(x) )
+             ,help="whether or not to include da in feature", default=False  )
         
-        parser.add_argument( '-frst' ,'--frst', type= lambda x: bool(int(x) )
+        #parser.add_argument( '--context_len', type= lambda x: eval(x), default={'rst':14, 'topics':18} )
+        parser.add_argument('--context_len', type= lambda x: eval(x), default={'rst':14, 'topics':18 } )
+                
+        parser.add_argument( '--frst', type= lambda x: bool(int(x) )
              ,help="whether or not to include rst info in feature", default=True  )
 
-        parser.add_argument( '-ftopic' ,'--ftopic', type= lambda x: bool(int(x) )
+        parser.add_argument( '--ftopic', type= lambda x: bool(int(x) )
              ,help="whether or not to include topic info in feature", default=True  )
 
-        parser.add_argument('-cl','--context_len',type= lambda x: json.loads(x) )
-
-        parser.add_argument( '-frstv' ,'--frst_version', type= int, choices=[0,1] 
-             ,help="which version of frst to use", default=0  ) 
-             #version 0, only uses the relations
-             #version 1, uses relations and ns and position information
+        parser.add_argument( '--frst_version', type= int, choices=[0,1] 
+             ,help="which version of frst to use", default=1  ) 
+                #version 0, only uses the relations
+                #version 1, uses relations and ns and position information
         
+        parser.add_argument('--max_input_len', type=int, default=200)
         
-        parser.add_argument('-mil','--max_input_len', type=int, default=264)
-        
-        parser.add_argument('-sgbf','--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=False, 
+        parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)) , default=False, 
                 help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         mparams = parser.parse_known_args( )[0]
        
@@ -1398,7 +1449,12 @@ class NLG(nn.Module):
             shift_labels = input_['labels'][..., 1:].contiguous() 
             
             loss = self.loss_fct( shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                        
+            
+            # if self.freeze_pretrained:
+            #     # removing gradient from wte. Only the new special tokens get fine_tuned
+            #     if self.transformer.transformer.wte.weight.grad != None:
+            #         self.transformer.transformer.wte.weight.grad[ :-self.special_token_count ] = 0
+                
             return (lm_logits, loss) 
 
         else:
@@ -1407,78 +1463,6 @@ class NLG(nn.Module):
             return output
 
     def forward_embedding(self, input_):
-        #Partially does the emebddign for our new inputs to the transformer
-
-        # Creating embedded inputs and attention mask
-        if self.fda and self.frst:
-            input_ = self.forward_embedding_drt( input_ )
-        elif self.fda==False and self.frst:
-            input_ = self.forward_embedding_rt( input_ )
-        return input_ 
-
-    def forward_embedding_drt(self, input_):
-        """Performs the input embedding and token type embedding calcs
-
-            Args:
-                input_ ([type]): [description]
-
-            Returns:
-                input_embedded [type]: [description]
-                
-                Note: logic for token_type_ids embedding is usually performed in transformer, but has been moved here
-                    since gpt-2 code indicates that 
-        """
-        #TODO: need to add the rst_rels and ns options
-        
-        # da token embedding
-        da_start_embed = self.transformer.transformer.wte( input_['da_start_token'] ).unsqueeze(1)
-        das_embed = self.embedding_das(input_['tnsr_das']).permute(0,2,1).contiguous()
-
-        # rst token emebedding
-        rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ) 
-        rst_rel_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ) #.permute(0,2,1) # (bs, channels, seq_len)
-        rst_embed = rst_rel_embed
-        
-        if self.frst_version == 1:
-            rst_ns_embed = self.embedding_rst_ns( input_['tnsr_rst_ns'] ) #.permute(0,2,1)
-            rst_pos_embed = self.embedding_rst_pos( input_['tnsr_rst_pos'] ) #.permute(0,2,1)
-            rst_embed += rst_ns_embed + rst_pos_embed
-
-        #topic  embedding
-        topics_phrase_embed = self.transformer.transformer.wte(input_['tnsr_topics_phrase']  )  
-        topics_score_embed = self.embedding_topics_score( input_['tnsr_topics_score']).permute(0,2,1)
-
-        topics_embed = topics_phrase_embed + topics_score_embed
-
-        utt_embed = self.transformer.transformer.wte(input_['tknzd_utt'] ) 
-
-        input_embeds = torch.cat(
-            [da_start_embed, das_embed,
-             rst_start_embed, rst_embed,
-             topics_embed,
-             utt_embed], axis = 1
-            ).contiguous() #dim [bs, seq_len, dim1]
-        
-            # Token type embedding is only added to the context section
-        token_type_embedding = self.token_type_embeddings( input_['token_type_ids'] )
-        input_embeds[ :self.context_len_pre_utterance, :] += token_type_embedding
-        
-        input_['input_embeds'] = input_embeds
-
-        # Positional Embedding
-            # Creating zero'd positional_embedding for context section,
-            #  while utterance section uses values from embedding matrix
-        utt_position_embeds = self.transformer.transformer.wpe(input_['position_ids']) 
-        shape = utt_position_embeds.shape
-        shape[1] = input_embeds.shape[1] - shape[1] # this dimensions of context
-        ctx_position_embeds = utt_position_embeds.new_zeros(  shape  ) #ctx has no position embedding 
-        input_['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
-
-    
-        
-        return input_
-
-    def forward_embedding_rt(self, input_):
         """Performs the input embedding and token type embedding calcs
 
             Args:
@@ -1491,17 +1475,18 @@ class NLG(nn.Module):
                     since gpt-2 code indicates that 
         """
         new_input = {}
-        new_input['attention_mask'] = input_['attention_mask']
-        new_input['labels'] = input_['labels']
+        #new_input['attention_mask'] = input_['attention_mask']
+        attention_mask = input_['attention_mask']
+        labels = input_['labels']
 
         # rst token emebedding
         rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ) 
-        rst_rel_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ) #.permute(0,2,1) # (bs, channels, seq_len)
+        rst_rel_embed = self.embedding_rst_rels( input_['tnsr_rst_rels'] ) 
         rst_embed = rst_rel_embed
         
         if self.frst_version == 1:
-            rst_ns_embed = self.embedding_rst_ns( input_['tnsr_rst_ns'] ) #.permute(0,2,1)
-            rst_pos_embed = self.embedding_rst_pos( input_['tnsr_rst_pos'] ) #.permute(0,2,1)
+            rst_ns_embed = self.embedding_rst_ns( input_['tnsr_rst_ns'] ) 
+            rst_pos_embed = self.embedding_rst_pos( input_['tnsr_rst_pos'] ) 
             rst_embed = rst_embed + rst_ns_embed + rst_pos_embed
 
         
@@ -1527,7 +1512,7 @@ class NLG(nn.Module):
         input_embeds[ :, :self.nlg_tokenizer.context_len_pre_utterance, :] += token_type_embedding
 
         #input_['input_embeds'] = input_embeds
-        new_input['input_embeds'] = input_embeds
+         #= input_embeds
 
         # position embedding
         utt_position_embeds = self.transformer.transformer.wpe(input_['position_ids']) 
@@ -1535,10 +1520,33 @@ class NLG(nn.Module):
         _ = utt_position_embeds.shape
         shape = [_[0], self.nlg_tokenizer.context_len_pre_utterance ,_[2]]
         ctx_position_embeds = utt_position_embeds.new_zeros(  shape  ) #ctx has no position embedding 
-        #input_['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
-        new_input['position_embeds'] = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 ) 
+        position_embeds = torch.cat( [ctx_position_embeds, utt_position_embeds], axis=1 )
+        
+        
+        # Padding will have been inserted in: 
+            # rst section in input_embeds
+            # topics section in input_embeds
+            # tknzed utterance section in input_embeds
+            
+            #corresponding atte_mask sections
+        li_input_ids = [ input_['rst_start_token'], input_['tnsr_rst_rels'], input_['tnsr_topics_phrase'], input_['tknzd_utt'] ]
+        li_pad_token_ids = [ self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'], 
+                            self.embedding_rst_rels.padding_idx, 
+                            self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'],
+                            self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'] ]
+        
+        input_embeds, attention_mask, position_embeds, labels = self.compress_padding( li_input_ids , li_pad_token_ids,
+                                                    input_embeds=input_embeds,
+                                                     attention_mask=attention_mask,
+                                                     position_embeds=position_embeds,
+                                                     labels = labels) 
         
 
+        new_input['input_embeds'] = input_embeds
+        new_input['attention_mask'] = attention_mask
+        new_input['position_embeds'] = position_embeds
+        new_input['labels'] = labels
+        
         return new_input
 
     def return_params(self):
@@ -1600,16 +1608,16 @@ class NLG(nn.Module):
         # default generation params
             #TODO: add these to config so they are automatically done
         if 'bad_words_ids' not in generation_params:
-            bad_words = ["<|rst|>","<|ta|>",r"\n", "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|"]
-            bad_words_ids = [model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
-            bad_words_ids = [model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
+            bad_words = ['"',"<|rst|>","<|ta|>", "<|pad|>",'\n', "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|"]
+            bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
+            bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [[526], [55],[8172], [3467], [59], [6852], [7479],[7879],[13426],[17405],[91],[8614],[930],[10],[9],[12],[1303],[2],[4242], [2235],[46424]]
             generation_params['bad_words_ids'] = bad_words_ids
         else:
             bad_words_ids = None
 
         default_generation_params = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':2.0, 
-                            'early_stopping':True, 'do_sample':False, 'no_repeat_ngram_size':3, 'bad_words_ids':bad_words_ids, 'max_length':300 } #,'min_length':4
+                            'early_stopping':True, 'do_sample':False, 'no_repeat_ngram_size':3, 'bad_words_ids':bad_words_ids,'max_length':300 } #,'min_length':4
 
         for key,value in default_generation_params.items():
             if key not in generation_params:
@@ -1656,6 +1664,41 @@ class NLG(nn.Module):
 
         }
 
+    def compress_padding( self,
+        li_input_ids, li_pad_token_ids, input_embeds, attention_mask, position_embeds, labels):
+        """ First for each datum remove all padding due to the head parts
+            Then use pad sequence to ensure they are all the same elnght"""
+        
+        """Remove columns that are populated exclusively by pad_token_id"""
+        
+        li_keep_column_mask = [ input_ids.ne(pad_token_ids) for input_ids, pad_token_ids in zip(li_input_ids, li_pad_token_ids) ]
+        
+        keep_column_mask = torch.cat(li_keep_column_mask, axis=-1)
+
+        input_embeds = self.compress_padding_inner(input_embeds, 1, keep_column_mask)
+        attention_mask = self.compress_padding_inner(attention_mask, 2, keep_column_mask)
+        position_embeds = self.compress_padding_inner(position_embeds, 1, keep_column_mask)
+        labels = self.compress_padding_inner(labels, 1, keep_column_mask)
+        
+        return (input_embeds, attention_mask, position_embeds, labels  )  
+
+    def compress_padding_inner( self, tensor_, compress_dims, keep_column_mask ):
+        li_subtens = tensor_.unbind(dim=0)
+        
+        if compress_dims == 1:
+            li_subtens = [ subtens[keep_column_mask[idx2]] for idx2, subtens in enumerate(li_subtens) ]
+            batched_padded_subtens = pad_sequence(li_subtens, batch_first=True, padding_value=0.0) #this tensor only hass padingg at the end
+        
+        elif compress_dims == 2:
+            max_len = keep_column_mask.sum(axis=1).max()
+            li_subtens = [ subtens[ keep_column_mask[idx2], :][: , keep_column_mask[idx2] ] 
+                for idx2, subtens in enumerate(li_subtens) ]
+            li_padded_subtens = [ torch.nn.functional.pad( tens, (0, max_len-tens.shape[0] , 0, max_len-tens.shape[1]), value=0.0 ) 
+                                for tens in li_subtens]
+            batched_padded_subtens = torch.stack(li_padded_subtens)
+
+        return batched_padded_subtens
+
 class NLG_tokenizer():
     """Rough Implmentation of the tokenizer for the NLG model
 
@@ -1682,7 +1725,7 @@ class NLG_tokenizer():
         self.frst = frst
         self.frst_version = frst_version
         self.ftopic = ftopic
-        self.special_token_count = sum( [self.fda, self.frst, self.ftopic] )
+        self.special_token_count = sum( [self.frst, self.ftopic] ) + 1
 
         assert max_input_len < 1025
         self.max_input_len = max_input_len  #self.e2m_tokenizer.max_len
@@ -1703,7 +1746,8 @@ class NLG_tokenizer():
             self.rst_ns_labeler = sklp.LabelEncoder()
             self.rst_ns_labeler.fit( self.rst_ns_li  )
 
-            self.rst_pos_maxidx = 30
+            #self.rst_pos_maxidx = 30
+            self.rst_pos_maxidx = 4094
 
 
         # Setting up context lengths
@@ -1711,7 +1755,7 @@ class NLG_tokenizer():
             self.context_len = kwargs.get( 'context_len' , { 'da':2, 'rst':6, 'topics':20 } ) #add this to config
         
         elif self.fda==False and self.frst and self.ftopic:
-            self.context_len = kwargs.get( 'context_len', { 'rst':6, 'topics':16 } ) #add this to config )
+            self.context_len = kwargs.get( 'context_len', { 'rst':12, 'topics':16 } ) #add this to config )
         
         self.context_len_pre_utterance =  sum(self.context_len.values())
 
@@ -1738,12 +1782,12 @@ class NLG_tokenizer():
             # Adding special tokens
             special_tokens_dict = {'additional_special_tokens':
                     []}
-            if self.fda:
-                special_tokens_dict['additional_special_tokens'].append('<|da|>')
             if self.frst:
                 special_tokens_dict['additional_special_tokens'].append('<|rst|>')
             if self.ftopic:
                 special_tokens_dict['additional_special_tokens'].append('<|ta|>')
+            if self.ftopic:
+                special_tokens_dict['additional_special_tokens'].append('<|pad|>')
             
             if str(special_tokens_dict['additional_special_tokens']) != \
                     self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens',''):
@@ -1756,7 +1800,7 @@ class NLG_tokenizer():
                 
                 self.e2m_tokenizer.save_pretrained(dir_tokenizer)
                 config.save_pretrained(dir_tokenizer)
-
+            
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
             """
                 Allows the user to select partiuclar rst_vectors in order to control their output
@@ -1813,117 +1857,6 @@ class NLG_tokenizer():
 
             return rst_rel_encoded, rst_names
 
-    def encode_v2( self, das ,rst_rels, rst_ns, rst_pos, topics, topics_score,
-             utterance, pad_utterance,generate_mode):
-
-        """
-            This version is a smaller output space than v1, by dropping rst_pos and rst_ns
-            Return 
-            
-            dictionary
-            attn_mask : Bidirectional up to bos token, Causal Up till EOS, 0s till end of padding
-
-        Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
-            and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
-        """
-        #effect max_sequence length
-
-        #Getting Special Tokens
-        da_start_token = self.e2m_tokenizer.encode("<|da|>")[0]
-        rst_start_token = self.e2m_tokenizer.encode("<|rst|>")[0] 
-        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>") 
-
-
-        #Getting Vectors
-        tnsr_das = self.encode_da( das ) #dims (1, 20), 
-
-        #Getting Vectors
-        if self.frst_version == 0:
-            tnsr_rst_rels, rst_pad_count = self.encode_rst_v2(rst_rels, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-            # dummy tensors
-            tnsr_rst_ns = torch.zeros([1])
-            tnsr_rst_pos = torch.zeros([1])
-
-        elif self.frst_version == 1:
-            tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels, rst_ns, rst_pos ,max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-
-
-        tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos, ta_phrase_lens  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance)
-                            
-        # Building Attention Mask
-
-            # calc the ending cumulative dim for da, rst, topics, utt, segments,
-        d_dim = self.context_len['da']
-        dr_dim = da_len + self.context_len['rst']       # d_dim + tnsr_rst_rels.shape[0]+ 1
-        drt_dim = dr_dim + self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
-
-        if pad_utterance == True:
-            utt_dim = drt_dim + self.context_len['utt']  
-        else:
-            utt_dim = drt_dim + tknzd_utt.shape[-1]
-
-        # New Version
-        attn_mask = torch.tril( torch.ones([utt_dim, utt_dim]), diagonal=drt_dim )
-                   #correcting for padding in rst section
-        attn_mask[ dr_dim-rst_pad_count:dr_dim ,:] = 0
-        attn_mask[ :, dr_dim-rst_pad_count:dr_dim] = 0
-                     #correcting for padding in topic section
-        attn_mask[ drt_dim-topics_pad_count: drt_dim, :  ] = 0
-        attn_mask[ :, drt_dim-topics_pad_count: drt_dim ] = 0
-
-            # Implementing causal masking for each topic subphrase 
-                # First, each topic subphrase only attends to other words within that topic subphrase (including ta token) and not the other topcics
-                # So set the template attn to 0 
-        attn_mask[ dr_dim:drt_dim, dr_dim:drt_dim ] = 0
-                #Second each topic phrase has causal masking on the tokens within the topic phrase
-                # use ta_tokens_pos
-                # essentially for idx i, i+1
-                # add a tril att attn_mask[ i:i+1 , i:i+1 ] so that in each topic phrase each word only attmeds to the previous words
-        for ta_idx, phrase_len in zip( ta_tokens_pos, ta_phrase_lens):
-            attn_mask[ r_dim+ta_idx:r_dim+ta_idx+phrase_len, r_dim+ta_idx:r_dim+ta_idx+phrase_len ] = torch.tril( attn_mask.new_ones( [phrase_len,phrase_len]  )  )
-
-                #correcting for padding in and after utterance section
-                    #when the utterance padding starts then we mask
-        attn_mask[ utt_dim-utt_pad_count: , : ] = 0
-
-        
-        #Creating labels/targets for GPT Language Model Head
-        labels = -100* torch.ones( size=[1, self.max_input_len], dtype = torch.long  ) 
-        labels[0][drt_dim:utt_dim-utt_pad_count] = tknzd_utt[: utt_dim-utt_pad_count-drt_dim]
-
-        # Creating Positional Emebeddings
-            # ALL words in drt get a positional encoding of 0 -> No positional meaning
-            # utterance has normal positional encoding        
-        
-        position_ids_utt =  torch.arange( 0, utt_dim-drt_dim   , dtype=torch.long)
-        position_ids = position_ids_utt
-
-        # Creating Token Type Ids
-            # 0:da, 
-            # 1:rst, 
-            # n<m for each word in each topic phrase i of length m_i including leading <ta> where 2>n>=2+topics_len//2
-        
-        token_type_ids_d = torch.full( [self.context_len['da'] ], 0 ,dtype=torch.long)
-        token_type_ids_r = torch.full( [self.context_len['rst']], 1 ,dtype=torch.long)
-                
-        _ = torch.zeros( [self.context_len['topics'] ], dtype=torch.long)
-        _[ ta_tokens_pos ] = 1
-        token_type_ids_t =  _.cumsum(axis=0) + 1
-        token_type_ids = torch.cat( [token_type_ids_d, token_type_ids_r, token_type_ids_t ] )
-
-        return { 'da_start_token':da_start_token, 'tnsr_das':tnsr_das,
-                'tnsr_rst_ns':tnsr_rst_ns, 'tnsr_rst_pos':tnsr_rst_pos,
-                 'rst_start_token':rst_start_token, 'tnsr_rst_rels':tnsr_rst_rels,
-                 'tnsr_topics_phrase':tnsr_topics_phrase.contiguous(),
-                  'tnsr_topics_score': tnsr_topics_score,
-                 'tknzd_utt':tknzd_utt.contiguous(),
-                 'attention_mask':attn_mask.contiguous(),
-                 'labels':labels,
-                 'position_ids':position_ids.contiguous(),
-                 'token_type_ids':token_type_ids.contiguous()
-                 }
-
     def encode_v2_exda( self, rst_rels, rst_ns , rst_pos, topics, topics_score, 
         utterance, pad_utterance, generate_mode):
 
@@ -1940,7 +1873,7 @@ class NLG_tokenizer():
         
         #Getting Special Tokens
         rst_start_token = self.e2m_tokenizer.encode("<|rst|>",return_tensors="pt")[0] 
-        padding_token =  self.e2m_tokenizer.encode("<|endoftext|>",return_tensors="pt") 
+        padding_token =  self.e2m_tokenizer.encode("<|pad|>",return_tensors="pt") 
 
 
         #Getting Vectors
@@ -1950,11 +1883,16 @@ class NLG_tokenizer():
             tnsr_rst_ns = torch.zeros([1])
             tnsr_rst_pos = torch.zeros([1])
 
+        #TODO: deal with rst_pad_count
+        #TODO: deal with utt_pad_count
+        #TODO: topics pad_count
+        #TODO: ensure atten_mask is still correct
+        
         elif self.frst_version == 1:
             tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst_v2_full(rst_rels,rst_ns, rst_pos, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
         
         tnsr_topics_phrase, tnsr_topics_score, topics_pad_count, ta_tokens_pos, ta_phrase_lens  = self.encode_topic_v2( topics, topics_score, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance, generate_mode)
+        tknzd_utt, utt_pad_count = self.encode_utterance_v2(utterance, pad_utterance, generate_mode, padding_token)
 
             # calc the ending cumulative dim for, rst, topics, utt, segments,
         r_dim = self.context_len['rst']       # tnsr_rst_rels.shape[0]
@@ -1991,12 +1929,13 @@ class NLG_tokenizer():
         attn_mask[ utt_dim-utt_pad_count: , : ] = 0
 
 
-        #Creating labels/targets for GPT Language Model Head
+        #Creating labels/targets
         try:
             
-            labels = -100* torch.ones( size=[1, utt_dim], dtype = torch.long  ) 
+            labels = -100* torch.ones( size=[ utt_dim], dtype = torch.long  ) 
 
-            labels[0][rt_dim:utt_dim-utt_pad_count] =  tknzd_utt[ : utt_dim-utt_pad_count-rt_dim ]
+            #first eos token should be excluded from loss calc. so rt_dim + 1 used
+            labels[rt_dim+1:utt_dim-utt_pad_count] =  tknzd_utt[ 1: utt_dim-utt_pad_count-rt_dim ]
         
         except Exception:
             labels = None
@@ -2089,7 +2028,7 @@ class NLG_tokenizer():
         elif len_ < max_len:
             _ = max_len-len_
             tnsr_ns = torch.cat( [tnsr_ns, torch.full([_],len(self.rst_ns_li ))])
-            tnsr_pos = torch.cat( [tnsr_pos, torch.full([_],self.rst_pos_maxidx+1)])
+            tnsr_pos = torch.cat( [tnsr_pos, torch.full([_], 0  )])
 
 
         return tnsr_rels, diff, tnsr_ns, tnsr_pos
@@ -2163,7 +2102,7 @@ class NLG_tokenizer():
 
         return topic_phrases , tnsr_score, diff, ta_idxs, ta_phrase_lens
 
-    def encode_utterance_v2(self, utterance, pad=True, generate_mode=False):
+    def encode_utterance_v2(self, utterance, pad=True, generate_mode=False, padding_token=[0]):
         #pad: 
         #   set to True during training to ensure all batches have the same length
         #   set to False in the case of Generation in order to work with huggingface .generate()
@@ -2195,7 +2134,7 @@ class NLG_tokenizer():
             #So using 'do_not_pad' and then padding manually
             tknzd_utt_no_pad_len = encoded['length'][0]
             pad_count = self.context_len['utt'] - tknzd_utt_no_pad_len            
-            tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(self.e2m_tokenizer.eos_token_id) ],axis=-1 )[0]
+            tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(padding_token.item() ) ],axis=-1 )[0]
                                            
         
         elif pad == False:
@@ -2224,7 +2163,7 @@ class TrainingModule(pl.LightningModule):
                     accumulate_grad_batches=1,
                     max_epochs=25,
                     gpus=1, 
-                    learning_rate=1e-3,
+                    learning_rate=1e-4,
                     warmup_proportion=0.1,
                     workers=0,
                     lr_schedule='hard_restarts',
@@ -2268,7 +2207,7 @@ class TrainingModule(pl.LightningModule):
                 self.hparams.update({ **train_params_to_save, **model_params_to_save})
 
             self.inference_samples = list( islice( self.inference_dl, 10 ) )
-            bad_words = ["<|rst|>","<|ta|>",r"\n" ] 
+            bad_words = ["<|rst|>","<|ta|>","<|pad|>",r"\n" ] 
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [[526], [55],[8172]]
@@ -2293,12 +2232,12 @@ class TrainingModule(pl.LightningModule):
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data', default="./dataset/reddit_large_annotated_long3", help="Relative directory path for datafiles")
+        parser.add_argument('--dir_data', default="./dataset_v2/reddit_large_annotated", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('-me','--max_epochs', default=32, type=int)
-        parser.add_argument('-agb','--accumulate_grad_batches', default=1, type=int)
-        parser.add_argument('-bs','--batch_size', default=5, type=int)
-        parser.add_argument('-lr','--learning_rate', default=5e-4, type=float)
+        parser.add_argument('--max_epochs', default=8, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('-b','--batch_size', default=5, type=int)
+        parser.add_argument('--learning_rate', default=1e-4, type=float)
         parser.add_argument('--warmup_proportion', default=0.15)
         parser.add_argument('--workers', default=16, type=int) #TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
@@ -2307,7 +2246,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
-        parser.add_argument('-opt','--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
+        parser.add_argument('--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
         parser.add_argument('--inference_context_utt', default=4, type=int)
@@ -2420,10 +2359,10 @@ class TrainingModule(pl.LightningModule):
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator=accelerator,
-                        #limit_train_batches =10,
-                        #limit_val_batches = 10,
-                        val_check_interval=0.2,
-                        num_sanity_val_steps=0, 
+                        # limit_train_batches =10,
+                        # limit_val_batches = 10,
+                        val_check_interval=0.10,
+                        #num_sanity_val_steps=2, 
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -2515,8 +2454,6 @@ class TrainingModule(pl.LightningModule):
                 best_ckpt_path = os.path.join( root_dir._str, best_ckpt_path[ best_ckpt_path.index('mastering-conversation'): ] )
 
             if torch.cuda.is_available():
-                #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage) )
-                #checkpoint = torch.load(best_ckpt_path, map_location=lambda storage, loc: storage.cuda())  
                 checkpoint = torch.load(best_ckpt_path, map_location='cpu' )  
 
             else:
@@ -2659,57 +2596,57 @@ class TrainingModule(pl.LightningModule):
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
         
-        # if step_name == "val" and rank_zero_only.rank == 0 :
+        if step_name == "val" and _get_rank() == 0 :
              
-        #     # Making directory if it doesnt exist
-        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
-        #     if not os.path.exists(dir_infer):
-        #         os.makedirs(dir_infer,exist_ok=True)
+            # Making directory if it doesnt exist
+            dir_infer = os.path.join(self.trainer.log_dir,"inference")
+            if not os.path.exists(dir_infer):
+                os.makedirs(dir_infer,exist_ok=True)
 
-        #     # Adding true values and making csv files if thy dont already exists
-        #     for idx, encoded_input in enumerate(self.inference_samples):
-        #         fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
+            # Adding true values and making csv files if thy dont already exists
+            for idx, encoded_input in enumerate(self.inference_samples):
+                fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
 
-        #         # If there file does not exists we add the true observed records
-        #         if not os.path.exists(fp):
+                # If there file does not exists we add the true observed records
+                if not os.path.exists(fp):
                     
-        #             df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
-        #             rst_rels = encoded_input.pop('orig_rst_rels')
-        #             topics = encoded_input.pop('orig_topics')
-        #             utterance = encoded_input.pop('orig_utt')
-        #             #utterance = self.nlg_tokenizer.e2m_tokenizer.decode( 
+                    df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
+                    rst_rels = encoded_input.pop('orig_rst_rels')
+                    topics = encoded_input.pop('orig_topics')
+                    utterance = encoded_input.pop('orig_utt')
+                    #utterance = self.nlg_tokenizer.e2m_tokenizer.decode( 
                     
-        #             datum = { 'val_round': -1,
-        #                         'rst_rels': sum( rst_rels, ()),
-        #                         "topics": sum( topics, () ),
-        #                         "utterance":utterance[0] }
+                    datum = { 'val_round': -1,
+                                'rst_rels': ', '.join( sum( rst_rels, ())),
+                                "topics": ', '.join(sum( topics, () )),
+                                "utterance":utterance[0] }
                 
-        #             df = df.append(datum, ignore_index=True)
-        #             df.to_csv( fp, index=False)
+                    df = df.append(datum, ignore_index=True)
+                    df.to_csv( fp, index=False)
                 
-        #         # Loading in dataframe of previous predictions
-        #         df = pd.read_csv(fp)    
+                # Loading in dataframe of previous predictions
+                df = pd.read_csv(fp)    
 
-        #         # creating predition andding to existing results
-        #         encoded_input.pop('orig_rst_rels', None)
-        #         encoded_input.pop('orig_topics', None)
-        #         encoded_input.pop('orig_utt', None)
+                # creating predition andding to existing results
+                encoded_input.pop('orig_rst_rels', None)
+                encoded_input.pop('orig_topics', None)
+                encoded_input.pop('orig_utt', None)
 
-        #         for k in encoded_input.keys():
-        #             encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
+                for k in encoded_input.keys():
+                    encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
 
-        #         output = self.model.generate(encoded_input, **self.inference_generation_params)
-        #         output = output[0].detach().to('cpu')
-        #         decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
-        #                             skip_special_tokens=False)
-        #         datum = {
-        #             'val_round':df['val_round'].max()+1,
-        #             'rst_rels': '',
-        #             'topics':'',
-        #             'utterance':json.dumps(decoded_text) }
-        #         df = df.append(datum, ignore_index=True)
-        #         df.to_csv( fp, index=False)
-        #         # Saving to file
+                output = self.model.generate(encoded_input, **self.inference_generation_params)
+                output = output[0].detach().to('cpu')
+                decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
+                                    skip_special_tokens=False)
+                datum = {
+                    'val_round':df['val_round'].max()+1,
+                    'rst_rels': '',
+                    'topics':'',
+                    'utterance':json.dumps(decoded_text) }
+                df = df.append(datum, ignore_index=True)
+                df.to_csv( fp, index=False)
+                # Saving to file
                    
     def create_data_loaders(self, shuffle=False, **kwargs):
        
@@ -2717,7 +2654,8 @@ class TrainingModule(pl.LightningModule):
                 workers=self.workers, mode=self.mode, split=self.data_splits,
                 fda=self.model.fda, frst=self.model.frst,
                 ftopic=self.model.ftopic,
-                inference_context_utt=self.inference_context_utt)
+                inference_context_utt=self.inference_context_utt,
+                pad_value = self.model.pad_values )
 
         _dict_dl = dg()
         self.train_dl = _dict_dl['train_dl']
@@ -2791,6 +2729,7 @@ class DataLoaderGenerator():
                     splits={'train':0.6,'val':0.2,'test':0.2},
                     fda=True, frst=True, ftopic=True,
                     inference_context_utt=0,
+                    pad_values = {},
                     **kwargs):
         
         self.dir_data = dir_data
@@ -2806,6 +2745,7 @@ class DataLoaderGenerator():
         self.ftopic = ftopic
         
         self.inference_context_utt = inference_context_utt
+        self.pad_values = pad_values
 
     def prepare_dataloaders(self):
         """prepares a train, validation and test set
@@ -2852,40 +2792,54 @@ class DataLoaderGenerator():
         if split_name == 'train':
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
-            shuffle = True
+            shuffle = False
             ifc = 0
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
+            
             ifc = 0
 
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
             shuffle = False
+            sampler = None
             ifc = 0
 
         elif split_name == 'inference':
             line_starts = [ random.randrange( int(fs*(1-self.splits['test'])), fs) for fs in files_sizes  ]
             line_ends =  files_sizes
             shuffle = False
+            sampler = None
             ifc = self.inference_context_utt
 
         li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end, self.fda, self.frst, self.ftopic, ifc) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
 
         if split_name == 'inference':
-            random.sample(li_dsets,10)
+            random.sample(li_dsets,20)
             bs = 1
         else:
             bs = self.bs
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
-
-        dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
-            shuffle=shuffle, num_workers=self.workers, collate_fn=default_collate)
+        if split_name in ["train",'val']:
+            sampler = SizedOrdered_Sampler(concat_dset, bs )
+        
+            dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
+                shuffle=shuffle, num_workers=self.workers,
+                collate_fn=lambda batch: default_collate_pad(batch, self.pad_values),
+                sampler = sampler,  pin_memory=True
+                )
+        else:
+            dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
+                shuffle=shuffle, num_workers=self.workers,
+                sampler = sampler
+                )
+            
         
         return dataloader
 
@@ -2896,6 +2850,7 @@ class DataLoaderGenerator():
 class SingleDataset(torch.utils.data.Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
 
+        create a custom index which sorts the entries by their length
     """
     def __init__(self, file_path, tokenizer, line_start, line_end, fda, 
                     frst, ftopic, inference_context_utt=0 ):
@@ -2924,14 +2879,17 @@ class SingleDataset(torch.utils.data.Dataset):
                     names=names, skiprows=skiprows,
                     nrows=(self.line_end-self.line_start) )
         
+        self.np_textlens = self.data.txt_preproc.str.len().to_numpy() #.argsort()
+        
     def __len__(self):
         return (self.line_end - self.line_start)
     
-    def __getitem__(self, index,pad_utterance=True):
+    def __getitem__(self, index, pad_utterance=True):
         
         das, rst_rels, rst_ns, rst_pos, topics, topics_score, utterance = self.getitem_extract_datum(index)
         
         if self.inference_context_utt != 0:
+            
             utterance_context = ' '.join( utterance.split(' ')[:self.inference_context_utt] )
             
             encoded = self.getitem_tokenize(das, rst_rels,rst_ns, rst_pos,
@@ -2962,7 +2920,7 @@ class SingleDataset(torch.utils.data.Dataset):
         return encoded
 
     def getitem_extract_datum(self, index):
-
+        
         datum = self.data[index:index+1]
 
         #Dialogue Act
@@ -2982,6 +2940,17 @@ class SingleDataset(torch.utils.data.Dataset):
             rst_rels = [ _dict['rel'] for _dict in li_rst ]
             rst_ns = [ _dict['ns'] for _dict in li_rst ]
             rst_pos = [ _dict['pos'] for _dict in li_rst ]
+            
+            sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: ( COMERST_tokenizer.edukp_pos_sort_function(x[1]), x[1] ) )]
+            
+            rst_rels = [ rst_rels[idx] for idx in sorted_order ]
+            rst_ns = [ rst_ns[idx] for idx in sorted_order ]
+            rst_pos = [ rst_pos[idx] for idx in sorted_order ]
+            # rst_pos.sort(key=lambda edu_pos: ( COMERST_tokenizer.edukp_pos_sort_function(edu_pos), edu_pos ) )
+            
+            
+            #sorting the order to be left to right
+            
         
         else:
             rst_rels = None
@@ -2992,7 +2961,7 @@ class SingleDataset(torch.utils.data.Dataset):
         if self.ftopic:
             topics_textrank = json.loads(datum['topic_textrank'].values[0])
 
-            topics, topics_score = zip( *topics_textrank ) #top 3 important words from utterance
+            topics, topics_score = zip( *topics_textrank ) #top 3 important prhases from utterance
 
         else:
             topics = None
@@ -3008,10 +2977,7 @@ class SingleDataset(torch.utils.data.Dataset):
         utterance,pad_utterance=True, generate_mode=False):
         
         if self.fda and self.frst:
-            encoded = self.tokenizer.encode_v2(das, rst_rels,  rst_ns, rst_pos,
-                        topics, topics_score, utterance,
-                        pad_utterance=pad_utterance,
-                        generate_mode=generate_mode)
+            raise ValueError
 
         elif self.fda == False and self.frst:
             encoded = self.tokenizer.encode_v2_exda(rst_rels, rst_ns, rst_pos ,
@@ -3019,6 +2985,33 @@ class SingleDataset(torch.utils.data.Dataset):
                         pad_utterance=pad_utterance, generate_mode=generate_mode)
 
         return encoded
+
+class SizedOrdered_Sampler(Sampler[int]):
+    r"""Samples elements sequentially, always in the same order.
+    #TODO; add this to pytorch. Sampler to sort nlp datasets by size
+    Args:
+        data_source (Dataset): dataset to sample from
+    """
+    
+    def __init__(self, data_source, batch_size) -> None:
+        self.data_source = data_source
+                        
+        np_txt_lens = np.concatenate( [ds.np_textlens for ds in self.data_source.datasets] ).flatten()
+
+        #Indices are sorted in order of the text lens of records in the datasets
+        np_ordered_lens = np_txt_lens.argsort()
+        
+        # No we Randomly re-arrange them in batches of batch size
+        li_chunked_lens = np.array_split( np_ordered_lens, self.__len__() //batch_size  )
+        random.shuffle( li_chunked_lens )
+        
+        self.li_shuffled_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
+        
+    def __iter__(self):
+        return iter(self.li_shuffled_chunked_ordered_lens)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
 
 def main(tparams={}, mparams={}):
     #gc.collect()
@@ -3077,23 +3070,24 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 86 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 14 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 44 -agb 6 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 86 -agb 3 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 16 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 44 -agb 2 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 8 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated_fixed"
 # CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 48 -agb 4 --gpus 2 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 161 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics, amended issue where txt_preproc was not being josn parsed so qoutation marks existed around text " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
 # CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 24 -agb 10 --gpus 1 -fda 0 -fp 0 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 17 --precision 16 --mode train_new -lr 18e-4 -me 70 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2-medium" --dir_data "./dataset_v2/reddit_large_annotated"
 
 # python3 train_nlg.py -bs 112 -agb 1 --gpus 2 -fda 0 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
 
 
-# dullduks server version 2 - No Freezing, partial RST
+# dullduks server version 2 - No Freezing, partial RST - BAD
 # CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 300 -agb 1 --gpus 1 -fda 0 -fp 0 -frstv 0 --workers 8 --version 2 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 1660 --tag "no freezing partial rst" --base_model_name "distilgpt2"
 # python3 train_nlg.py -bs 40 -agb 1 --gpus 2 -fda 0 --workers 16 --version 42 -opt AdamW --precision 16 --mode test
 
-# version 3 - Freezing, Full RST
+# version 3 - Freezing, Full RST - bad
 # CUDA_VISIBLE_DEVICES=1,2 python3 train_nlg.py -bs 40 -agb 2 --gpus 2 -fda 0 -fp 1 -frstv 1 --workers 8 --version 3 --precision 16 --mode train_new -lr 1e-5 -me 80 -mil 160 --tag "freezing, full rst" --base_model_name "distilgpt2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fda 0 -fp 1 -frstv 1 --workers 8 --version 31 --precision 16 --mode train_new -lr 1e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, dataset with sentences with two sections" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 1 -frstv 1 -sgbf 0 --workers 4 --version 32 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fda 0 -fp 1 -frstv 1 -sgbf 1 --workers 4 --version 33 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset, inverse_freq_grad to embedding" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
 # CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 50 -agb 6 --gpus 1 -fda 0 -fp 1 -frstv 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 35 --precision 16 --mode train_new -lr 8e-4 -me 20 -mil 200 --tag "partial freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
+
+
+# New version with ability to encode very long positions
+# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -b 120 --gpus 1 --freeze_pretrained 0 --scale_grad_by_freq 1 --context_len '{ "rst":14, "topics":18 }' --workers 12 --version 42 --precision 16 --mode train_new --tag "no freezing full rst, gpt2, inverse_grad_freq used in embedding layer" --base_model_name "gpt2" --max_input_len 120

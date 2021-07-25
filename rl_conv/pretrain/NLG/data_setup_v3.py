@@ -36,13 +36,11 @@ pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start
              "(?<=\w\.)\w",               # end of acronym
              )
  
-
 import csv
 
 import time
 
 from filelock import Timeout, FileLock
-
 
 import multiprocessing as mp
 
@@ -655,9 +653,14 @@ if __name__ == '__main__':
             main( **dict_args )
             completed = True
         except Exception as e:
+                        
+            dir_save_dataset = utils_nlg.get_path("./dataset_v3/",_dir=True)
+            df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
+            df_records.loc[ subreddit, ['last_batch'] ] =  batches_completed[subreddit] + 2
+            df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
+            
             print(e)
             print(traceback.format_exc())
-            batches_completed[subreddit] = batches_completed[subreddit] + 2
             dict_args['resume_progress'] = True
             
         finally :
@@ -670,4 +673,6 @@ if __name__ == '__main__':
             # time.sleep(3)
             pass
 
-# python3 data_setup_v3.py -bps 240 -rp 1  --mp_count 8  --subset_no 1
+# python3 data_setup_v3.py -bps 240 -rp 1  --mp_count 6  --subset_no 1
+# python3 data_setup_v3.py -bps 320 -rp 1  --mp_count 6  --subset_no 2
+# python3 data_setup_v3.py -bps 240 -rp 1  --mp_count 8  --subset_no 3
