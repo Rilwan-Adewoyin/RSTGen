@@ -5,7 +5,7 @@
 
 #region imports 
 import os
-#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
+os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'eth'
 #os.environ['NCCL_SOCKET_IFNAME'] =  "enp226s0f0"
 #os.environ['NCCL_IB_DISABLE'] ="1"#
@@ -399,8 +399,8 @@ class COMERST(nn.Module):
         elif self.relation_embedding == "hierarchical2":
             # This is the normal embedding layer for COMET model
                 # NOTE: cancelled -> We allow one extra embedding position to act as a domain shift embedding position from COMET to RST
-            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1
-            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li )
+            rel_embed_len_atomic = len(self.tokenizer.atomic_rel_li ) + 1 + 1
+            rel_pad_idx_atomic = len(self.tokenizer.atomic_rel_li ) + 1
             self.embedding_rels_atomic = torch.nn.Embedding( rel_embed_len_atomic, self.transformer.config.d_model, padding_idx=rel_pad_idx_atomic, scale_grad_by_freq=self.scale_grad_by_freq   )
 
             #  This is an embedding layer that maps each RST relationship to a set of weights over the atomic relationships
@@ -411,9 +411,9 @@ class COMERST(nn.Module):
             self.embedding_rels_rst = torch.nn.Sequential(
                 self.embedding_rels_rst_l1,
                 torch.nn.Linear( 80, 160 , bias=rst_embed_bias ) ,
-                torch.nn.LeakyReLU(),
+                torch.nn.GELU(),
                 torch.nn.Linear( 160, 80 , bias=rst_embed_bias ) ,
-                torch.nn.LeakyReLU(),
+                torch.nn.GELU(),
                 torch.nn.Linear( 80, rel_embed_len_atomic, bias=rst_embed_bias ) ,
                 torch.nn.Tanh(),
             )
@@ -2175,22 +2175,16 @@ class TrainingModule(pl.LightningModule):
         
         # Creating Callbacks
         callbacks = []        
-        # checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
-        #     mode='min', dirpath=dir_checkpoints, 
-        #     filename='{epoch:03d}_{val_loss:.5f}')
-        #NOTE: debugging
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=0, 
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
-        
         
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model, checkpoint_callback) #monkey patch
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
-            #monitor='val_loss_comet',
             min_delta=0.00,
-            patience=5,
+            patience=7,
             verbose=False,
             mode='min'
         )
@@ -2207,20 +2201,17 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
-                        #check_val_every_n_epoch=1,
+                        
                         logger=tb_logger,
-                        #log_every_n_steps=20,
+                        
                         precision=tparams['precision'], callbacks=callbacks,
-                        #accelerator='ddp2', amp_level='O2',
+                        
                         accelerator=accelerator,
-                        limit_train_batches =10,
-                        limit_val_batches = 5,
-                        #val_check_interval=0.3,
-                        #num_sanity_val_steps=0, 
-                        #overfit_batches=25,
+                        val_check_interval=0.3,
+                        num_sanity_val_steps=0, 
                         reload_dataloaders_every_epoch=True,
                         multiple_trainloader_mode='max_size_cycle'
-                        #,gradient_clip_val=0.00001, gradient_clip_algorithm='value'
+                        
                         )
 
         elif tparams['mode'] in ["train_cont","inference"]:
@@ -2234,11 +2225,10 @@ class TrainingModule(pl.LightningModule):
                     #log_every_n_steps=20,   
                     precision=tparams['precision'],
                     callbacks=callbacks,
-                    #accelerator='ddp2',  amp_level='O2', # use_amp=True,
                     accelerator=accelerator,
-                        limit_train_batches =20,
-                        limit_val_batches = 5,
-                    #val_check_interval=0.3,
+                        # limit_train_batches =20,
+                        # limit_val_batches = 5,
+                    val_check_interval=0.3,
                     num_sanity_val_steps=0,
                     #track_grad_norm = True,
                     #overfit_batches=5
@@ -2465,161 +2455,168 @@ class TrainingModule(pl.LightningModule):
                 loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
                 self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
 
-        if step_name == "val" and _get_rank() == 0 :
-            bad_words = ['"']
-            bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words ]
-            
-            generation_kwargs_comet = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
-                                'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
-                                'min_length':3, 'max_length':18 }
-
-            generation_kwargs_rst = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
-                                'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
-                                'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
-                                'min_length':3, 'max_length':10 }
+        try:
+            with timeout(seconds= 120 ):
+                if step_name == "val" and _get_rank() == 0 :
+                    bad_words = ['"', ' "']
+                    bad_words_ids = [ self.model.tokenizer.base_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words ]
                     
-                    # At end of validation loop produce some quantitative examples of model's performance
+                    generation_kwargs_comet = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                        'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                        'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                        'min_length':4, 'max_length':18 }
 
-            # Making directory for inference testing results
-            dir_infer = os.path.join(self.trainer.log_dir,"inference")
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer,exist_ok=True)
-        
-            # data holders
-            li_comet_heads = []
-            li_comet_rels = []
-            li_comet_preds = []
-            li_comet_tails = []
+                    generation_kwargs_rst = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':1.0, 
+                                        'early_stopping':False, 'do_sample':False, 'no_repeat_ngram_size':3, 
+                                        'num_return_sequences':1, 'bad_words_ids':bad_words_ids,
+                                        'min_length':4, 'max_length':10 }
+                            
+                            # At end of validation loop produce some quantitative examples of model's performance
 
-            li_rst_heads = []
-            li_rst_rels = []
-            li_rst_preds = []
-            li_rst_tails = []
-
-            for idx, batch in enumerate( self.inference_samples ):
+                    # Making directory for inference testing results
+                    dir_infer = os.path.join(self.trainer.log_dir,"inference")
+                    if not os.path.exists(dir_infer):
+                        os.makedirs(dir_infer,exist_ok=True)
                 
-                # COMET testing
-                if 'comet' in batch:
-                    batch_comet =       batch['comet']
-                    batch_comet_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids, skip_special_tokens=True  ).strip() for head_ids in batch_comet['head_ids'] ]
-                    batch_comet_rels =  [ self.model.tokenizer.atomic_rel_labeler.inverse_transform( rels_ids ) for rels_ids in batch_comet['rels_ids'].cpu().numpy().tolist() ]
-                    batch_tails_comet = [  self.model.tokenizer.base_tokenizer.decode( tail_ids , skip_special_tokens=True  ).strip()  for tail_ids in batch_comet['tail_ids'] ]
+                    # data holders
+                    li_comet_heads = []
+                    li_comet_rels = []
+                    li_comet_preds = []
+                    li_comet_tails = []
 
-                    preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs_comet )
-                    
-                    li_comet_heads.extend(batch_comet_heads)
-                    li_comet_rels.extend(batch_comet_rels)
-                    li_comet_tails.extend(batch_tails_comet)
-                    li_comet_preds.extend(preds)
+                    li_rst_heads = []
+                    li_rst_rels = []
+                    li_rst_preds = []
+                    li_rst_tails = []
 
-                # RST Testing
-                if 'rst' in batch:
-                    batch_rst = batch['rst']
+                    for idx, batch in enumerate( self.inference_samples ):
+                        
+                        # COMET testing
+                        if 'comet' in batch:
+                            batch_comet =       batch['comet']
+                            batch_comet_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids, skip_special_tokens=True  ).strip() for head_ids in batch_comet['head_ids'] ]
+                            batch_comet_rels =  [ self.model.tokenizer.atomic_rel_labeler.inverse_transform( rels_ids ) for rels_ids in batch_comet['rels_ids'].cpu().numpy().tolist() ]
+                            batch_tails_comet = [  self.model.tokenizer.base_tokenizer.decode( tail_ids , skip_special_tokens=True  ).strip()  for tail_ids in batch_comet['tail_ids'] ]
+
+                            preds = self.model.generate_from_batch( batch_comet, comet_or_rst="comet", generation_kwargs=generation_kwargs_comet )
                             
-                    # RST -  prediction for every elem in batch
-                    preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs_rst )
+                            li_comet_heads.extend(batch_comet_heads)
+                            li_comet_rels.extend(batch_comet_rels)
+                            li_comet_tails.extend(batch_tails_comet)
+                            li_comet_preds.extend(preds)
+
+                        # RST Testing
+                        if 'rst' in batch:
+                            batch_rst = batch['rst']
                                     
-                    #batch decoding to get original data for each elem in batch
-                    batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
-                    batch_rst_heads = [ [ _.strip("<s>").strip("</").strip() for _ in heads_rst ] for heads_rst in batch_rst_heads ]
-                    
-                    batch_heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().numpy().tolist()
-                    batch_heads_treepos_rst = [ [ key for key, group in groupby(treepos) ] for treepos in batch_heads_treepos_rst ]
-                    
-                    batch_edu_pos_for_head = batch_rst.get('li_edu_pos_for_head',None).cpu().numpy().tolist()
-                    
-                    batch_rels_ids_rst = [ self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( rst_rel_ids ).tolist() for rst_rel_ids in batch_rst['rst_rel_ids'].tolist() ]                    
-                    batch_rels_treepos_rst = [ id_ for id_ in batch_rst['rst_treepos_ids'].tolist() if id_!= self.model.embedding_rst_pos.padding_idx]
-                    
-                    batch_ns_rst = [ [ns for ns in rst_ns_ids if ns<len(self.model.tokenizer.rst_ns_labeler.classes_)  ] for rst_ns_ids in batch_rst['rst_ns_ids'].tolist() ]
-                    batch_rels_ns_rst = [ self.model.tokenizer.rst_ns_labeler.inverse_transform( rst_ns_id ).tolist() for rst_ns_id in batch_ns_rst ]
-
-                    batch_tails_rst = [self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
-                    
-                    batch_edu_pos_for_tail = batch_rst.get('li_edu_pos_for_tail',None).cpu().numpy().tolist()
-                            
-                    # looping through every element in the batch to get head, rel, tail for recording
-                    for idx1 in range(len(preds)):
-                    
-                        head = { ','.join(map(str,batch_edu_pos_for_head[idx1])):  batch_rst_heads[idx1][0] }       
-                        rel = [ {pos:[rel, ns]} for pos, rel,ns in zip(batch_rels_treepos_rst[idx1], batch_rels_ids_rst[idx1], batch_rels_ns_rst[idx1]) ]
-                        tail = {','.join(map(str,batch_edu_pos_for_tail[idx1])):batch_tails_rst[idx1].strip() }
-                                                            
-                        li_rst_heads.append( head )
-                        li_rst_rels.append( rel )
-                        li_rst_tails.append( tail )
-                        li_rst_preds.append( preds[idx1] )
-                            
-
-            # Adding records from this epoch to files
-            for idx in range(len(self.inference_samples)):
-                if 'comet' in batch:
-                    fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
-                    
-                    # comet- If file for example idx does not exists we add the true observed records
-                    if not os.path.exists(fp_comet):
-                        
-                        df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
-                        
-                        head = li_comet_heads[idx]
-                        rels = li_comet_rels[idx]
-                        tail = li_comet_tails[idx]
-                        preds = li_comet_preds[idx]
+                            # RST -  prediction for every elem in batch
+                            preds = self.model.generate_from_batch( batch_rst, comet_or_rst="rst", generation_kwargs=generation_kwargs_rst )
                                             
-                        datum = { 'epoch': 0,
-                                    'head': head,
-                                    "rels": rels,
-                                    "tail":tail,
-                                    "preds":preds }
-                    
-                        df_comet = df_comet.append(datum, ignore_index=True)
-                        df_comet.to_csv( fp_comet, index=False)
+                            #batch decoding to get original data for each elem in batch
+                            batch_rst_heads = [ self.model.tokenizer.base_tokenizer.decode( head_ids,  skip_special_tokens=True ).split('</s><s>') for  head_ids in batch_rst['head_ids']  ]
+                            batch_rst_heads = [ [ _.strip("<s>").strip("</").strip() for _ in heads_rst ] for heads_rst in batch_rst_heads ]
+                            
+                            batch_heads_treepos_rst = batch_rst['head_treepos_ids'].cpu().numpy().tolist()
+                            batch_heads_treepos_rst = [ [ key for key, group in groupby(treepos) ] for treepos in batch_heads_treepos_rst ]
+                            
+                            batch_edu_pos_for_head = batch_rst.get('li_edu_pos_for_head',None).cpu().numpy().tolist()
+                            
+                            batch_rels_ids_rst = [ self.model.tokenizer.rst_rel_labeler.inverse_transform_patch( rst_rel_ids ).tolist() for rst_rel_ids in batch_rst['rst_rel_ids'].tolist() ]                    
+                            batch_rels_treepos_rst = [ id_ for id_ in batch_rst['rst_treepos_ids'].tolist() if id_!= self.model.embedding_rst_pos.padding_idx]
+                            
+                            batch_ns_rst = [ [ns for ns in rst_ns_ids if ns<len(self.model.tokenizer.rst_ns_labeler.classes_)  ] for rst_ns_ids in batch_rst['rst_ns_ids'].tolist() ]
+                            batch_rels_ns_rst = [ self.model.tokenizer.rst_ns_labeler.inverse_transform( rst_ns_id ).tolist() for rst_ns_id in batch_ns_rst ]
 
-                    # comet - adding to preds
-                    df_comet = pd.read_csv(fp_comet)    
-                    datum_comet = {
-                        'epoch':df_comet['epoch'].max()+1,
-                        'head': '',
-                        'rels':'',
-                        'tail':'',
-                        'preds':li_comet_preds[idx] }
+                            batch_tails_rst = [self.model.tokenizer.base_tokenizer.decode( tail_id, skip_special_tokens=True ).strip() for tail_id in batch_rst['tail_ids'].tolist()  ]
+                            
+                            batch_edu_pos_for_tail = batch_rst.get('li_edu_pos_for_tail',None).cpu().numpy().tolist()
+                                    
+                            # looping through every element in the batch to get head, rel, tail for recording
+                            for idx1 in range(len(preds)):
+                            
+                                head = { ','.join(map(str,batch_edu_pos_for_head[idx1])):  batch_rst_heads[idx1][0] }       
+                                rel = [ {pos:[rel, ns]} for pos, rel,ns in zip(batch_rels_treepos_rst[idx1], batch_rels_ids_rst[idx1], batch_rels_ns_rst[idx1]) ]
+                                tail = {','.join(map(str,batch_edu_pos_for_tail[idx1])):batch_tails_rst[idx1].strip() }
+                                                                    
+                                li_rst_heads.append( head )
+                                li_rst_rels.append( rel )
+                                li_rst_tails.append( tail )
+                                li_rst_preds.append( preds[idx1] )
+                                    
 
-                    df_comet = df_comet.append(datum_comet, ignore_index=True)
-                    df_comet.to_csv( fp_comet, index=False)
+                    # Adding records from this epoch to files
+                    for idx in range(len(self.inference_samples)):
+                        if 'comet' in batch:
+                            fp_comet = os.path.join(dir_infer, f"example_comet_{idx:03d}.csv")
+                            
+                            # comet- If file for example idx does not exists we add the true observed records
+                            if not os.path.exists(fp_comet):
+                                
+                                df_comet = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                                
+                                head = li_comet_heads[idx]
+                                rels = li_comet_rels[idx]
+                                tail = li_comet_tails[idx]
+                                preds = li_comet_preds[idx]
+                                                    
+                                datum = { 'epoch': 0,
+                                            'head': head,
+                                            "rels": rels,
+                                            "tail":tail,
+                                            "preds":preds }
+                            
+                                df_comet = df_comet.append(datum, ignore_index=True)
+                                df_comet.to_csv( fp_comet, index=False)
 
-                if 'rst' in batch:
-                    fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
-                    # rst - If file for example idx does not exists we add the true observed records
-                    if not os.path.exists(fp_rst):
-                        
-                        df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
-                        
-                        head = li_rst_heads[idx]
-                        rels = li_rst_rels[idx]
-                        tail = li_rst_tails[idx]
-                        preds = li_rst_preds[idx]
-                                            
-                        datum = { 'epoch': 0,
-                                    'head': head,
-                                    "rels": rels,
-                                    "tail":tail,
-                                    "preds":preds }
-                    
-                        df_rst = df_rst.append(datum, ignore_index=True)
-                        df_rst.to_csv( fp_rst, index=False)
+                            # comet - adding to preds
+                            df_comet = pd.read_csv(fp_comet)    
+                            datum_comet = {
+                                'epoch':df_comet['epoch'].max()+1,
+                                'head': '',
+                                'rels':'',
+                                'tail':'',
+                                'preds':li_comet_preds[idx] }
 
-                    # rst - adding to preds
-                    df_rst = pd.read_csv(fp_rst)    
-                    datum_rst = {
-                        'epoch':df_rst['epoch'].max()+1,
-                        'head': '',
-                        'rels':'',
-                        'tail':'',
-                        'preds':li_rst_preds[idx] }
+                            df_comet = df_comet.append(datum_comet, ignore_index=True)
+                            df_comet.to_csv( fp_comet, index=False)
 
-                    df_rst = df_rst.append(datum_rst, ignore_index=True)
-                    df_rst.to_csv( fp_rst, index=False)
+                        if 'rst' in batch:
+                            fp_rst = os.path.join(dir_infer, f"example_rst_{idx:03d}.csv")
+                            # rst - If file for example idx does not exists we add the true observed records
+                            if not os.path.exists(fp_rst):
+                                
+                                df_rst = pd.DataFrame(columns=[ 'epoch', 'head','rels','tail', 'preds'])                    
+                                
+                                head = li_rst_heads[idx]
+                                rels = li_rst_rels[idx]
+                                tail = li_rst_tails[idx]
+                                preds = li_rst_preds[idx]
+                                                    
+                                datum = { 'epoch': 0,
+                                            'head': head,
+                                            "rels": rels,
+                                            "tail":tail,
+                                            "preds":preds }
+                            
+                                df_rst = df_rst.append(datum, ignore_index=True)
+                                df_rst.to_csv( fp_rst, index=False)
+
+                            # rst - adding to preds
+                            df_rst = pd.read_csv(fp_rst)    
+                            datum_rst = {
+                                'epoch':df_rst['epoch'].max()+1,
+                                'head': '',
+                                'rels':'',
+                                'tail':'',
+                                'preds':li_rst_preds[idx] }
+
+                            df_rst = df_rst.append(datum_rst, ignore_index=True)
+                            df_rst.to_csv( fp_rst, index=False)
+                else:
+                    pass
+        except TimeoutInterrupt as e:
+            pass
+        
 
     def create_data_loaders(self, shuffle=False, **kwargs ):
         
@@ -2893,25 +2890,6 @@ class SingleDataset_rst(torch.utils.data.Dataset):
         encoded = self.tokenizer.tokenize_rst( li_edu_kp = li_edu_kp ,
                                                      li_rst = li_rst,
                                                      li_kp_score = li_kp_score)
-
-            # encoded May include some of the following
-            #    return {
-            #         #'input_ids': , 
-
-            #         'li_head_ids': li_head_ids ,
-            #         'li_head_pos_ids': li_head_pos_ids,
-            #         'li_head_kpscore': li_head_kpscore,
-
-            #         'tail_ids': tail_ids,
-            #         'tail_pos_id': tail_pos_id ,
-            #         'tail_kpscore': target_edu_kpscore
-
-            #         'li_rst_rel_ids': li_rst_rel_ids ,
-            #         'li_rst_pos_ids': li_rst_pos_ids,
-            #         'li_rst_pos_ids': li_rst_ns_ids
-
-            #     }   
-
         return encoded
 
     def getitem_extract_datum(self, index):
@@ -3056,21 +3034,7 @@ class SingleDataset_atomic2020(torch.utils.data.Dataset):
         #encoding
         encoded = self.tokenizer.tokenize_comet( head=head,
                                                 rel=rel,
-                                                tail=tail )
-
-            # encoded May include some of the following
-            # return {
-            #     'li_head_ids':li_head_ids,
-            #     'li_head_pos_ids':None,
-
-            #     'tail_ids':tail_ids,
-            #     'tail_pos_id':None,
-
-            #     'li_rst_rel_ids': None,
-            #     'li_rst_pos_ids': None,
-            #     'li_rst_pos_ids':None,
-
-            # }    
+                                                tail=tail ) 
 
         return encoded
 
@@ -3096,9 +3060,7 @@ def main(tparams={}, mparams={}):
                     name = mparams['model_name'],
                     version = tparams['version'] )
     tparams['version'] =  tb_logger.version
-    #NOTE: debugging
-    tb_logger = None
-    
+       
     tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
     
     os.makedirs(tparams['dir_checkpoints'],exist_ok=True)
@@ -3173,4 +3135,7 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -rpet 2 -fe 1 -sgbf 1 -rmto 1 -at 2 -re hierarchical2 -1wr 0.5 -lwc 0.5 -mlh 20 -mlt 20 -bs 280 -far 0 -agb 1 --gpus 1 --workers 12 --version 101 --precision 16 --mode train_new -lr 1e-4 -me 20 --tag "New model. New Keyphrase v2 dataset and With novel position embedding to allow all positions to be embeded"
 
 # 102 - Same as 101 - bias removed on rst embedding, larger dataset, 
-# CUDA_VISIBLE_DEVICES=1 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.0 -c 1.0 -s 220 --gpus 1 --workers 12 --version 117 --precision 16 --mode train_new -l 5e-4 --max_epochs 60 --tag "same as 101 larger dset"
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.5 -c 0.5 -s 220 --gpus 1 --workers 12 --version 102 --precision 16 --mode train_new -l 1e-4 --max_epochs 25 --tag "same as 101 larger dset"
+
+# 103 - Same as 101 - bias removed on rst embedding, larger dataset, without head kp being shortened and without detach() -> allows smoother gradients
+# CUDA_VISIBLE_DEVICES=4 python3 train_comerst.py -p 2 -f 1 -a 2 -b 0 -e hierarchical2 -r 0.5 -c 0.5 -s 220 --gpus 1 --workers 13 --version 102 --precision 16 --mode train_new -l 1e-4 --max_epochs 25 --tag "same as 101 larger dset"
