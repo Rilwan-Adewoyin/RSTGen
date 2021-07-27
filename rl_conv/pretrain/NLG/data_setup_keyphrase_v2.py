@@ -402,8 +402,6 @@ def check_full_rst(li_dict_rsttext):
         else:
             li_dict_rsttext[idx2]['rst'] = li_rst_dict[idx1]
 
-    
-
 
     return li_dict_rsttext
 

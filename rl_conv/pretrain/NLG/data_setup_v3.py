@@ -36,13 +36,11 @@ pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start
              "(?<=\w\.)\w",               # end of acronym
              )
  
-
 import csv
 
 import time
 
 from filelock import Timeout, FileLock
-
 
 import multiprocessing as mp
 
