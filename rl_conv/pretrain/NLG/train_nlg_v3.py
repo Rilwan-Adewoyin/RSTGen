@@ -687,7 +687,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         rst_ns_encoded = self.rst_ns_labeler.transform( rst_ns ) #.reshape( [1,-1] )  
         tnsr_ns = torch.LongTensor(rst_ns_encoded)
     
-        tnsr_pos = torch.LongTensor( self.clamp_values( rst_pos, utils.MAX_LONG_VALUE ) ) #.reshape([1,-1])
+        tnsr_pos = torch.LongTensor( self.clamp_values( np.array(rst_pos), utils.MAX_LONG_VALUE ) ) #.reshape([1,-1])
             
 
         # padding ns and pos
@@ -778,7 +778,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
             # copies each score phrase_len times to cover that phrase and handles case where there is no phrase
         topics_pos = [ [score]*phrase_len for score, phrase_len in zip(topics_pos, ta_phrase_lens) ]
         topics_pos = sum(topics_pos,[]) #flattening list
-        tnsr_pos = torch.LongTensor( self.clamp_values( topics_pos, utils.MAX_LONG_VALUE )  )
+        tnsr_pos = torch.LongTensor( self.clamp_values( np.array(topics_pos), utils.MAX_LONG_VALUE )  )
         
         
         #Padding out to max_len
