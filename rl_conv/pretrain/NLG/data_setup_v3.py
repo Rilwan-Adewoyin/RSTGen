@@ -590,12 +590,14 @@ def _save_data(li_dict_utt, dir_save_dataset, last_batch_operated_on=0,
             old_fp = os.path.join(subreddit_dir,fn)
             new_fp = os.path.join(subreddit_dir,f"{fn[:4]}_{new_len:010d}")
             
-            df_ = pd.read_csv(old_fp)
-            df_ = df_.append( _li_dict_utt, ignore_index=True, sort=False)
-            df_.to_csv( new_fp, index=False)
+            #df_ = pd.read_csv(old_fp)
+            #df_ = df_.append( _li_dict_utt, ignore_index=True, sort=False)
+            #df_.to_csv( new_fp, index=False)
+            pd.DataFrame(_li_dict_utt).to_csv(old_fp, mode='a', header=False, index=False)
+            os.rename(old_fp,new_fp)
 
-            if os.path.exists(old_fp) and old_fp!=new_fp:
-                os.remove(old_fp)
+            # if os.path.exists(old_fp) and old_fp!=new_fp:
+            #     os.remove(old_fp)
                 
         # Updating record of last batch operated on for each subreddit
         new_record = { 'batch_process_size':batch_process_size, 'last_batch':last_batch_operated_on }
