@@ -239,13 +239,13 @@ from utils_nlg_v3 import EmbeddingRstPos
 def clamp_values(x, max):
 
     #clamps values in a tree method where the parent tree nodes is the evel
-        # to reduce to
-    # we use this since the rst positions in our tree are often too large 
+    # to reduce to
+    # we use this since the rst positions in our tree are often too large
     # for torch.long to handle
     while x.max() >= max:
-        x = np.where( x<max, x, np.floor_divide(x-1,2) )
-    
-    return x.astype( int )
+        x = np.where(x < max, x, np.floor_divide(x-1, 2))
+
+    return x.astype(int)
 
 MAX_LONG_VALUE = torch.iinfo(torch.long).max
 

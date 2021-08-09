@@ -155,9 +155,11 @@ rst_rel_li = ['Attribution',
 
 #region RST info Encoding
 
+MAX_LONG_VALUE = torch.iinfo(torch.long).max
 
 class RstTokenizerMixin():
-
+  
+    
     @staticmethod
     @lru_cache()
     def edukp_pos_sort_function(edukp_pos: int):
@@ -206,6 +208,17 @@ class RstTokenizerMixin():
             parent_pos = math.floor(parent_pos)
         
         return li_leftright_seq
+
+    def clamp_values(self, x, max):
+
+        #clamps values in a tree method where the parent tree nodes is the evel
+            # to reduce to
+        # we use this since the rst positions in our tree are often too large 
+        # for torch.long to handle
+        while x.max() >= max:
+            x = np.where( x<max, x, np.floor_divide(x-1,2) )
+                    
+        return x.astype( int )
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
     def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
@@ -392,6 +405,8 @@ class EffeciencyMixin():
 
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 
+    
+    
 
 #endregion
 

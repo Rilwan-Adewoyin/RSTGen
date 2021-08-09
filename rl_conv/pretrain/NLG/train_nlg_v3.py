@@ -10,7 +10,7 @@ from torch._C import Value
 #os.environ['NCCL_P2P_DISABLE'] = '1'
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
-os.environ['CUDA_LAUNCH_BLOCKING']="1"
+#os.environ['CUDA_LAUNCH_BLOCKING']="1"
 
 import torch
 import torch.nn as nn
@@ -108,7 +108,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.001)
 
         self.embedding_rst_pos = EmbeddingRstPos(   max_rst_index=self.nlg_tokenizer.rst_pos_maxidx,
-                                                    max_rst_level = EmbeddingRstPos.node_level(self.nlg_tokenizer.rst_pos_maxidx),
+                                                    max_rst_level = NLG_tokenizer.node_level(self.nlg_tokenizer.rst_pos_maxidx),
                                                     rst_encoding_ndim=self.embd_outp_dim,
                                                     init_val=0.001)
               
@@ -128,7 +128,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
             
         with torch.no_grad():
                 # initialising new special tokens to to eos token value
-            self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count:-1,:] = self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count-1:-self.nlg_tokenizer.special_token_count,:] 
+            #self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count:-1,:] = self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count-1:-self.nlg_tokenizer.special_token_count,:] 
                 # initialising 
             self.transformer.transformer.wte.weight[  -1 ].fill_(0)
         self.transformer.tie_weights()
@@ -334,7 +334,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         # default generation params
             #TODO: add these to config so they are automatically done
         if 'bad_words_ids' not in generation_params:
-            bad_words = ['"',"<|rst|>","<|ta|>", "<|pad|>",'\n', "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|"]
+            bad_words = ['"',"<|rst|>","<|ta|>", "<|pad|>",'\n', "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|",r'\""']
             bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [[526], [55],[8172], [3467], [59], [6852], [7479],[7879],[13426],[17405],[91],[8614],[930],[10],[9],[12],[1303],[2],[4242], [2235],[46424]]
@@ -368,7 +368,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
 
         return gen_text
 
-class NLG_tokenizer(utils.EffeciencyMixin):
+class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
     """Rough Implmentation of the tokenizer for the NLG model
 
     Raises:
@@ -583,15 +583,14 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         
         #Getting Special Tokens
         rst_start_token = self.e2m_tokenizer.encode("<|rst|>",return_tensors="pt")[0] 
-        padding_token =  self.e2m_tokenizer.encode("<|pad|>",return_tensors="pt") 
-
+        
         #tnsr_rst_rels, rst_pad_count, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst(rst_rels, rst_ns, rst_pos, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
         #tnsr_topics_phrase, tnsr_topics_pos, topics_pad_count, ta_tokens_pos, ta_phrase_lens  = self.encode_topic( topics, topics_pos, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
         #tknzd_utt, utt_pad_count = self.encode_utterance(utterance, pad_utterance, generate_mode, padding_token)
-        tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst(rst_rels, rst_ns, rst_pos, max_len=self.context_len['rst'] - 1)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
-        tnsr_topics_phrase, tnsr_topics_pos, ta_tokens_pos, ta_phrase_lens  = self.encode_topic( topics, topics_pos, max_len=self.context_len['topics'], padding_token=padding_token) # dims (max_padding, 13) 
-        tknzd_utt = self.encode_utterance(utterance, pad_utterance, generate_mode, padding_token)
-
+        tnsr_rst_rels, tnsr_rst_ns, tnsr_rst_pos = self.encode_rst(rst_rels, rst_ns, rst_pos)   # dims (max_padding, n) #not we do rt_len-1 since we add the rst start token outside this method
+        tnsr_topics_phrase, tnsr_topics_pos, ta_tokens_pos, ta_phrase_lens  = self.encode_topic( topics, topics_pos ) # dims (max_padding, 13) 
+        tknzd_utt = self.encode_utterance(utterance, pad_utterance, generate_mode ) 
+        
             # calc the ending cumulative dim for, rst, topics, utt, segments,
         # r_dim = self.context_len['rst']               # tnsr_rst_rels.shape[0]
         # rt_dim = r_dim + self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
@@ -669,7 +668,7 @@ class NLG_tokenizer(utils.EffeciencyMixin):
                  'token_type_ids':token_type_ids.contiguous()
                  }
 
-    def encode_rst(self,rst_rels, rst_ns, rst_pos, max_len=8):
+    def encode_rst(self,rst_rels, rst_ns, rst_pos):
         """Converts rst_rels in a series of vectors
 
             Args:
@@ -681,25 +680,26 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         """
 
         #tnsr_rels, diff = self.encode_rst_rels(rst_rels, max_len=max_len)
-        tnsr_rels = self.encode_rst_rels(rst_rels, max_len=max_len)
+        tnsr_rels = self.encode_rst_rels(rst_rels )
 
 
         # Encoding the rst ns 
-            #Encoded to the sequence of integers representing the ns values
         rst_ns_encoded = self.rst_ns_labeler.transform( rst_ns ) #.reshape( [1,-1] )  
         tnsr_ns = torch.LongTensor(rst_ns_encoded)
-
-        # Encoding the rst position
-        tnsr_pos = torch.LongTensor( rst_pos ) #.reshape([1,-1])
+    
+        tnsr_pos = torch.LongTensor( self.clamp_values( np.array(rst_pos), utils.MAX_LONG_VALUE ) ) #.reshape([1,-1])
+            
 
         # padding ns and pos
             # The ns and pos embedding layer uses the index value 0 as a padding index
             # For this index the vector is initialized to zer0 and as such never updates
         
-        # len_ =  tnsr_ns.shape[0]
-        # if len_ > max_len:
-        #     tnsr_ns = tnsr_ns[:max_len]
-        #     tnsr_pos = tnsr_pos[:max_len]
+        max_len = self.context_len['rst'] - 1
+        len_ =  tnsr_rels.shape[0]
+        if len_ > max_len:
+            tnsr_rels = tnsr_rels[:max_len ] 
+            tnsr_ns = tnsr_ns[:max_len]
+            tnsr_pos = tnsr_pos[:max_len]
         
         # elif len_ < max_len:
         #     _ = max_len-len_
@@ -707,10 +707,10 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         #     tnsr_pos = torch.cat( [tnsr_pos, torch.full([_], 0  )])
 
         #return tnsr_rels, diff, tnsr_ns, tnsr_pos
+        
         return tnsr_rels, tnsr_ns, tnsr_pos
 
-
-    def encode_rst_rels(self,rst_rels, max_len=8):
+    def encode_rst_rels(self,rst_rels):
         """Converts rst_rels in a series of vectors
 
             Args:
@@ -735,7 +735,7 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         return tnsr_rels#, diff
     
 
-    def encode_topic(self, topics, topics_pos, padding_token, max_len=16):
+    def encode_topic(self, topics, topics_pos):
         """[summary]
 
             Args:
@@ -748,13 +748,15 @@ class NLG_tokenizer(utils.EffeciencyMixin):
             Returns:
                 [type]: [description]
         """
+        max_len =self.context_len['topics']
+        
         str_topics = ''.join([ '<|ta|>'+topic  for topic in topics ])
         dict_encoding = self.e2m_tokenizer(str_topics, add_special_tokens=False,
                                             return_attention_mask = False, 
                                             truncation = True,
                                             padding='do_not_pad', 
                                             return_tensors='np',
-                                            max_length = self.context_len['topics'],
+                                            max_length = max_len,
                                             return_token_type_ids=None,
                                             return_special_tokens_mask=False,
                                             return_length=True )
@@ -774,10 +776,9 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         ta_phrase_lens = np.diff( ta_idxs, append=dict_encoding['length'] ) 
         
             # copies each score phrase_len times to cover that phrase and handles case where there is no phrase
-        #TODO: here check the ta_phrase_lens above is not a problem
         topics_pos = [ [score]*phrase_len for score, phrase_len in zip(topics_pos, ta_phrase_lens) ]
         topics_pos = sum(topics_pos,[]) #flattening list
-        tnsr_pos = torch.LongTensor( topics_pos ) 
+        tnsr_pos = torch.LongTensor( self.clamp_values( np.array(topics_pos), utils.MAX_LONG_VALUE )  )
         
         
         #Padding out to max_len
@@ -795,7 +796,7 @@ class NLG_tokenizer(utils.EffeciencyMixin):
         return topic_phrases , tnsr_pos, ta_idxs, ta_phrase_lens
 
 
-    def encode_utterance(self, utterance, pad=True, generate_mode=False, padding_token=[0]):
+    def encode_utterance(self, utterance, pad=True, generate_mode=False ):
         #pad: 
         #   set to True during training to ensure all batches have the same length
         #   set to False in the case of Generation in order to work with huggingface .generate()
@@ -1060,14 +1061,12 @@ class TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
-                        check_val_every_n_epoch=1, logger=tb_logger,
+                        logger=tb_logger,
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator=accelerator,
-                        # limit_train_batches =10,
-                        # limit_val_batches = 10,
-                        val_check_interval=0.10,
-                        #num_sanity_val_steps=2, 
+                        val_check_interval=0.05,
+                        num_sanity_val_steps=0, 
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1082,20 +1081,16 @@ class TrainingModule(pl.LightningModule):
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
-                    check_val_every_n_epoch=1, logger=tb_logger,
-                    log_every_n_steps=20,   
+                     logger=tb_logger,
+                      
                     precision=tparams['precision'],
-                    callbacks=callbacks,
-                    accelerator=accelerator,
-                    #limit_train_batches = 0.4,
-                    #val_check_interval=0.5,
-                    #limit_val_batches = ,
-                    val_check_interval=0.2,
-                    num_sanity_val_steps=0,
-                    #track_grad_norm = True,
-                    #overfit_batches=5
-                    #,fast_dev_run=2, 
-                    #log_gpu_memory=True
+                    callbacks=callbacks,accelerator=accelerator,
+                         val_check_interval=0.05,
+                        num_sanity_val_steps=0, 
+                        #track_grad_norm = True,
+                        #overfit_batches=25,
+                        #fast_dev_run=2, 
+                        #log_gpu_memory=True
                     )
 
             # load callback states
@@ -1487,31 +1482,31 @@ class DataLoaderGenerator():
         #defining starting line and total lines to use for dataset
         if split_name == 'train':
             line_starts = [0]*len(files_sizes)
-            #line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
-            line_ends = [ 100 for ls,fs in zip(line_starts, files_sizes)  ]
+            line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
+            #line_ends = [ 100 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
             ifc = 0
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
-            #line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
-            line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
+            line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
+            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
             
             ifc = 0
 
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
-            #line_ends = files_sizes
-            line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
+            line_ends = files_sizes
+            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
             sampler = None
             ifc = 0
 
         elif split_name == 'inference':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
-            #line_ends =  files_sizes
-            line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
+            line_ends =  files_sizes
+            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = True
             sampler = None
             ifc = self.inference_context_utt
@@ -1616,7 +1611,7 @@ class SingleDataset(torch.utils.data.Dataset):
         rst_pos = [ _dict['pos'] for _dict in li_rst ]
         
             #sorting the order to be left to right in binary tree
-        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: ( EmbeddingRstPos.edukp_pos_sort_function(x[1]), x[1] ) )]
+        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: ( NLG_tokenizer.edukp_pos_sort_function(x[1]), x[1] ) )]
         rst_rels = [ rst_rels[idx] for idx in sorted_order ]
         rst_ns = [ rst_ns[idx] for idx in sorted_order ]
         rst_pos = [ rst_pos[idx] for idx in sorted_order ]
@@ -1638,7 +1633,6 @@ class SingleDataset(torch.utils.data.Dataset):
     def getitem_tokenize(self,  rst_rels, rst_ns, rst_pos ,topics, topic_pos,
         utterance,pad_utterance=True, generate_mode=False):
         
-
         encoded = self.tokenizer.encode(rst_rels, rst_ns, rst_pos ,
                         topics, topic_pos, utterance,
                         pad_utterance=pad_utterance, generate_mode=generate_mode)
@@ -1683,7 +1677,7 @@ def main(tparams={}, mparams={}):
                     version = tparams['version'] )
     tparams['version'] =  tb_logger.version
     
-    tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']:02d}",'checkpoints' )
+    tparams['dir_checkpoints'] = os.path.join(tparams['model_dir'],mparams['model_name'],f"version_{tparams['version']}",'checkpoints' )
     
     os.makedirs(tparams['dir_checkpoints'],exist_ok=True)
 
@@ -1713,26 +1707,4 @@ if __name__ == '__main__':
 
 # dullduks server version 1 - No Freezing, Full RST
 
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fp 0 --workers 8 --version 1 --precision 16 --mode train_new -lr 4e-4 -me 60 -mil 160 --tag "no freezing full rst" --base_model_name "distilgpt2"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 100 -agb 1 --gpus 1 -fp 0 --workers 8 --version 11 --precision 16 --mode train_new -lr 1e-5 -me 60 -mil 160 --tag "no freezing full rst, lower learning rate" --base_model_name "distilgpt2"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fp 0 --workers 8 --version 12 --precision 16 --mode train_new -lr 1e-4 -me 90 -mil 160 --tag "no freezing full rst, lower learning rate but using normal sized gpt and full sized dset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fp 0 -sgbf 1 --workers 4 --version 13 --precision 16 --mode train_new -lr 5e-4 -me 50 -mil 160 --tag "no freezing full rst, normal sized gpt and proper full sized dset, inverse_grad_freq used in embedding layer " --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 44 -agb 2 --gpus 1 -fp 0 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 8 --version 15 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=0,1 python3 train_nlg.py -bs 48 -agb 4 --gpus 2 -fp 0 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 161 --precision 16 --mode train_new -lr 6e-4 -me 50 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics, amended issue where txt_preproc was not being josn parsed so qoutation marks existed around text " --base_model_name "gpt2" --dir_data "./dataset_v2/reddit_large_annotated"
-# CUDA_VISIBLE_DEVICES=0 python3 train_nlg.py -bs 24 -agb 10 --gpus 1 -fp 0 -sgbf 1 -cl '{ "rst":16, "topics":30 }' --workers 6 --version 17 --precision 16 --mode train_new -lr 18e-4 -me 70 -mil 200 --tag "no freezing full rst, gpt2 and proper full sized dset (with iteration 2 of new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "gpt2-medium" --dir_data "./dataset_v2/reddit_large_annotated"
-
-# python3 train_nlg.py -bs 112 -agb 1 --gpus 2 --workers 16 --version 41 -opt AdamW --precision 16 --mode test
-
-
-
-# version 3 - Freezing, Full RST - bad
-# CUDA_VISIBLE_DEVICES=1,2 python3 train_nlg.py -bs 40 -agb 2 --gpus 2 -fp 1 --workers 8 --version 3 --precision 16 --mode train_new -lr 1e-5 -me 80 -mil 160 --tag "freezing, full rst" --base_model_name "distilgpt2"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 60 -agb 2 --gpus 1 -fp 1 --workers 8 --version 31 --precision 16 --mode train_new -lr 1e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, dataset with sentences with two sections" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_long2"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fp 1 -sgbf 0 --workers 4 --version 32 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 64 -agb 5 --gpus 1 -fp 1 -sgbf 1 --workers 4 --version 33 --precision 16 --mode train_new -lr 5e-4 -me 80 -mil 160 --tag "freezing, full rst, gpt2, full dataset, inverse_freq_grad to embedding" --base_model_name "gpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -bs 50 -agb 6 --gpus 1 -fp 1 -sgbf 1 -cl '{ "rst":16, "topics":30 }'  --workers 4 --version 35 --precision 16 --mode train_new -lr 8e-4 -me 20 -mil 200 --tag "partial freezing full rst, distilgpt and proper full sized dset (with additions from new data_v2), inverse_grad_freq used in embedding layer, larger context_len for rst and topics " --base_model_name "distilgpt2" --dir_data "./dataset/reddit_large_annotated_fixed"
-
-
-# New version with ability to encode very long positions
-# CUDA_VISIBLE_DEVICES=1 python3 train_nlg.py -b 120 --gpus 1 --freeze_pretrained 0 --scale_grad_by_freq 1 --context_len '{ "rst":14, "topics":18 }' --workers 12 --version 42 --precision 16 --mode train_new --tag "no freezing full rst, gpt2, inverse_grad_freq used in embedding layer" --base_model_name "gpt2" --max_input_len 120
+#   
