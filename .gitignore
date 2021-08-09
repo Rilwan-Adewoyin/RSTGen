@@ -38,6 +38,7 @@ rl_conv/pretrain/.ipynb_checkpoints
 *vscode/launch.json
 *vscode/settings.json
 *src*
+*temp*
 
 
 .vscode/launch.json
