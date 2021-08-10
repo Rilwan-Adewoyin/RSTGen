@@ -327,7 +327,7 @@ def edu_segmenter(li_dict_rsttext, use_kp_ds=True):
                                                 skip_parsing=True, redirect_output=True)
     
     #TODO: Parser wrapper seperates at apostrophes
-    # corrects any formatting errors caused by the segmenter
+        # corrects any formatting errors caused by the segmenter
     li_li_edus = edu_fixer( li_textwedutoken )
 
     # for each utterance, merge list of words into one text
@@ -486,7 +486,7 @@ def position_kp(li_dict_rsttext):
                 raise StopIteration
                 kp_pos = next( ( pos for pos, edu in  dict_pos_edu.items() if kp in edu ) )
             except StopIteration: 
-                # kp spans two different EDUs. So finding length, in words, of longest common substring
+                # kp can spans two different EDUs. So finding length, in words, of longest common substring
                 li_pos_coveragecount = []
                 for pos, edu in dict_pos_edu.items():
                     kp_split = kp.split()
