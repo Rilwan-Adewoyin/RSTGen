@@ -192,12 +192,22 @@ def rst_tree_parse_records(li_records):
 
     # Attaching the rst trees to the records
         # and removing records which could not be parsed
-    for idx in reversed( range(len(li_records))  ):
+    for idx in reversed( range(len(li_records)) ):
+        
         if li_rst_dict[idx] == None:
             li_rst_dict.pop(idx)
             li_records.pop(idx)
+
+        elif len(li_rst_dict[idx]['ns'])==1 and li_rst_dict[idx]['ns'][0] == 'a'  :
+            li_rst_dict.pop(idx)
+            li_records.pop(idx)
+
         else:
             li_records[idx]['rst'] = li_rst_dict[idx]
+<<<<<<< HEAD
+=======
+
+>>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
     return li_records
 
 
@@ -251,8 +261,12 @@ def convert_dyploc_to_nlg( li_records ):
         li_records = copy.deepcopy(li_records)
 
         for idx in range(len(li_records)):
+<<<<<<< HEAD
             
             li_records[idx].pop('kp_set_str',None)
+=======
+            li_records[idx].pop('kp_set_str')
+>>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
 
         
         #positioning edus
@@ -261,15 +275,25 @@ def convert_dyploc_to_nlg( li_records ):
             li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
             li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
 
+<<<<<<< HEAD
             li_edu = li_records[idx].pop('li_edus',None)
+=======
+            li_edu = li_records[idx].pop('li_edus')
+>>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
 
             dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
             
             li_records[idx]['dict_pos_edu'] = dict_pos_edu
         
+<<<<<<< HEAD
 
         #extracting keyphrases
 
+=======
+
+        #extracting keyphrases
+
+>>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
         for idx in reversed(range(len(li_records))):
             branch_input = li_records[idx]['branch_input']
             
