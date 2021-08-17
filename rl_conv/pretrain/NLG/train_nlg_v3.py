@@ -1,5 +1,6 @@
 import os
 from typing import Optional, Tuple
+from pytorch_lightning.utilities import distributed
 
 from torch._C import Value
 
@@ -52,8 +53,6 @@ from pytorch_lightning.core.decorators import auto_move_data
 import yaml
 import types
 
-import copy
-
 from itertools import permutations, combinations, combinations_with_replacement
 from typing import Optional, Callable, Union, Optional, List, Iterable
 
@@ -64,6 +63,14 @@ from transformers.generation_logits_process import (
 
 from utils_nlg_v3 import EmbeddingRstPos
 
+from typing import TypeVar, Iterator
+
+from torch.utils.data.sampler import Sampler
+from torch.utils.data.dataset import Dataset
+
+import torch.distributed as dist
+
+T_co = TypeVar('T_co', covariant=True)
 
 #Monkey patching the forward on gpt
 
@@ -102,20 +109,20 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         self.embd_outp_dim = self.transformer.config.n_embd
                 
         self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.001)
+        self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.0005)
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ),scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.001)
+        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.0005)
 
         self.embedding_rst_pos = EmbeddingRstPos(   max_rst_index=self.nlg_tokenizer.rst_pos_maxidx,
                                                     max_rst_level = NLG_tokenizer.node_level(self.nlg_tokenizer.rst_pos_maxidx),
                                                     rst_encoding_ndim=self.embd_outp_dim,
-                                                    init_val=0.001)
+                                                    init_val=0.0005)
               
         self.token_type_embeddings = torch.nn.Embedding( self.nlg_tokenizer.special_token_count -1 + 1 , self.embd_outp_dim, #-1 since <|pad|> is a special token. +1 for padding token
                                                         padding_idx=(self.nlg_tokenizer.special_token_count -1 + 1 )-1,
                                                         scale_grad_by_freq=self.scale_grad_by_freq) #The maximum value this can take is based on the different types of input
-        self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.001)
+        self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.0005)
             # 1 for each of da, rst and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
             #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
         #endregion
@@ -700,11 +707,6 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
             tnsr_rels = tnsr_rels[:max_len ] 
             tnsr_ns = tnsr_ns[:max_len]
             tnsr_pos = tnsr_pos[:max_len]
-        
-        # elif len_ < max_len:
-        #     _ = max_len-len_
-        #     tnsr_ns = torch.cat( [tnsr_ns, torch.full([_],len(self.rst_ns_li ))])
-        #     tnsr_pos = torch.cat( [tnsr_pos, torch.full([_], 0  )])
 
         #return tnsr_rels, diff, tnsr_ns, tnsr_pos
         
@@ -895,7 +897,7 @@ class TrainingModule(pl.LightningModule):
         if self.mode in ['train_new','train_cont','test']:
             self.dir_data = utils.get_path(dir_data)
             self.inference_context_utt = inference_context_utt
-            self.create_data_loaders( )
+            #self.create_data_loaders( )
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
@@ -908,12 +910,10 @@ class TrainingModule(pl.LightningModule):
             train_params_to_save = self.return_params()
             model_params_to_save = self.model.return_params()
 
-            try:
-                self.hparams = { **train_params_to_save, **model_params_to_save}
-            except Exception as e:
-                self.hparams.update({ **train_params_to_save, **model_params_to_save})
+            self.hparams.update({ **train_params_to_save, **model_params_to_save})
+            self.save_hyperparameters({ **train_params_to_save, **model_params_to_save})
 
-            self.inference_samples = list( islice( self.inference_dl, 10 ) )
+            #self.inference_samples = list( islice( self.inference_dl, 10 ) )
             bad_words = ["<|rst|>","<|ta|>","<|pad|>",r"\n" ] 
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
@@ -929,13 +929,22 @@ class TrainingModule(pl.LightningModule):
                                 # 'max_length':self.model.nlg_tokenizer.max_input_len  } 
             
             self.inference_generation_params = generation_params
-
-            del self.inference_dl
+            self.init_data()
+            
 
         if self.mode in ['inference']:
             self.eval() 
             self.freeze() 
-
+    
+    def init_data(self):
+        if self.mode in ['train_new','train_cont']:
+            self.create_data_loaders( ['train','val','inference'] )
+            self.inference_samples = list( islice( self.inference_dl, 10 ) )
+            del self.inference_dl
+            
+        elif self.mode in ['test']:
+            self.create_data_loaders( ['test'] )
+        
     @staticmethod
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
@@ -945,7 +954,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('-b','--batch_size', default=5, type=int)
         parser.add_argument('--learning_rate', default=1e-4, type=float)
-        parser.add_argument('--warmup_proportion', default=0.15)
+        parser.add_argument('--warmup_proportion', default=0.35)
         parser.add_argument('--workers', default=16, type=int) #TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference'])
@@ -955,7 +964,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
         parser.add_argument('--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
-        parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
+        parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=[0,1] )
         parser.add_argument('--inference_context_utt', default=4, type=int)
             #TODO: check --version of required type None actually works
         tparams = parser.parse_known_args()[0]
@@ -1033,16 +1042,17 @@ class TrainingModule(pl.LightningModule):
         
         # Creating Callbacks
         callbacks = []        
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=1, 
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
         
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model,checkpoint_callback) #monkey patch
 
+        val_check_interval = 0.05
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=10,
+            patience=max(4, int(1/val_check_interval)/2 ),
             verbose=False,
             mode='min'
         )
@@ -1067,11 +1077,13 @@ class TrainingModule(pl.LightningModule):
                         accelerator=accelerator,
                         val_check_interval=0.05,
                         num_sanity_val_steps=0, 
+                        replace_sampler_ddp=False,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
                         )
+            #training_module.init_data()
 
         elif tparams['mode'] in ["train_cont","inference"]:
             #restoring checkpoint             
@@ -1087,12 +1099,14 @@ class TrainingModule(pl.LightningModule):
                     callbacks=callbacks,accelerator=accelerator,
                          val_check_interval=0.05,
                         num_sanity_val_steps=0, 
+                        replace_sampler_ddp=False,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
                     )
-
+            #training_module.init_data()
+            
             # load callback states
             trainer.on_load_checkpoint(checkpoint)
             trainer.global_step = checkpoint['global_step']
@@ -1138,7 +1152,7 @@ class TrainingModule(pl.LightningModule):
 
             # load callback states
             trainer.on_load_checkpoint(checkpoint)
-           
+            #training_module.init_data()
 
         return trainer,training_module
     
@@ -1346,17 +1360,20 @@ class TrainingModule(pl.LightningModule):
                 df.to_csv( fp, index=False)
                 # Saving to file
                    
-    def create_data_loaders(self, shuffle=False, **kwargs):
+    def create_data_loaders(self, modes):
        
         dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.model.nlg_tokenizer, 
                 workers=self.workers, mode=self.mode, split=self.data_splits,
-                inference_context_utt=self.inference_context_utt )
+                inference_context_utt=self.inference_context_utt, gpus=self.gpus )
 
-        _dict_dl = dg()
-        self.train_dl = _dict_dl['train_dl']
-        self.val_dl = _dict_dl['val_dl']
-        self.test_dl = _dict_dl['test_dl']
-        self.inference_dl = _dict_dl['inference_dl']
+        if 'train' in modes:
+            self.train_dl =  dg.prepare_dataloader(shuffle=True, split_name = 'train')
+        if 'val' in modes:
+            self.val_dl = dg.prepare_dataloader(shuffle=False, split_name = 'val')
+        if 'test' in modes:
+            self.test_dl =  dg.prepare_dataloader(shuffle=False, split_name = 'test')
+        if 'inference' in modes:
+            self.inference_dl =  dg.prepare_dataloader(shuffle=True, split_name = 'inference')
 
     def train_dataloader(self):
         return self.train_dl
@@ -1423,6 +1440,7 @@ class DataLoaderGenerator():
                     workers=0, mode='train_new',
                     splits={'train':0.6,'val':0.2,'test':0.2},
                     inference_context_utt=0,
+                    gpus = 1,
                     pad_values = {},
                     **kwargs):
         
@@ -1433,7 +1451,7 @@ class DataLoaderGenerator():
         self.bs = batch_size
         self.workers  = workers
         self.mode = mode
-        
+        self.gpus = gpus
         self.inference_context_utt = inference_context_utt
         self.pad_values = tokenizer.pad_values
         self.pad_maxlens = tokenizer.pad_maxlens
@@ -1465,7 +1483,7 @@ class DataLoaderGenerator():
 
         return dict_dl 
 
-    def prepare_dataloader(self, dir_data, shuffle=False, 
+    def prepare_dataloader(self, shuffle=False, 
         split_name='train'):
 
         """Prepares a dataloader given a directory of data for NLG language module
@@ -1473,6 +1491,8 @@ class DataLoaderGenerator():
             Args:
                 dir_dset ([type]): [description]
         """
+        dir_data = self.dir_data
+        
         #getting all files from all different subreddits/types of conversation
         fns = glob.glob(  os.path.join( utils.get_path(dir_data),"*","*") )
         fns = [fn for fn in fns if os.path.split(fn)[-1]!="lock"]
@@ -1484,57 +1504,48 @@ class DataLoaderGenerator():
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
             #line_ends = [ 100 for ls,fs in zip(line_starts, files_sizes)  ]
-            shuffle = False
             ifc = 0
+            bs = self.bs
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
             #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
-            
             ifc = 0
-
+            bs = self.bs
+            
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
             #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
-            shuffle = False
-            sampler = None
             ifc = 0
+            bs = self.bs
 
         elif split_name == 'inference':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends =  files_sizes
             #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
-            shuffle = True
             sampler = None
             ifc = self.inference_context_utt
+            bs = 1
 
         li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end, ifc) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
-
-        if split_name == 'inference':
-            bs = 1
-        else:
-            bs = self.bs
-
-        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
-        if split_name in ["train",'val','test']:
-            sampler = SizedOrdered_Sampler(concat_dset, bs )
-        
-            dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
-                shuffle=shuffle, num_workers=self.workers,
-                collate_fn=lambda batch: self.tokenizer.default_collate_pad(batch),
-                sampler = sampler,  pin_memory=True
-                )
-        else:
-            dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
-                shuffle=shuffle, num_workers=self.workers,
-                sampler = sampler
-                )
             
+        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
+                                
+        if self.gpus <= 1 or split_name not in ['inference','test'] :
+            sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle )
+        else:
+            sampler = SizedOrdered_DistributedSampler( concat_dset, bs, shuffle=shuffle, gpus=self.gpus )
+ 
         
+        dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
+                num_workers=self.workers,
+                sampler = sampler,
+                collate_fn =  self.tokenizer.default_collate_pad
+                )
         return dataloader
 
     def __call__(self):
@@ -1620,7 +1631,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
         
         #Topic scores
-        topics_textrank = ujson.loads(datum['li_pos_kp'].values[0])
+        topics_textrank = json.loads( datum['li_pos_kp'].values[0])
         topics_pos, topics = zip( *topics_textrank ) #top 3 important prhases from utterance
         topics_pos = tuple( int(pos) for pos in topics_pos )
 
@@ -1646,7 +1657,7 @@ class SizedOrdered_Sampler(Sampler[int]):
         data_source (Dataset): dataset to sample from
     """
     
-    def __init__(self, data_source, batch_size) -> None:
+    def __init__(self, data_source, batch_size, shuffle) -> None:
         self.data_source = data_source
                         
         np_txt_lens = np.concatenate( [ds.np_textlens for ds in self.data_source.datasets] ).flatten()
@@ -1656,16 +1667,141 @@ class SizedOrdered_Sampler(Sampler[int]):
         
         # We Randomly re-arrange them in batches of batch size
         #li_chunked_lens = np.array_split( np_ordered_lens, self.__len__() //batch_size  )
-        li_chunked_lens = [ np_ordered_lens[idx:idx+batch_size] for idx in range(0, np_ordered_lens.size, batch_size) ]
-        random.shuffle( li_chunked_lens )
+        li_chunked_lens = [ np_ordered_lens[idx:idx+batch_size] for idx in range(0, np_ordered_lens.size - batch_size, batch_size) ]
         
-        self.li_shuffled_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
+        if shuffle:
+            random.shuffle( li_chunked_lens )
+        
+        self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
         
     def __iter__(self):
-        return iter(self.li_shuffled_chunked_ordered_lens)
+        return iter(self.li_chunked_ordered_lens)
 
     def __len__(self) -> int:
         return len(self.data_source)
+
+class SizedOrdered_DistributedSampler(Sampler[T_co]):
+    r"""
+        Adapted so that each process takes sequential indices as opposed to strides across indices
+    """
+    r"""Sampler that restricts data loading to a subset of the dataset.
+    It is especially useful in conjunction with
+    :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
+    process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
+    :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
+    original dataset that is exclusive to it.
+    .. note::
+        Dataset is assumed to be of constant size.
+    Args:
+        dataset: Dataset used for sampling.
+        num_replicas (int, optional): Number of processes participating in
+            distributed training. By default, :attr:`world_size` is retrieved from the
+            current distributed group.
+        rank (int, optional): Rank of the current process within :attr:`num_replicas`.
+            By default, :attr:`rank` is retrieved from the current distributed
+            group.
+        shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
+            indices.
+        seed (int, optional): random seed used to shuffle the sampler if
+            :attr:`shuffle=True`. This number should be identical across all
+            processes in the distributed group. Default: ``0``.
+        drop_last (bool, optional): if ``True``, then the sampler will drop the
+            tail of the data to make it evenly divisible across the number of
+            replicas. If ``False``, the sampler will add extra indices to make
+            the data evenly divisible across the replicas. Default: ``False``.
+    .. warning::
+        In distributed mode, calling the :meth:`set_epoch` method at
+        the beginning of each epoch **before** creating the :class:`DataLoader` iterator
+        is necessary to make shuffling work properly across multiple epochs. Otherwise,
+        the same ordering will be always used.
+    Example::
+        >>> sampler = DistributedSampler(dataset) if is_distributed else None
+        >>> loader = DataLoader(dataset, shuffle=(sampler is None),
+        ...                     sampler=sampler)
+        >>> for epoch in range(start_epoch, n_epochs):
+        ...     if is_distributed:
+        ...         sampler.set_epoch(epoch)
+        ...     train(loader)
+    """
+
+    def __init__(self, dataset: Dataset, batch_size: int,
+                 num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, 
+                 seed: int = 0,
+                 shuffle: bool = False,
+                 gpus: int = 2) -> None:
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            #num_replicas = dist.get_world_size()
+            num_replicas = gpus
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            #rank = dist.get_rank()
+            rank = _get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(rank, num_replicas - 1))
+        
+        # normal code
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        
+        #self.num_samples 
+        #self.total_size = self.num_samples * self.num_replicas
+        self.seed = seed
+    
+        # new code
+        #self.dataset = dataset
+        self.data_source = dataset
+        np_txt_lens = np.concatenate( [ds.np_textlens for ds in self.data_source.datasets] ).flatten()
+
+        #Indices are sorted in order of the text lens of records in the datasets
+        np_ordered_lens = np_txt_lens.argsort()
+        
+            # We Randomly re-arrange them in batches of batch size
+        li_chunked_lens = [ np_ordered_lens[idx:idx+batch_size] for idx in range(0, np_ordered_lens.size-batch_size, batch_size) ]
+
+            # Divide into n sublists,
+            # Each sublist at index i, contains the indices for process at rank i
+            # Each sublist at index i, is a list non flatten indices. Each index represents items in the dataset
+        
+        li_li_chunked_lens = [ 
+                              [ li_chunked_lens[ (self.num_replicas*idx)+_rank ] for idx in range(len(li_chunked_lens)//self.num_replicas)  ] 
+                                
+                                for _rank in range(self.num_replicas)]
+        
+        # shuffle each processes subllist in the same order to optimize paralel training
+        _ = list( zip( *li_li_chunked_lens ))
+        
+        if shuffle:
+            random.shuffle( _ )
+        
+        li_li_chunked_lens = list(zip(*_))
+        
+        self.li_li_sizeorderedidx = [ np.concatenate(li_chunked_lens).tolist() for li_chunked_lens in li_li_chunked_lens ]
+        self.num_samples = len(self.li_li_sizeorderedidx[0])
+        self.total_size = self.num_samples * self.num_replicas
+        #assert all( len(self.li_li_sizeorderedidx[idx])==self.num_samples for idx in range(len(self.num_replicas)) )
+    def __iter__(self) -> Iterator[T_co]:
+
+        return iter( self.li_li_sizeorderedidx[ self.rank] )
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
 
 def main(tparams={}, mparams={}):
    
@@ -1699,7 +1835,7 @@ if __name__ == '__main__':
         assert tparams.gpus in [0,1]
 
     if tparams.gpus not in [0,1]:
-        os.environ['MASTER_ADDR'] = 'localhost' #'127.0.0.1'
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
 
     main(vars(tparams), vars(mparams))
@@ -1707,4 +1843,4 @@ if __name__ == '__main__':
 
 # dullduks server version 1 - No Freezing, Full RST
 
-#   
+#   CUDA_VISIBLE_DEVICES=0 python3 train_nlg_v3.py --batch_size 3 --gpus 1 --accumulate_grad_batches 8 --freeze_pretrained 0 --scale_grad_by_freq 1 --max_input_len 220 --context_len '{ "rst":18, "topics":35 }' --workers 12 --version 2 --precision 16 --mode train_new --tag "gpt2 large . utterance 170 tokes long" --base_model_name "gpt2-large" --learning_rate 5e-4 --max_epochs 5

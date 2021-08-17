@@ -320,13 +320,15 @@ class EffeciencyMixin():
         return batched_padded_subtens
 
     def default_collate_pad(self, batch):
-        r"""Puts each data field into a tensor with outer dimension batch size"""
+        r"""Puts each data field into a tensor with outer dimension batch size
+
+
+        """
 
         pad_values = self.pad_values
         pad_maxlens = self.pad_maxlens
         elem = batch[0]
         elem_type = type(elem)
-
 
         if isinstance(elem, torch.Tensor):
                     
@@ -394,15 +396,21 @@ class EffeciencyMixin():
                             
                             li_[idx] = elem_
 
-                                
-
-
                 dict_output[key] = self.default_collate_pad( li_ )    
             return dict_output
 
         elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
             return elem_type(*(self.default_collate_pad(samples,pad_values) for samples in zip(*batch)))
-
+        
+        elif isinstance(elem, collections.abc.Sequence):
+            # check to make sure that the elements in batch have consistent size
+            it = iter(batch)
+            elem_size = len(next(it))
+            if not all(len(elem) == elem_size for elem in it):
+                raise RuntimeError('each element in list of batch should be of equal size')
+            transposed = zip(*batch)
+            return [self.default_collate_pad(samples) for samples in transposed]
+        
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 
     
