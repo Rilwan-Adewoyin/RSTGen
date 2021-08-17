@@ -26,6 +26,7 @@ from collections import defaultdict
 
 import copy 
 import json 
+import regex as re
 
 import regex as re
 pattern_punctuation_space = re.compile(r'\s([?.!"](?:\s|$))')
@@ -79,7 +80,7 @@ def main( batch_process_size=20,
         batch_process_size (int, optional): [description]. Defaults to 20.
         subreddit_names (str, optional): List of subreddit names to filter through
     """
-    
+    orig_batch_process_size = copy.deepcopy( batch_process_size )
     #region  Setup 
     dict_subredditnames_sets = {
                 #batch warwick desktop
@@ -90,7 +91,10 @@ def main( batch_process_size=20,
         3: ["Diablo","DotA2","Drugs","Economics","electronic_cigarette","explainlikeimfive","AskReddit","askscience","AskWomen","asoiaf","CasualConversation","CFB","changemyview","Christianity","conspiracy","cringe","cringepics","dayz"]
     }
 
-    subreddit_names = dict_subredditnames_sets[subset_no]
+    if subset_no == 0:
+        subreddit_names = sum( list( dict_subredditnames_sets.values() ) , [] )
+    else:
+        subreddit_names = dict_subredditnames_sets[subset_no]
     #Creating Save directory
     dir_save_dataset = utils_nlg.get_path("./dataset_v3/",_dir=True)
     
@@ -117,7 +121,7 @@ def main( batch_process_size=20,
 
         dset_source = pd.read_csv( fp, usecols=['rst','txt_preproc','subreddit','topic_textrank'] )
         
-        total_batch_count = math.ceil(len(dset_source)/batch_process_size)
+        
 
         # region Optionally auto-resuming from last completed batch
         if resume_progress == True:
@@ -126,12 +130,13 @@ def main( batch_process_size=20,
             fn = os.path.join(dir_save_dataset,'last_batch_record')
             _bool_file_check = os.path.exists( fn )
 
-            auto_fnd_failed = lambda : print("User choose auto-resume from last recorded batch.\
-                But no last records exists, so initialising from batch 0")
 
             if not _bool_file_check: #if file does not exist
                 batches_completed[subreddit]= 0
-                auto_fnd_failed()
+                batch_process_size = orig_batch_process_size
+                total_batch_count = math.ceil(len(dset_source)/batch_process_size)
+                print("\tUser choose auto-resume from last recorded batch.\
+                But no last records exists, so initialising from batch 0")
                 
             else: #if file does exists
                 df_records = pd.read_csv( fn, index_col = "subreddit" )
@@ -139,6 +144,9 @@ def main( batch_process_size=20,
 
                 if not _bool_record_check:
                     batches_completed[subreddit] = 0
+                    batch_process_size = orig_batch_process_size
+                    total_batch_count = math.ceil(len(dset_source)/batch_process_size)
+
                 
                 else:
                     batches_completed[subreddit] = int( df_records.loc[ subreddit, 'last_batch' ] ) + 1
@@ -152,6 +160,7 @@ def main( batch_process_size=20,
                 dset_source = dset_source[batches_completed[subreddit]*batch_process_size:]
 
         else:
+            total_batch_count = math.ceil(len(dset_source)/batch_process_size)
             batches_completed[subreddit] = 0
         # endregion
 
@@ -203,8 +212,6 @@ def main( batch_process_size=20,
                 batch_li_dict_utt = sum(batch_li_dict_utt, [])
 
             timer.end("\t\tEDU parsing, RST correction and EDU position labelling")
-
-            
 
             #region Saving Batches
             timer.start()
@@ -320,7 +327,7 @@ def edu_segmenter(li_dict_rsttext, use_kp_ds=True):
                                                 skip_parsing=True, redirect_output=True)
     
     #TODO: Parser wrapper seperates at apostrophes
-    # corrects any formatting errors caused by the segmenter
+        # corrects any formatting errors caused by the segmenter
     li_li_edus = edu_fixer( li_textwedutoken )
 
     # for each utterance, merge list of words into one text
@@ -479,7 +486,7 @@ def position_kp(li_dict_rsttext):
                 raise StopIteration
                 kp_pos = next( ( pos for pos, edu in  dict_pos_edu.items() if kp in edu ) )
             except StopIteration: 
-                # kp spans two different EDUs. So finding length, in words, of longest common substring
+                # kp can spans two different EDUs. So finding length, in words, of longest common substring
                 li_pos_coveragecount = []
                 for pos, edu in dict_pos_edu.items():
                     kp_split = kp.split()
@@ -641,7 +648,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--subset_no', default=1, type=int)
     
-    parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(x)), 
+    parser.add_argument('-rp','--resume_progress', default=True, type=lambda x: bool(int(eval(x))) if type(x)==str else bool(int(x)), 
                         help="whether or not to resume from last operated on file" )
 
     args = parser.parse_args()
@@ -655,14 +662,17 @@ if __name__ == '__main__':
             main( **dict_args )
             completed = True
         except Exception as e:
-                        
+
+            print(subreddit)
+            print(e)
+            print(traceback.format_exc())
+
             dir_save_dataset = utils_nlg.get_path("./dataset_v3/",_dir=True)
             df_records = pd.read_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_col = "subreddit" )
             df_records.loc[ subreddit, ['last_batch'] ] =  batches_completed[subreddit] + 2
             df_records.to_csv( os.path.join(dir_save_dataset,'last_batch_record'), index_label='subreddit' )
             
-            print(e)
-            print(traceback.format_exc())
+
             dict_args['resume_progress'] = True
             
         finally :

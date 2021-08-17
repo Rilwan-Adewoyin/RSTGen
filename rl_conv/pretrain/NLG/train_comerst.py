@@ -26,7 +26,6 @@ from sklearn.utils import shuffle as skl_shuffle
 from itertools import islice
 import math
 from itertools import groupby
-import copy
 from types import MethodType
 from collections import defaultdict
 import pke
@@ -202,7 +201,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import loggers as pl_loggers
 import yaml
 import glob
-import ast
 import regex as re
 import random
 import types
@@ -236,62 +234,7 @@ for name in nlp.pipe_names:
     if name not in components:
         nlp.remove_pipe(name)
 
-class EmbeddingRstPos(nn.Module):
-    def __init__(self, lr_func , max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
-                    ):
-        super(EmbeddingRstPos, self).__init__()
-
-        self.max_rst_index = max_rst_index
-        self.max_rst_level = max_rst_level
-        self.left_right_seq_from_root_to_edu_pos = lr_func
-
-        self.init_val = init_val
-        self.fixed_rst_encoding = self.make_rst_encoding( )
-        self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=False )
-        
-        self.padding_idx = self.fixed_rst_encoding.padding_idx
-        
-        
-    def forward(self, x ):
-        while x.max() >= self.max_rst_index:
-            x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
-   
-
-        x = self.fixed_rst_encoding(x)
-        x = self.ffd( x )
-        return x
-    
-    def make_rst_encoding(self):
-        
-        embedding_weight = torch.zeros( 
-                                (self.max_rst_index, self.max_rst_level ),
-                                dtype = torch.float )
-        
-        # zero index embedding vector
-        zero_embedding = np.zeros( [self.max_rst_level] )
-
-        split_dir_numb = {'L':-self.init_val, 'R':self.init_val}
-        
-        # for each embedding
-        for idx in range(self.max_rst_index):
-            
-            idx_embedding = copy.deepcopy( zero_embedding )
-            
-            # Determine the sequence of lefts and rights to reach node    
-            left_rights_from_root_to_pos = COMERST_tokenizer.left_right_seq_from_root_to_edu_pos( idx )
-            
-            # Convert sequence of LRs to a sequence of -1 and 1s and 0s
-            for idx1, val in enumerate(left_rights_from_root_to_pos):
-                idx_embedding[idx1] = split_dir_numb[val]
-
-            # set this as the new embedding
-            embedding_weight[idx] = torch.FloatTensor( idx_embedding )
-
-        fixed_rst_encoding = torch.nn.Embedding.from_pretrained( embedding_weight ,
-                                    freeze=True, padding_idx=0)
-
-        return fixed_rst_encoding
-    
+from utils_nlg_v3 import EmbeddingRstPos
 
 def clamp_values(x, max):
 

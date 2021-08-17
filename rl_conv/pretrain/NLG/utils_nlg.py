@@ -7,6 +7,7 @@ import glob
 import regex as re
 
 
+#region loading and saving
 def get_path(_path,_dir=False):
 
     if os.path.isabs(_path) == False:
@@ -20,7 +21,6 @@ def get_path(_path,_dir=False):
         os.makedirs(os.path.dirname(_path), exist_ok=True)
 
     return _path
-
 
 def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, 
                                     tokenizer=False):
@@ -77,6 +77,28 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
 
     return True    
 
+#endregion 
+
+#region Monkey Patches the save module
+def monkey_save_model(self, trainer, filepath: str):
+    #TODO: suggest this change on github pytorch lightning 
+    # in debugging, track when we save checkpoints
+    trainer.dev_debugger.track_checkpointing_history(filepath)
+
+    # make paths
+    if trainer.is_global_zero:
+        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    # delegate the saving to the trainer
+    if self.save_function is not None:
+        self.save_function(filepath, self.save_weights_only)
+    
+    self.to_yaml()
+
+
+#end region
+
+#region RST helper
 tree_order = {
     ():0,
     
@@ -109,3 +131,4 @@ rst_rel_li = ['Attribution',
                 'Contrast','Elaboration','Enablement','Evaluation',
                 'Explanation','Joint','Manner-Means','Topic-Comment',
                 'Summary','Temporal','Topic-Change','n','same-unit','textual-organization'] #Add this to savable config
+#endregion

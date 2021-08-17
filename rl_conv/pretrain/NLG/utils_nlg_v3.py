@@ -341,8 +341,6 @@ class EffeciencyMixin():
                 out = elem.new(storage)
 
             return torch.stack(batch, 0, out=out)
-
-
         elif isinstance(elem, float):
             return torch.tensor(batch, dtype=torch.float64)
         elif isinstance(elem, int):

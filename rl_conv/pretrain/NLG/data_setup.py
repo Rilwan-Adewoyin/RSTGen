@@ -8,7 +8,7 @@ import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-import convokit
+
 from convokit.model import ConvoKitMeta
 sys.path.append(os.path.dirname(sys.path[0])) # Adds higher directory to python modules path
 sys.path.append( os.path.join( os.path.dirname(sys.path[0]),"DialogueAct" ) ) 
@@ -35,15 +35,30 @@ import nltk
 #nltk.download('stopwords')
 import rake_nltk
 import json
-import pytextrank
+
 import spacy
+import pytextrank
 import en_core_web_sm
 sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
     #install using python -m spacy download en_core_web_sm
 nlp = en_core_web_sm.load()
-#tr = pytextrank.TextRank()
-#nlp.add_pipe(tr.PipelineComponent, name="textrank", last=True)
-nlp.add_pipe("textrank", last=True)
+
+from spacy.language import Language
+
+try:
+    nlp.add_pipe("textrank", last=True)
+    
+except Exception as e:
+
+    @Language.component("textrank")
+    def textrank(doc):
+        tr = pytextrank.TextRank()
+        doc = tr.PipelineComponent(doc)
+        return doc
+
+    nlp.add_pipe("textrank", last=True)
+
+
 
 import csv
 import pickle
