@@ -328,8 +328,7 @@ class EffeciencyMixin():
         elem_type = type(elem)
 
 
-        if isinstance(elem, torch.Tensor):
-                    
+        if isinstance(elem, torch.Tensor):        
             out = None
             if torch.utils.data.get_worker_info() is not None:
                 # If we're in a background process, concatenate directly into a
@@ -339,8 +338,6 @@ class EffeciencyMixin():
                 out = elem.new(storage)
 
             return torch.stack(batch, 0, out=out)
-
-
         elif isinstance(elem, float):
             return torch.tensor(batch, dtype=torch.float64)
         elif isinstance(elem, int):
@@ -393,9 +390,6 @@ class EffeciencyMixin():
                                 elem_ = elem_[ :missing_dims, :missing_dims ]
                             
                             li_[idx] = elem_
-
-                                
-
 
                 dict_output[key] = self.default_collate_pad( li_ )    
             return dict_output
