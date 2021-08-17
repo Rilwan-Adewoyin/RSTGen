@@ -14,6 +14,7 @@ import pandas as pd
 from transformers import BartTokenizer
 from functools import partial
 from itertools import tee
+import traceback
 
 # Docker Images Parser and RST tree labeller
 mp1 = os.path.abspath(os.path.join('..'))
@@ -57,18 +58,22 @@ def main( batch_process_size = 10, mp_count=1 ):
 
     
     # iterate through train, val, test
-    for dset_section in ['test','val','train']:
-        
+    #for dset_section in ['test','val','train']:
+    
+    for dset_section in ['train']:
         
         # loading dataset
         with open(os.path.join(dir_sourcedset,dset_section+".jsonl") ) as f:
             li_records = [json.loads(line) for line in f]
-            total_batch_count = len(li_records) // batch_size
+            total_batch_count = int( math.ceil( len(li_records) / batch_size ) )
 
         # Operating on the dataset in batches
         batches_completed = 0
         model_formats = conversions_map[dset_section]
         
+        batches_completed = 128
+        li_records = li_records[batch_size*batches_completed:]
+
         while len(li_records) > 0:
 
             batch_li_records = li_records[:batch_size]
@@ -193,10 +198,10 @@ def rst_tree_parse_records(li_records):
             li_records.pop(idx)
         else:
             li_records[idx]['rst'] = li_rst_dict[idx]
-    
-    # endregion
-
     return li_records
+
+
+    
 
 def li_edu_parse_records(li_records):
     # getting edus
@@ -225,10 +230,12 @@ def li_edu_parse_records(li_records):
 
     return li_records
 
+
 def salience_keywords_parse(li_records):
     #extract kp_set_str from dyploc context
         # get kp_set_str from actual reference text based on word salience
         # use compute_topic_signatures script
+    
     tsc = TopicSignatureConstruction(li_records)
     tsc.receive_data()
     tsc.calculate_llr()
@@ -239,263 +246,296 @@ def salience_keywords_parse(li_records):
 
 def convert_dyploc_to_nlg( li_records ):
 
-    li_records = copy.deepcopy(li_records)
+    try:
 
-    for idx in range(len(li_records)):
-        li_records[idx].pop('kp_set_str')
+        li_records = copy.deepcopy(li_records)
 
-    
-    #positioning edus
-    for idx in range(len(li_records)):
-        
-        li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
-        li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
-
-        li_edu = li_records[idx].pop('li_edus')
-
-        dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
-        
-        li_records[idx]['dict_pos_edu'] = dict_pos_edu
-    
-
-    #extracting keyphrases
-
-    for idx in range(len(li_records)):
-        branch_input = li_records[idx]['branch_input']
-
-            #extracting core concepts
-        li_concepts = [ dict_['concepts'] for dict_ in branch_input]
-        li_target_entity = [ dict_['target_entity'] for dict_ in branch_input]  
-        li_claims = [ dict_['claims'] for dict_ in branch_input if 'claims' in dict_ ]
-
-            #flattening
-        li_concepts = sum(li_concepts, [])
-        #li_target_entity = sum(li_target_entity, [])
-
-        #handling cases where underscore is used for a target word
-        li_target_entity = [ elem.replace('_'," ")  for elem in li_target_entity if elem!=None]
-
-        li_records[idx]['dyploc_context'] = {
-            'concepts':li_concepts,
-            'target_entity':li_target_entity,
-            'claims':li_claims,
-        }
-
-    
-    #  position keyphrase
-    for idx in range(len(li_records)):
-        
-        li_records[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
-        li_records[idx]['li_claim'] = [] # a list of lists. each sublists holds pos and keyphrase
-
-
-        dyploc_context = li_records[idx]['dyploc_context']
-
-        for key in dyploc_context:
-            dyploc_context[key] = list(set(dyploc_context[key]))
-
-        dict_pos_edu = li_records[idx]['dict_pos_edu']
-        
-        for key, li_kp in dyploc_context.items():
+        for idx in range(len(li_records)):
             
-            if key in ['concepts','target_entity']:
-                for kp in li_kp:
-                    # FIND POS
-                    # kp can span two different EDUs. So finding length, in words, of longest common substring
-                    li_pos_coveragecount = []
-                    for pos, edu in dict_pos_edu.items():
-                        kp_split = kp.split()
-                        edu_split = [ w for w in edu.translate(str.maketrans('', '', string.punctuation)).split() if w!= " "]
+            li_records[idx].pop('kp_set_str',None)
 
-                        match = SequenceMatcher(None, kp_split, edu_split).find_longest_match(0, len(kp_split) ,0, len(edu_split) )
-                        li_pos_coveragecount.append( [pos, match.size] )
-                    
-                    # If words occurs twice then the first instance is used
-                    kp_pos, coverage_count = max( li_pos_coveragecount, key=itemgetter(1))
-                    
-                    if coverage_count > 0:
-                        li_records[idx]['li_pos_kp'].append( [kp_pos, kp] ) 
-                    elif coverage_count == 0:
-                        #TODO: remember to map -1 to the final position (the pad position)
-                        #li_records[idx]['li_pos_kp'].append( [ -1, kp] ) 
-                        pass
-                            
-            elif key in ['claims']:
-                for kp in li_kp:
-                    #li_records[idx]['li_pos_kp'].append( [-1, kp] ) 
-                    li_records[idx]['li_claim'].append( kp )
-    
-    
-    #removing unwanted info
-    for idx in range(len(li_records)):
-        li_records[idx]['prompt'] = li_records[idx].pop('title')
-
-        li_records[idx].pop('dyploc_context')
-        li_records[idx].pop('dict_pos_edu')
         
-        li_records[idx].pop('reference_sentences')
-        li_records[idx].pop('branch_input')
-        li_records[idx].pop('sentence_types')
+        #positioning edus
+        for idx in range(len(li_records)):
+            
+            li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
+            li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
+
+            li_edu = li_records[idx].pop('li_edus',None)
+
+            dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
+            
+            li_records[idx]['dict_pos_edu'] = dict_pos_edu
+        
+
+        #extracting keyphrases
+
+        for idx in reversed(range(len(li_records))):
+            branch_input = li_records[idx]['branch_input']
+            
+            if branch_input is None:
+                li_records.pop(idx)
+                continue
+
+                #extracting core concepts
+            li_concepts = [ dict_['concepts'] for dict_ in branch_input if ( dict_!=None and 'concepts' in dict_ ) ]
+            li_target_entity = [ dict_['target_entity'] for dict_ in branch_input if ( dict_!=None and 'target_entity' in dict_  ) ]  
+            li_claims = [ dict_['claims'] for dict_ in branch_input if (dict_!=None and 'claims' in dict_)]
+
+                #flattening
+            li_concepts = sum(li_concepts, [])
+            #li_target_entity = sum(li_target_entity, [])
+
+            #handling cases where underscore is used for a target word
+            li_target_entity = [ elem.replace('_'," ")  for elem in li_target_entity if elem!=None]
+
+            li_records[idx]['dyploc_context'] = {
+                'concepts':li_concepts,
+                'target_entity':li_target_entity,
+                'claims':li_claims,
+            }
+
+        #  position keyphrase
+        for idx in range(len(li_records)):
+            
+            li_records[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
+            li_records[idx]['li_claim'] = [] # a list of lists. each sublists holds pos and keyphrase
+
+
+            dyploc_context = li_records[idx]['dyploc_context']
+
+            for key in dyploc_context:
+                dyploc_context[key] = list(set(dyploc_context[key]))
+
+            dict_pos_edu = li_records[idx]['dict_pos_edu']
+            
+            for key, li_kp in dyploc_context.items():
+                
+                if key in ['concepts','target_entity']:
+                    for kp in li_kp:
+                        # FIND POS
+                        # kp can span two different EDUs. So finding length, in words, of longest common substring
+                        li_pos_coveragecount = []
+                        for pos, edu in dict_pos_edu.items():
+                            kp_split = kp.split()
+                            edu_split = [ w for w in edu.translate(str.maketrans('', '', string.punctuation)).split() if w!= " "]
+
+                            match = SequenceMatcher(None, kp_split, edu_split).find_longest_match(0, len(kp_split) ,0, len(edu_split) )
+                            li_pos_coveragecount.append( [pos, match.size] )
+                        
+                        # If words occurs twice then the first instance is used
+                        kp_pos, coverage_count = max( li_pos_coveragecount, key=itemgetter(1))
+                        
+                        if coverage_count > 0:
+                            li_records[idx]['li_pos_kp'].append( [kp_pos, kp] ) 
+                        elif coverage_count == 0:
+                            #TODO: remember to map -1 to the final position (the pad position)
+                            #li_records[idx]['li_pos_kp'].append( [ -1, kp] ) 
+                            pass
+                                
+                elif key in ['claims']:
+                    for kp in li_kp:
+                        #li_records[idx]['li_pos_kp'].append( [-1, kp] ) 
+                        li_records[idx]['li_claim'].append( kp )
+        
+        
+        #removing unwanted info
+        for idx in range(len(li_records)):
+            li_records[idx]['prompt'] = li_records[idx].pop('title',None)
+
+            li_records[idx].pop('dyploc_context',None)
+            li_records[idx].pop('dict_pos_edu',None)
+            
+            li_records[idx].pop('reference_sentences',None)
+            li_records[idx].pop('branch_input',None)
+            li_records[idx].pop('sentence_types',None)
     
-    return li_records
+        return li_records
+
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
 
 def convert_dyploc_to_pair( li_records ):
-    # extract pair from the reference text
-    li_records = copy.deepcopy(li_records)
+    try:
 
-    for idx in range(len(li_records)):
-        li_records[idx].pop('rst')
+        # extract pair from the reference text
+        li_records = copy.deepcopy(li_records)
 
-
-    #region use kp_set_str to convert reference to template
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-large")
+        for idx in range(len(li_records)):
+            li_records[idx].pop('rst',None)
 
 
-    for idx in range(len(li_records)):
-            
-        li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_set_str'], li_records[idx]['reference'], tokenizer )
-
-        li_records[idx]['prompt'] = li_records[idx].pop('title')
-
-        #removing unwanted info
-
-        li_records[idx].pop('reference_sentences')
-        li_records[idx].pop('branch_input')
-        li_records[idx].pop('sentence_types')
-
-    #endregion
+        #region use kp_set_str to convert reference to template
+        tokenizer = BartTokenizer.from_pretrained("facebook/bart-large")
 
 
-    return li_records
+        for idx in range(len(li_records)):
+                
+            li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_set_str'], li_records[idx]['reference'], tokenizer )
+
+            li_records[idx]['prompt'] = li_records[idx].pop('title',None)
+
+            #removing unwanted info
+
+            li_records[idx].pop('reference_sentences',None)
+            li_records[idx].pop('branch_input',None)
+            li_records[idx].pop('sentence_types',None)
+
+        #endregion
+
+        return li_records
+    
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
 
 def pair_template_maker(  kp_set_str, reference, tokenizer ):
 
-    # Find the position of each tokenized word in the tokenized text
-        # Must use the tokenizer used by the generation model
+    try: 
+            
+        # Find the position of each tokenized word in the tokenized text
+            # Must use the tokenizer used by the generation model
 
-    li_kp_str = kp_set_str.split( ' <s>') #words must have space at the front
+        li_kp_str = kp_set_str.split( ' <s>') #words must have space at the front
+            
+        reference_tokenized = tokenizer.encode( ' '+reference.lower().translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
+
+        kp_set_str_tokenized = tokenizer.batch_encode_plus( li_kp_str,  add_special_tokens=False )['input_ids']
+
+        li_tokens_posidx = []
+        # getting position of tokenized kp in tokenized reference
+        for tokens, word in zip(kp_set_str_tokenized,li_kp_str):
+
+            start_idx = [i for i in range(0,len(reference_tokenized))
+                if reference_tokenized[i:i+len(tokens)]==tokens][:1]
+            
+            if len(start_idx) == 1:
+                li_tokens_posidx.append( [ tokens, start_idx ] )
         
-    reference_tokenized = tokenizer.encode( ' '+reference.lower().translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
-
-    kp_set_str_tokenized = tokenizer.batch_encode_plus( li_kp_str,  , add_special_tokens=False )['input_ids']
-
-    li_tokens_posidx = []
-    # getting position of tokenized kp in tokenized reference
-    for tokens, word in zip(kp_set_str_tokenized,li_kp_str):
-
-        start_idx = [i for i in range(0,len(reference_tokenized))
-            if reference_tokenized[i:i+len(tokens)]==tokens][:1]
+        # building template
+        li_tokens_posidx.sort( key=lambda sub_li: sub_li[1] ) #sort by posix
         
-        if len(start_idx) == 1:
-            li_tokens_posidx.append( [ tokens, start_idx ] )
-    
-    # building template
-    li_tokens_posidx.sort( key=lambda sub_li: sub_li[1] ) #sort by posix
-    
-    template_text = []
-    template_tokens = []
-    mask = [None]
+        template_text = []
+        template_tokens = []
+        mask = [None]
 
-    #iteratively build template by place tokens and filling gaps
-    # we form a template of text and tokens simultaneously
-    # using template_tokens in order to correctly record positions for items in template_text
-    for tokens, posidx  in li_tokens_posidx:
+        #iteratively build template by place tokens and filling gaps
+        # we form a template of text and tokens simultaneously
+        # using template_tokens in order to correctly record positions for items in template_text
+        for tokens, posidx  in li_tokens_posidx:
 
-        next_pos = len(template_tokens)
+            next_pos = len(template_tokens)
 
-        mask_len_before_tokens = posidx[0] - next_pos
+            mask_len_before_tokens = posidx[0] - next_pos
 
-        if mask_len_before_tokens>0:
-            template_tokens.extend( [-1]*mask_len_before_tokens  )
-            template_text.extend( mask*mask_len_before_tokens )
-        
-        # template tokens
-        template_tokens.extend( tokens )
-        
-        # tempalate_words
-        decoded_tokens = tokenizer.decode(tokens)
-        li_split_text = decoded_tokens.split(' ')[1:]
-        template_text.extend( li_split_text )
+            if mask_len_before_tokens>0:
+                template_tokens.extend( [-1]*mask_len_before_tokens  )
+                template_text.extend( mask*mask_len_before_tokens )
+            
+            # template tokens
+            template_tokens.extend( tokens )
+            
+            # tempalate_words
+            decoded_tokens = tokenizer.decode(tokens)
+            li_split_text = decoded_tokens.split(' ')[1:]
+            template_text.extend( li_split_text )
 
-    return template_text
+        return template_text
+
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
 
 def convert_dyploc_to_nlgpair(li_records):    
-    
-    li_records = copy.deepcopy(li_records)
-    
-    # form dict_pos_kp from kp_set_str and li_edus
-    
-    #positioning edus
-    for idx in range(len(li_records)):
+    try:
+        li_records = copy.deepcopy(li_records)
         
-        li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
-        li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
-
-        li_edu = li_records[idx].pop('li_edus')
-
-        dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
+        # form dict_pos_kp from kp_set_str and li_edus
         
-        li_records[idx]['dict_pos_edu'] = dict_pos_edu
-
-    # positioning keyphrase using dict_pos_edu and kp_set_str
-    for idx in range(len(li_records)):
-        
-        li_records[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
-
-        kp_set_str = li_records[idx]['kp_set_str']
-
-        li_kp = kp_set_str.split(' <s>')
-
-        dict_pos_edu = li_records[idx]['dict_pos_edu']
-        
-        
-        for kp in li_kp:
-            # FIND POS
-            # kp can span two different EDUs. So finding length, in words, of longest common substring
-            li_pos_coveragecount = []
-            for pos, edu in dict_pos_edu.items():
-                kp_split = kp.split()
-                edu_split = [ w for w in edu.translate(str.maketrans('', '', string.punctuation)).split() if w!= " "]
-
-                match = SequenceMatcher(None, kp_split, edu_split).find_longest_match(0, len(kp_split) ,0, len(edu_split) )
-                li_pos_coveragecount.append( [pos, match.size] )
+        #positioning edus
+        for idx in range(len(li_records)):
             
-            # If words occurs twice then the first instance is used
-            kp_pos, coverage_count = max( li_pos_coveragecount, key=itemgetter(1))
-            
-            if coverage_count > 0:
-                li_records[idx]['li_pos_kp'].append( [kp_pos, kp] ) 
-            elif coverage_count == 0:
-                #TODO: remember to map -1 to the final position (the pad position)
-                #li_records[idx]['li_pos_kp'].append( [ -1, kp] ) 
-                pass
-    
-    #removing unwanted info
-    for idx in range(len(li_records)):
-        li_records[idx]['prompt'] = li_records[idx].pop('title')
+            li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
+            li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
 
-        li_records[idx].pop('kp_set_str')
-        li_records[idx].pop('dict_pos_edu')
+            li_edu = li_records[idx].pop('li_edus')
+
+            dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
+            
+            li_records[idx]['dict_pos_edu'] = dict_pos_edu
+
+        # positioning keyphrase using dict_pos_edu and kp_set_str
+        for idx in reversed(range(len(li_records))):
+            
+            li_records[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
+
+            if 'kp_set_str' in li_records[idx]:
+                kp_set_str = li_records[idx]['kp_set_str']
+            else:
+                li_records.pop(idx)
+                continue
+
+            li_kp = kp_set_str.split(' <s>')
+
+            dict_pos_edu = li_records[idx]['dict_pos_edu']
+            
+            
+            for kp in li_kp:
+                # FIND POS
+                # kp can span two different EDUs. So finding length, in words, of longest common substring
+                li_pos_coveragecount = []
+                for pos, edu in dict_pos_edu.items():
+                    kp_split = kp.split()
+                    edu_split = [ w for w in edu.translate(str.maketrans('', '', string.punctuation)).split() if w!= " "]
+
+                    match = SequenceMatcher(None, kp_split, edu_split).find_longest_match(0, len(kp_split) ,0, len(edu_split) )
+                    li_pos_coveragecount.append( [pos, match.size] )
+                
+                # If words occurs twice then the first instance is used
+                kp_pos, coverage_count = max( li_pos_coveragecount, key=itemgetter(1))
+                
+                if coverage_count > 0:
+                    li_records[idx]['li_pos_kp'].append( [kp_pos, kp] ) 
+                elif coverage_count == 0:
+                    #TODO: remember to map -1 to the final position (the pad position)
+                    #li_records[idx]['li_pos_kp'].append( [ -1, kp] ) 
+                    pass
         
-        li_records[idx].pop('reference_sentences')
-        li_records[idx].pop('branch_input')
-        li_records[idx].pop('sentence_types')
+        #removing unwanted info
+        for idx in range(len(li_records)):
+            li_records[idx]['prompt'] = li_records[idx].pop('title',None)
+
+            li_records[idx].pop('kp_set_str',None)
+            li_records[idx].pop('dict_pos_edu',None)
+            
+            li_records[idx].pop('reference_sentences',None)
+            li_records[idx].pop('branch_input',None)
+            li_records[idx].pop('sentence_types',None)
+        
+        return li_records
     
-    return li_records
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
 
 def convert_dyploc_to_seqseq( li_records ):
     
-    li_records = copy.deepcopy(li_records)
-    
-    for idx in range(len(li_records)):
-        li_records[idx]['prompt'] = li_records[idx].pop('title')
+    try:
+        li_records = copy.deepcopy(li_records)
         
-        li_records[idx].pop('reference_sentences')
-        li_records[idx].pop('branch_input')
-        li_records[idx].pop('sentence_types')    
+        for idx in range(len(li_records)):
+            li_records[idx]['prompt'] = li_records[idx].pop('title',None)
+            
+            li_records[idx].pop('reference_sentences',None)
+            li_records[idx].pop('branch_input',None)
+            li_records[idx].pop('sentence_types',None)    
+        
+        return li_records
     
-    return li_records
-
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
 
 def _save_data(li_records, dset_section, m_format):
 
@@ -509,7 +549,7 @@ def _save_data(li_records, dset_section, m_format):
 
     li_record_enc = [ { str(k):json.dumps(v) for k,v in dict_.items() } for dict_ in li_records ]
                 
-    save_dir = os.path.join( "./dataset_cmv", m_format)
+    save_dir = os.path.join( "./dataset_cmv/", m_format, dset_section)
     os.makedirs(save_dir, exist_ok=True)
 
     
@@ -537,13 +577,16 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=3,
+    parser.add_argument('-bps','--batch_process_size', default=50,
                              help='',type=int)        
    
-    parser.add_argument('--mp_count', default=1, type=int)
+    parser.add_argument('--mp_count', default=5, type=int)
 
     args = parser.parse_args()
     
     dict_args = vars(args)
 
     main(**dict_args)
+
+
+#python3 data_setup_cmv.py -bps 520 --mp_count 26
