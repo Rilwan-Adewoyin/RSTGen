@@ -46,8 +46,8 @@ regex_bulletpoints = re.compile( "[ ]*>[ ]*")
 def main( batch_process_size = 10, mp_count=1 ):
 
     conversions_map = {
-        "train":["nlg",'nlg_pair'],
-        "val":["nlg", "nlg_pair"],
+        "train":["nlg",'nlg_pair',"seq2seq"],
+        "val":["nlg", "nlg_pair","seq2seq"],
         "test":["nlg","pair","seq2seq","nlg_pair"]
     }
 
@@ -58,10 +58,9 @@ def main( batch_process_size = 10, mp_count=1 ):
 
     
     # iterate through train, val, test
-    #for dset_section in ['test','val','train']:
-    
-    for dset_section in ['train']:
+    for dset_section in ['test','val','train']:
         
+                
         # loading dataset
         with open(os.path.join(dir_sourcedset,dset_section+".jsonl") ) as f:
             li_records = [json.loads(line) for line in f]
@@ -71,7 +70,7 @@ def main( batch_process_size = 10, mp_count=1 ):
         batches_completed = 0
         model_formats = conversions_map[dset_section]
         
-        batches_completed = 128
+        batches_completed = 0
         li_records = li_records[batch_size*batches_completed:]
 
         while len(li_records) > 0:
@@ -104,27 +103,27 @@ def main( batch_process_size = 10, mp_count=1 ):
 
                 res_dyploc_to_nlg = pool.imap( convert_dyploc_to_nlg, rrse_1 )
                 res_dyploc_to_nlgpair = pool.imap( convert_dyploc_to_nlgpair, rrse_2  )
-
+                res_dyploc_to_seq2seq = pool.imap( convert_dyploc_to_seqseq, res_2  )
+                
                 if dset_section in ['val','test']:
                     res_dyploc_to_pair = pool.imap( convert_dyploc_to_pair, rrs_2 )
-                    res_dyploc_to_seq2seq = pool.imap( convert_dyploc_to_seqseq, res_2  )
-
-                #getting results
+                
+                # #getting results
                 li_recs_nlg = sum( list(res_dyploc_to_nlg), [] )
                 li_recs_nlgpair = sum( list(res_dyploc_to_nlgpair), [] )
+                li_recs_seq2seq = sum( list(res_dyploc_to_seq2seq), [] )   
 
-
-                if dset_section in ['val','test']:
+                if dset_section in ['test']:
                     li_recs_pair = sum( list(res_dyploc_to_pair), [] )
-                    li_recs_seq2seq = sum( list(res_dyploc_to_seq2seq), [] )   
+                    
 
             # packing results
             dict_li_records = {'nlg_pair':li_recs_nlgpair,
-                    'nlg':li_recs_nlg}
+                    'nlg':li_recs_nlg, 'seq2seq':li_recs_seq2seq}
+            
             if dset_section in ['test']:
                 dict_li_records['pair'] = li_recs_pair
-                dict_li_records['seq2seq'] = li_recs_seq2seq        
-
+            
             #saving
             for m_format in model_formats :
                 _save_data( dict_li_records[m_format], dset_section, m_format )
@@ -198,16 +197,13 @@ def rst_tree_parse_records(li_records):
             li_rst_dict.pop(idx)
             li_records.pop(idx)
 
-        elif len(li_rst_dict[idx]['ns'])==1 and li_rst_dict[idx]['ns'][0] == 'a'  :
+        elif len(li_records[idx]['rst'])==1 and li_records[idx]['rst'][0]['ns'] == 'a' :
             li_rst_dict.pop(idx)
             li_records.pop(idx)
 
         else:
             li_records[idx]['rst'] = li_rst_dict[idx]
-<<<<<<< HEAD
-=======
-
->>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
+            
     return li_records
 
 
@@ -261,12 +257,7 @@ def convert_dyploc_to_nlg( li_records ):
         li_records = copy.deepcopy(li_records)
 
         for idx in range(len(li_records)):
-<<<<<<< HEAD
-            
             li_records[idx].pop('kp_set_str',None)
-=======
-            li_records[idx].pop('kp_set_str')
->>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
 
         
         #positioning edus
@@ -275,25 +266,15 @@ def convert_dyploc_to_nlg( li_records ):
             li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
             li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
 
-<<<<<<< HEAD
             li_edu = li_records[idx].pop('li_edus',None)
-=======
-            li_edu = li_records[idx].pop('li_edus')
->>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
 
             dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
             
             li_records[idx]['dict_pos_edu'] = dict_pos_edu
         
-<<<<<<< HEAD
 
         #extracting keyphrases
 
-=======
-
-        #extracting keyphrases
-
->>>>>>> be46bcab05a4f93059677eab05ac69c54dac5d28
         for idx in reversed(range(len(li_records))):
             branch_input = li_records[idx]['branch_input']
             
@@ -601,10 +582,10 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=50,
-                             help='',type=int)        
+    parser.add_argument('-bps','--batch_process_size', default=100,
+                             help='', type=int)        
    
-    parser.add_argument('--mp_count', default=5, type=int)
+    parser.add_argument('--mp_count', default=10, type=int)
 
     args = parser.parse_args()
     
@@ -613,4 +594,4 @@ if __name__ == '__main__':
     main(**dict_args)
 
 
-#python3 data_setup_cmv.py -bps 520 --mp_count 26
+# python3 data_setup_cmv.py -bps 520 --mp_count 26

@@ -471,7 +471,8 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         if 'bad_words_ids' not in generation_params:
             bad_words = ['"',"<|rst|>","<|ta|>", "<|pad|>",'\n', "\s"," \s", ". \s", "|", '\\n', "\\", "\\t", "#|",r'\""']
             bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
-            bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
+            bad_words_ids.extend( [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words] )
+
             bad_words_ids = bad_words_ids + [[526], [55],[8172], [3467], [59], [6852], [7479],[7879],[13426],[17405],[91],[8614],[930],[10],[9],[12],[1303],[2],[4242], [2235],[46424]]
             generation_params['bad_words_ids'] = bad_words_ids
         else:
