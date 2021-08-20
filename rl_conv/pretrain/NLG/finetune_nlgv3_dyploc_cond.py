@@ -45,7 +45,7 @@ import einops
 
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
-from transformers import Adafactor
+from transformers import Adafactor, AdafactorSchedule
 from transformers.generation_beam_search import BeamHypotheses
 
 from pytorch_lightning import loggers as pl_loggers
@@ -1531,32 +1531,16 @@ class TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         
-        if self.optimizer_type == "AdamW":
             
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-            
-            warmup_steps = int( self.warmup_proportion*self.total_steps() )
-
-            lr_schedule = get_cosine_schedule_with_warmup(optimizer, 
-                            warmup_steps, self.total_steps(), 0.5 )
-
-            return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step", "monitor":"val_loss"}]
+        optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
+                              relative_step=True, warmup_init=True, lr=None)
         
-        elif self.optimizer_type == "Adafactor":
-            optimizer = torch.optim.Adafactor(
-                self.model.parameters(), lr=self.learning_rate,
-                eps=(1e-30, 1e-3),
-                clip_threshold=1.0,
-                decay_rate=-0.8,
-                beta1=None,
-                weight_decay=0.0,
-                relative_step=False,
-                scale_parameter=True,
-                warmup_init=False
-                )
+        lr_scheduler = AdafactorSchedule(optimizer)
 
-            return [optimizer]
-            raise NotImplementedError
+
+        return [optimizer], [{ "scheduler":lr_scheduler ,"interval": "step", "monitor":"val_loss"}]
+        
+       
 
     def return_params(self):
         params = {}
