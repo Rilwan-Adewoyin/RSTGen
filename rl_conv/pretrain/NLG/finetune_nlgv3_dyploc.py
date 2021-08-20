@@ -1157,7 +1157,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=10,
+            patience=4,
             verbose=False,
             mode='min'
         )
@@ -1180,8 +1180,8 @@ class TrainingModule(pl.LightningModule):
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
                         accelerator=accelerator,
-                        val_check_interval=0.05,
                         num_sanity_val_steps=0, 
+                        val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1199,8 +1199,8 @@ class TrainingModule(pl.LightningModule):
                       
                     precision=tparams['precision'],
                     callbacks=callbacks,accelerator=accelerator,
-                         val_check_interval=0.05,
                         num_sanity_val_steps=0, 
+                        val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1770,5 +1770,5 @@ if __name__ == '__main__':
     main(vars(tparams), vars(mparams))
 
 
-# CUDA_VISIBLE_DEVICES=0 python3 finetune_nlgv3_dyploc.py --workers 6 --gpus 1 --batch_size 3 --version 0 --accumulate_grad_batches 8 --mode finetune --me 15 --max_input_len 290 --base_model_name "gpt2-medium" --prefix_prompt_max_len 30 --prefix_claim_max_len 40
+# CUDA_VISIBLE_DEVICES=4 python3 finetune_nlgv3_dyploc.py --workers 6 --gpus 1 --batch_size 10 --version 0 --accumulate_grad_batches 3 --mode finetune --me 7 --max_input_len 290 --base_model_name "gpt2-medium" --prefix_prompt_max_len 30 --prefix_claim_max_len 40
    
