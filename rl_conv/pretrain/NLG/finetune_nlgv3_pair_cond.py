@@ -1111,7 +1111,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=10,
+            patience=4,
             verbose=False,
             mode='min'
         )
@@ -1153,8 +1153,8 @@ class TrainingModule(pl.LightningModule):
                       
                     precision=tparams['precision'],
                     callbacks=callbacks,accelerator=accelerator,
-                        val_check_interval=0.5,
                         num_sanity_val_steps=0, 
+                        val_check_interval=0.5,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1712,4 +1712,4 @@ if __name__ == '__main__':
 
 # dullduks server version 1 - No Freezing, Full RST
 
-# CUDA_VISIBLE_DEVICES=0 python3 finetune_nlgv3_pair_cond.py --workers 6 --gpus 1 --batch_size 5 --version 0 --accumulate_grad_batches 4 --mode finetune --me 15 --max_input_len 222 --prefix_len 7 --base_model_name "gpt2-medium" --tag "finetune nlgv3 using pair with conditional prefix training and gpt2-medium base"
+# CUDA_VISIBLE_DEVICES=3 python3 finetune_nlgv3_pair_cond.py --workers 6 --gpus 1 --batch_size 18 --version 0 --accumulate_grad_batches 2 --mode finetune --me 7 --max_input_len 245 --base_model_name "gpt2-medium" --tag "gpt-2 medium finetune nlgv3 pair style"

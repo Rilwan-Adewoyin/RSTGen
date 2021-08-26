@@ -216,8 +216,7 @@ class RstTokenizerMixin():
         # we use this since the rst positions in our tree are often too large 
         # for torch.long to handle
         while x.max() >= max:
-            x = np.where( x<max, x, np.floor_divide(x-1,2) )
-                    
+            x = np.where( x<max, x, np.floor_divide(x-1,2) )                    
         return x.astype( int )
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):

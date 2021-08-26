@@ -43,9 +43,11 @@ import argparse
 import utils_nlg_v3 as utils
 import random 
 
-from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers.optimization import Adafactor, AdafactorSchedule
+from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
+from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
-from transformers import Adafactor
+
 from transformers.generation_beam_search import BeamHypotheses
 
 from pytorch_lightning import loggers as pl_loggers
@@ -79,7 +81,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
     """
 
     def __init__(self, 
-        base_model_name= 'distilgpt2', model_name="NLG",
+        base_model_name= 'gpt2-medium', model_name="NLG",
         max_input_len=264, freeze_pretrained=0,
         scale_grad_by_freq=False, **kwargs ):
             #base model uses same code as 'microsoft/DialoGPT-small'
@@ -109,20 +111,21 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         self.embd_outp_dim = self.transformer.config.n_embd
                 
         self.embedding_rst_rels = torch.nn.Embedding( len(self.nlg_tokenizer.rst_rel_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_rel_li ), scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.0005)
+        #self.embedding_rst_rels.weight.data.normal_(mean=0.0, std=0.0005)
 
         self.embedding_rst_ns = torch.nn.Embedding( len(self.nlg_tokenizer.rst_ns_li )+1, self.embd_outp_dim, padding_idx=len(self.nlg_tokenizer.rst_ns_li ),scale_grad_by_freq=self.scale_grad_by_freq )
-        self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.0005)
+        #self.embedding_rst_ns.weight.data.normal_(mean=0.0, std=0.0005)
 
         self.embedding_rst_pos = EmbeddingRstPos(   max_rst_index=self.nlg_tokenizer.rst_pos_maxidx,
                                                     max_rst_level = NLG_tokenizer.node_level(self.nlg_tokenizer.rst_pos_maxidx),
                                                     rst_encoding_ndim=self.embd_outp_dim,
-                                                    init_val=0.0005)
+                                                    #init_val=0.0005
+                                                    )
               
         self.token_type_embeddings = torch.nn.Embedding( self.nlg_tokenizer.special_token_count -1 + 1 , self.embd_outp_dim, #-1 since <|pad|> is a special token. +1 for padding token
                                                         padding_idx=(self.nlg_tokenizer.special_token_count -1 + 1 )-1,
                                                         scale_grad_by_freq=self.scale_grad_by_freq) #The maximum value this can take is based on the different types of input
-        self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.0005)
+        #self.token_type_embeddings.weight.data.normal_(mean=0.0, std=0.0005)
             # 1 for each of da, rst and + 1 for each topic phrase (note that each topic phrase includes a <topic> token.
             #      therefore the largest number of different topics is topic_ctx//2 if every topic only has one word)
         #endregion
@@ -136,7 +139,7 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         with torch.no_grad():
                 # initialising new special tokens to to eos token value
             #self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count:-1,:] = self.transformer.transformer.wte.weight[-self.nlg_tokenizer.special_token_count-1:-self.nlg_tokenizer.special_token_count,:] 
-                # initialising 
+                # initialising a pad token
             self.transformer.transformer.wte.weight[  -1 ].fill_(0)
         self.transformer.tie_weights()
         
@@ -914,7 +917,7 @@ class TrainingModule(pl.LightningModule):
             self.hparams.update({ **train_params_to_save, **model_params_to_save})
             pl.core.saving.save_hparams_to_yaml( os.path.join( os.path.dirname(kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams )
                 
-            self.inference_samples = list( islice( self.inference_dl, 10 ) )
+            
             bad_words = ["<|rst|>","<|ta|>","<|pad|>",r"\n" ] 
             bad_words_ids = [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + [self.model.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
@@ -963,7 +966,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--splits', default={'train':0.6,'val':0.2,'test':0.2}, required=False, type=str )
         parser.add_argument('--version', default=None,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16,required=False, type=int, help="Precision to use", choices=[16,32] )
-        parser.add_argument('--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
+        parser.add_argument('--optimizer_type', default="Adafactor",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=[0,1] )
         parser.add_argument('--inference_context_utt', default=4, type=int)
@@ -1049,11 +1052,11 @@ class TrainingModule(pl.LightningModule):
         
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model,checkpoint_callback) #monkey patch
 
-        val_check_interval = 0.05
+        val_check_interval = 0.1
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=max(4, int(1/val_check_interval)/2 ),
+            patience=max(6, int(1/val_check_interval)/2 ),
             verbose=False,
             mode='min'
         )
@@ -1063,8 +1066,12 @@ class TrainingModule(pl.LightningModule):
        
         if tparams['gpus'] in [0,1]:
             accelerator=None
+            trainer_vars = None
         else:
-            accelerator = 'ddp'
+
+            trianer_vars = { 'accelerator':'ddp',
+                    'plugins':DeepSpeedPlugin( stage=2 )
+                        }
 
         
         if tparams['mode'] in ["train_new"]:
@@ -1074,15 +1081,18 @@ class TrainingModule(pl.LightningModule):
                         default_root_dir=tparams['dir_checkpoints'],
                         logger=tb_logger,
                         #log_every_n_steps=20,
-                        precision=tparams['precision'], callbacks=callbacks,
-                        accelerator=accelerator,
-                        val_check_interval=0.05,
+                        precision=tparams['precision'], 
+                        callbacks=callbacks,
+                        #accelerator=accelerator,
+                        val_check_interval=val_check_interval,
                         num_sanity_val_steps=0, 
                         replace_sampler_ddp=False,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
+                        **trianer_vars,
+
                         )
             #training_module.init_data()
 
@@ -1098,13 +1108,14 @@ class TrainingModule(pl.LightningModule):
                       
                     precision=tparams['precision'],
                     callbacks=callbacks,accelerator=accelerator,
-                         val_check_interval=0.05,
+                         val_check_interval=val_check_interval,
                         num_sanity_val_steps=0, 
                         replace_sampler_ddp=False,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
+                        **trianer_vars,
                     )
             #training_module.init_data()
             
@@ -1310,56 +1321,56 @@ class TrainingModule(pl.LightningModule):
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
         
-        if step_name == "val" and _get_rank() == 0 :
+        # if step_name == "val" and _get_rank() == 0 :
              
-            # Making directory if it doesnt exist
-            dir_infer = os.path.join(self.trainer.log_dir,"inference")
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer,exist_ok=True)
+        #     # Making directory if it doesnt exist
+        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
+        #     if not os.path.exists(dir_infer):
+        #         os.makedirs(dir_infer,exist_ok=True)
 
-            # Adding true values and making csv files if thy dont already exists
-            for idx, encoded_input in enumerate(self.inference_samples):
-                fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
+        #     # Adding true values and making csv files if thy dont already exists
+        #     for idx, encoded_input in enumerate(self.inference_samples):
+        #         fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
 
-                # If there file does not exists we add the true observed records
-                if not os.path.exists(fp):
+        #         # If there file does not exists we add the true observed records
+        #         if not os.path.exists(fp):
                     
-                    df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
-                    rst_rels = encoded_input.pop('orig_rst_rels')
-                    topics = encoded_input.pop('orig_topics')
-                    utterance = encoded_input.pop('orig_utt')
+        #             df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
+        #             rst_rels = encoded_input.pop('orig_rst_rels')
+        #             topics = encoded_input.pop('orig_topics')
+        #             utterance = encoded_input.pop('orig_utt')
                     
-                    datum = { 'val_round': -1,
-                                'rst_rels': ', '.join( sum( rst_rels, ())),
-                                "topics": ', '.join(sum( topics, () )),
-                                "utterance":utterance[0] }
+        #             datum = { 'val_round': -1,
+        #                         'rst_rels': ', '.join( sum( rst_rels, ())),
+        #                         "topics": ', '.join(sum( topics, () )),
+        #                         "utterance":utterance[0] }
                 
-                    df = df.append(datum, ignore_index=True)
-                    df.to_csv( fp, index=False)
+        #             df = df.append(datum, ignore_index=True)
+        #             df.to_csv( fp, index=False)
                 
-                # Loading in dataframe of previous predictions
-                df = pd.read_csv(fp)    
+        #         # Loading in dataframe of previous predictions
+        #         df = pd.read_csv(fp)    
 
-                # creating predition andding to existing results
-                encoded_input.pop('orig_rst_rels', None)
-                encoded_input.pop('orig_topics', None)
-                encoded_input.pop('orig_utt', None)
+        #         # creating predition andding to existing results
+        #         encoded_input.pop('orig_rst_rels', None)
+        #         encoded_input.pop('orig_topics', None)
+        #         encoded_input.pop('orig_utt', None)
 
-                for k in encoded_input.keys():
-                    encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
+        #         for k in encoded_input.keys():
+        #             encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
 
-                output = self.model.generate(encoded_input, **self.inference_generation_params)
-                output = output[0].detach().to('cpu')
-                decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
-                                    skip_special_tokens=True)
-                datum = {
-                    'val_round':df['val_round'].max()+1,
-                    'rst_rels': '',
-                    'topics':'',
-                    'utterance':json.dumps(decoded_text) }
-                df = df.append(datum, ignore_index=True)
-                df.to_csv( fp, index=False)
-                # Saving to file
+        #         output = self.model.generate(encoded_input, **self.inference_generation_params)
+        #         output = output[0].detach().to('cpu')
+        #         decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
+        #                             skip_special_tokens=True)
+        #         datum = {
+        #             'val_round':df['val_round'].max()+1,
+        #             'rst_rels': '',
+        #             'topics':'',
+        #             'utterance':json.dumps(decoded_text) }
+        #         df = df.append(datum, ignore_index=True)
+        #         df.to_csv( fp, index=False)
+        #         # Saving to file
                    
     def create_data_loaders(self, modes):
        
@@ -1405,21 +1416,18 @@ class TrainingModule(pl.LightningModule):
 
             return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step", "monitor":"val_loss"}]
         
-        elif self.optimizer_type == "Adafactor":
-            optimizer = torch.optim.Adafactor(
-                self.model.parameters(), lr=self.learning_rate,
-                eps=(1e-30, 1e-3),
-                clip_threshold=1.0,
-                decay_rate=-0.8,
-                beta1=None,
-                weight_decay=0.0,
-                relative_step=False,
-                scale_parameter=True,
-                warmup_init=False
-                )
 
-            return [optimizer]
-            raise NotImplementedError
+        elif self.optimizer_type == "Adafactor":
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=False, 
+                                relative_step=False, warmup_init=False, lr=self.learning_rate )
+            
+            lr_scheduler = get_constant_schedule_with_warmup(optimizer,
+                                num_warmup_steps= 0.10*self.total_steps(),
+                                )
+        
+
+            return [optimizer], [{ "scheduler":lr_scheduler ,"interval": "step", "monitor":"val_loss"}]
+
 
     def return_params(self):
         params = {}
@@ -1845,3 +1853,5 @@ if __name__ == '__main__':
 # dullduks server version 1 - No Freezing, Full RST
 
 #   CUDA_VISIBLE_DEVICES=0 python3 train_nlg_v3.py --batch_size 3 --gpus 1 --accumulate_grad_batches 8 --freeze_pretrained 0 --scale_grad_by_freq 1 --max_input_len 220 --context_len '{ "rst":18, "topics":35 }' --workers 12 --version 2 --precision 16 --mode train_new --tag "gpt2 large . utterance 170 tokes long" --base_model_name "gpt2-large" --learning_rate 5e-4 --max_epochs 5
+
+#   CUDA_VISIBLE_DEVICES=3,4 python3 train_nlg_v3.py --batch_size 8 --gpus 1 --accumulate_grad_batches 2 --freeze_pretrained 0 --scale_grad_by_freq 0 --max_input_len 240 --context_len '{ "rst":18, "topics":35 }' --workers 20 --version 5 --precision 16 --mode train_new --tag "gpt2 large . utterance 187 tokes long" --base_model_name "gpt2-large" --learning_rate 5e-4 --max_epochs 6
