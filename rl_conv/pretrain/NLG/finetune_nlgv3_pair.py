@@ -238,7 +238,6 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         """
         new_input = {}
         attention_mask = input_['attention_mask']
-        labels = input_['labels']
 
         # rst token emebedding
         rst_start_embed = self.transformer.transformer.wte( input_['rst_start_token'] ) 
@@ -320,15 +319,15 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         prefix_dummy_pos_embed = input_['prefix_prompt_pos'].new_zeros(  [_[0], prefix_prompt_embed.shape[1] ,_[2]]  ) #ctx has no position embedding 
         position_embeds = torch.cat( [prefix_dummy_pos_embed, position_embeds], axis=1 )
 
-
-            # Shift Labels
-        labels = torch.cat( [ labels.new_zeros([_[0], prefix_prompt_embed.shape[1]]), labels], axis=1)
-
-
         new_input['input_embeds'] = input_embeds
         new_input['attention_mask'] = attention_mask
         new_input['position_embeds'] = position_embeds
-        new_input['labels'] = labels
+
+            # Shift Labels
+        if 'labels' in input_:
+            labels = input_['labels']
+            labels = torch.cat( [ labels.new_zeros([_[0], prefix_prompt_embed.shape[1]]), labels], axis=1)
+            new_input['labels'] = labels
         
         return new_input
 
@@ -356,8 +355,8 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         return params_
 
     def get_predicted_utterance(self, rst_rels, rst_ns,
-            rst_pos, topics, topics_pos, 
-            prompt, generation_params={}):
+            rst_pos, topics, topics_pos, start_utterance,
+            prompt, generation_params={}, device='cuda:0'):
         """Given an encoded input, outputs predictions up until an <EOS> is emmitted
                 The input will have been encoded using nlg_tokenizer
                 
@@ -382,12 +381,12 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
             bad_words_ids = [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
             bad_words_ids.extend( [self.nlg_tokenizer.e2m_tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words] )
             bad_words_ids = bad_words_ids + [[526], [55],[8172], [3467], [59], [6852], [7479],[7879],[13426],[17405],[91],[8614],[930],[10],[9],[12],[1303],[2],[4242], [2235],[46424]]
-            generation_params['bad_words_ids'] = bad_words_ids
+            generation_params['bad_words_ids'] = [ elem for elem in bad_words_ids if len(elem)!=0 ]
         else:
             bad_words_ids = None
 
-        default_generation_params = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':2.0, 
-                            'early_stopping':True, 'do_sample':False, 'no_repeat_ngram_size':3, 'bad_words_ids':bad_words_ids,'max_length':300 } #,'min_length':4
+        default_generation_params = {'num_beams':1, 'temperature':1.2, 'repitition_penalty':2.0, 'top_p':0.90,
+                            'early_stopping':True, 'do_sample':False, 'no_repeat_ngram_size':2, 'bad_words_ids':bad_words_ids,'max_length':300 } #,'min_length':4
 
         for key,value in default_generation_params.items():
             if key not in generation_params:
@@ -395,8 +394,8 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
 
 
         encoded_input = self.nlg_tokenizer.encode(rst_rels, rst_ns, rst_pos ,
-                                                    topics, topics_pos, prompt,
-                                                    pad_utterance=False, generate_mode=True)
+                                                    topics, topics_pos, start_utterance ,prefix_prompt=prompt,
+                                                    pad_utterance=False, generate_mode=True, device=device)
 
             # Add batch dimension to data and moving to GPU
         device = next(self.parameters()).device
@@ -404,8 +403,9 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         for key in ['tnsr_rst_rels', 'tnsr_rst_ns', 'tnsr_rst_pos',
                     'tnsr_topics_phrase','tnsr_topics_pos','tknzd_utt',
                     'position_ids','token_type_ids',
-                        'attention_mask','rst_start_token']:
-            encoded_input[key] = torch.unsqueeze( encoded_input[key],axis=0).to(device)
+                        'attention_mask','rst_start_token',
+                        'prefix_prompt', 'prefix_prompt_pos', 'prefix_attention_mask_tril_w_pad']:
+            encoded_input[key] = torch.unsqueeze( encoded_input[key],axis=0)
 
             # Generating Text
         output = self.generate(encoded_input, **generation_params)
@@ -466,7 +466,10 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         if os.path.isdir(dir_tokenizer):
             self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_tokenizer,use_fast=False)
 
-            self.special_token_count = len(eval(self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens','')))
+            special_tokens_dict = {'additional_special_tokens':
+                    [ '<|rst|>', '<|ta|>', '<|pad|>']}
+            
+            self.special_token_count = len(special_tokens_dict['additional_special_tokens'])
 
         # retreiving   base tokenizer from online or from local distillgpt2
         else:
@@ -625,8 +628,8 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
             return rst_rel_encoded, rst_names
 
     def encode(self, rst_rels, rst_ns , rst_pos, topics, topics_pos, 
-        utterance, pad_utterance, generate_mode,
-        prefix_prompt ):
+        utterance, pad_utterance, generate_mode=False,
+        prefix_prompt='', device=None ):
 
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -656,13 +659,6 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
 
         # Building Attention Mask
         attn_mask = torch.tril( torch.ones([utt_dim, utt_dim]), diagonal=rt_dim )
-            #correcting for padding in rst section
-        # attn_mask[ r_dim-rst_pad_count:r_dim ,:] = 0
-        # attn_mask[ :, r_dim-rst_pad_count:r_dim] = 0
-
-            #correcting for padding in topic section
-        # attn_mask[ rt_dim-topics_pad_count: rt_dim, :  ] = 0
-        # attn_mask[ :, rt_dim-topics_pad_count: rt_dim ] = 0
 
             # Implementing causal masking for each topic subphrase 
                 # First, each topic subphrase only attends to other words within that topic subphrase (including ta token) and not the other topcics
@@ -681,14 +677,15 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         attn_mask[ utt_dim: , : ] = 0
 
         #Creating labels/targets
-        try:
-            labels = -100* torch.ones( size=[utt_dim], dtype=torch.long )
-            #first eos token should be excluded from loss calc. so rt_dim + 1 used
-            #labels[rt_dim+1:utt_dim-utt_pad_count] =  tknzd_utt[ 1: utt_dim-utt_pad_count-rt_dim ]
-            labels[rt_dim+1:utt_dim] =  tknzd_utt[ 1: utt_dim-rt_dim ]
+        if generate_mode == False:
+            try:
+                labels = -100* torch.ones( size=[utt_dim], dtype=torch.long )
+                #first eos token should be excluded from loss calc. so rt_dim + 1 used
+                #labels[rt_dim+1:utt_dim-utt_pad_count] =  tknzd_utt[ 1: utt_dim-utt_pad_count-rt_dim ]
+                labels[rt_dim+1:utt_dim] =  tknzd_utt[ 1: utt_dim-rt_dim ]
 
-        except Exception:
-            labels = None
+            except Exception:
+                labels = None
         
         # Creating Positional Emebeddings
             # ALL words in rt get a positional encoding of 0 -> No positional meaning
@@ -719,12 +716,32 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
 
         prefix_attention_mask_tril_w_pad = torch.tril( torch.ones( [prefix_prompt.shape[0], prefix_prompt.shape[0]] ), diagonal=0 )
         
-        return { 'rst_start_token':rst_start_token,
+        if device != None: 
+            rst_start_token = rst_start_token.to(device)
+            tnsr_rst_rels = tnsr_rst_rels.to(device)
+            tnsr_rst_ns = tnsr_rst_ns.to(device)
+            tnsr_rst_pos = tnsr_rst_pos.to(device)
+            tnsr_topics_phrase = tnsr_topics_phrase.to(device)
+            tnsr_topics_pos = tnsr_topics_pos.to(device)
+            
+            tknzd_utt = tknzd_utt.to(device)
+            position_ids = position_ids.to(device)
+            token_type_ids = token_type_ids.to(device)
+            attn_mask = attn_mask.to(device)
+            rst_start_token = rst_start_token.to(device)
+            
+            if generate_mode == False:
+                labels = labels.to(device)
+            
+            prefix_prompt = prefix_prompt.to(device)
+            prefix_prompt_pos=prefix_prompt_pos.to(device)
+            prefix_attention_mask_tril_w_pad=prefix_attention_mask_tril_w_pad.to(device)
+        
+        output = { 'rst_start_token':rst_start_token,
                 'tnsr_rst_rels':tnsr_rst_rels,'tnsr_rst_ns':tnsr_rst_ns, 'tnsr_rst_pos':tnsr_rst_pos,
                 'tnsr_topics_phrase':tnsr_topics_phrase.contiguous(), 'tnsr_topics_pos': tnsr_topics_pos.contiguous(),
                  'tknzd_utt':tknzd_utt.contiguous(),
                  'attention_mask':attn_mask.contiguous(),
-                 'labels':labels,
                  'position_ids':position_ids.contiguous(),
                  'token_type_ids':token_type_ids.contiguous(),
 
@@ -733,6 +750,11 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
                  'prefix_prompt_pos':prefix_prompt_pos,
                  'prefix_attention_mask_tril_w_pad':prefix_attention_mask_tril_w_pad
                  }
+        
+        if generate_mode == False:
+            output['labels'] = labels
+
+        return output
 
     def encode_rst(self,rst_rels, rst_ns, rst_pos):
         """Converts rst_rels in a series of vectors
@@ -858,56 +880,13 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         return topic_phrases , tnsr_pos, ta_idxs, ta_phrase_lens
 
     def encode_utterance(self, utterance, pad=True, generate_mode=False ):
-        #pad: 
-        #   set to True during training to ensure all batches have the same length
-        #   set to False in the case of Generation in order to work with huggingface .generate()
-        
+       
         
         if generate_mode == False:
             utterance ='<|endoftext|>' + utterance + '<|endoftext|>'
             
         else:
             utterance ='<|endoftext|>' + utterance
-            
-            
-        # if pad == True:
-        #     encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
-        #                                 return_attention_mask = False, 
-                                        
-        #                                 padding='do_not_pad',
-        #                                 truncation=True, 
-        #                                 max_length= self.context_len['utt'],
-                                                                                
-        #                                 return_tensors='pt',
-        #                                 return_length=True,
-        #                                 return_token_type_ids=None,
-        #                                 add_prefix_space = False
-        #                                 )
-            
-        #     #tokenizer length usually returns the padded length as opposed the original length.
-        #     #So using 'do_not_pad' and then padding manually
-        #     tknzd_utt_no_pad_len = encoded['length'][0]
-        #     pad_count = self.context_len['utt'] - tknzd_utt_no_pad_len            
-        #     tknzd_utt = torch.cat( [ encoded['input_ids'], torch.LongTensor(1,pad_count).fill_(padding_token.item() ) ],axis=-1 )[0]
-                                           
-        
-        # elif pad == False:
-                        
-            # encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
-            #                             return_attention_mask = False, 
-            #                             padding='do_not_pad',
-            #                             truncation=True, 
-            #                             max_length= self.context_len['utt'],
-            #                             return_tensors='pt',
-            #                             return_length=True,
-            #                             return_token_type_ids=None,
-            #                             add_prefix_space=False)
-            # tknzd_utt_no_pad_len = encoded['length'][0]
-            # pad_count = 0
-
-        
-        # tknzd_utt = encoded['input_ids'][0]
-
         
         encoded = self.e2m_tokenizer( utterance, add_special_tokens=False,
                                     return_attention_mask = False, 
@@ -924,6 +903,49 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         #return tknzd_utt, pad_count
         return tknzd_utt
 
+    def parse_rawinput(self, li_rst, li_pos_kp, prompt, utterance):
+
+        if type(li_rst) == str:
+            li_rst = json.loads(li_rst)  #list of dictionaries 
+        
+        if type(li_pos_kp) == str:
+            li_pos_kp = json.loads(li_pos_kp)
+                
+        try:
+            utterance = ujson.loads(utterance)
+        except Exception as e:
+            pass
+        
+        try:
+            prompt = ujson.loads(prompt)
+        except Exception as e:
+            pass
+        
+        
+        
+        #region RST
+        rst_rels = [ _dict['rel'] for _dict in li_rst ]
+        rst_ns = [ _dict['ns'] for _dict in li_rst ]
+        rst_pos = [ _dict['pos'] for _dict in li_rst ]
+        
+            #sorting the order to be left to right in binary tree
+        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: ( NLG_tokenizer.edukp_pos_sort_function(x[1]), x[1] ) )]
+        rst_rels = [ rst_rels[idx] for idx in sorted_order ]
+        rst_ns = [ rst_ns[idx] for idx in sorted_order ]
+        rst_pos = [ rst_pos[idx] for idx in sorted_order ]
+        #endregion
+
+        
+        #Topic scores
+        if len(li_pos_kp) == 0:
+            topics_pos = []
+            topics = []
+        else: 
+            topics_pos, topics = zip( *li_pos_kp ) #top 3 important prhases from utterance
+            topics_pos = tuple( int(pos) for pos in topics_pos )
+        
+        return rst_rels, rst_ns, rst_pos, topics, topics_pos, utterance, prompt
+    
 class TrainingModule(pl.LightningModule):
 
     def __init__(self, model_params, batch_size=20, 

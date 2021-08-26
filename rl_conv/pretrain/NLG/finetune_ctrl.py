@@ -70,7 +70,7 @@ from transformers import CTRLTokenizer, CTRLLMHeadModel
 
 class TrainingModule(pl.LightningModule):
 
-    def __init__(self, max_input_len, batch_size=20, 
+    def __init__(self, max_input_len=1024, batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
                     max_epochs=25,
@@ -80,6 +80,7 @@ class TrainingModule(pl.LightningModule):
                     lr_schedule='hard_restarts',
                     mode = 'train_new',
                     tag='ctrl fine tuned on argument generation',
+                    model_name='ctrl',
                     *args,
                     **kwargs):
         super().__init__()
@@ -90,8 +91,8 @@ class TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.max_input_len = max_input_len
-        self.model = CTRLLMHeadModel.from_pretrained('ctrl')
-        self.model.tokenizer = CTRLTokenizer.from_pretrained('ctrl')
+        self.model = CTRLLMHeadModel.from_pretrained(model_name)
+        self.model.tokenizer = CTRLTokenizer.from_pretrained(model_name)
         self.model.tokenizer.default_collate_pad = types.MethodType(utils.EffeciencyMixin.default_collate_pad,
                                                                     self.model.tokenizer)                                        
         self.model.tokenizer.pad_values  = { 'input_ids': 246532 , 'loss_mask':0 }                                   
@@ -370,26 +371,12 @@ class TrainingModule(pl.LightningModule):
             raise NotImplementedError   
     
     @staticmethod
-    def load_ctrlmodel(model_name="ctrl", model_version=0, max_input_len=None, device="cuda:0"):
+    def load_ctrlmodel(model_name="ctrl", model_version=0, device="cuda:0"):
         # Loading in NLG model
         checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
-
-        # Getting tparams
-        tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type',
-            'tag']}
-
-        tparams['mode'] = 'inference'
-
-        mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'model_name','max_input_len']}
-        
-        
-        if max_input_len != None:
-            mparams['max_input_len'] = max_input_len
             
         # Loading Training Module
-        training_module = TrainingModule(**tparams, model_params=mparams )
+        training_module = TrainingModule(mode='inference',model_name=model_name)
         training_module.load_state_dict(checkpoint['state_dict'])
         model = training_module.model
 
@@ -658,7 +645,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
     def getitem_tokenize(self, utterance, prompt):
 
-        comment_prompt = f" Comment: "
+        #comment_prompt = f" Comment: "
         prompt =  prompt + comment_prompt
         
         prompt_tok = self.tokenizer.encode(prompt,return_tensors="pt")[0]
