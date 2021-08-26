@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 from torch._C import Value
 from torch.nn.modules import loss
 import transformers
+from transformers.utils.dummy_pt_objects import MBartPreTrainedModel
 
 #os.environ["NCCL_DEBUG"]="INFO"
 #os.environ["NCCL_DEBUG_SUBSYS"]="ALL"
@@ -13,7 +14,7 @@ import transformers
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
 #os.environ['CUDA_LAUNCH_BLOCKING']="1"
-
+import fairscale
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,10 +37,12 @@ from pytorch_lightning.utilities import rank_zero_only
 from torch.nn import CrossEntropyLoss
 
 from sklearn import preprocessing as sklp
+from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
+import deepspeed
 
 import argparse
 import utils_nlg_v3 as utils
@@ -77,9 +80,9 @@ class TrainingModule(pl.LightningModule):
                     gpus=1, 
                     learning_rate=1e-4,
                     workers=0,
-                    lr_schedule='hard_restarts',
                     mode = 'train_new',
                     tag='ctrl fine tuned on argument generation',
+                    model_name='ctrl',
                     *args,
                     **kwargs):
         super().__init__()
@@ -90,24 +93,22 @@ class TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.max_input_len = max_input_len
-        self.model = CTRLLMHeadModel.from_pretrained('ctrl')
-        self.model.tokenizer = CTRLTokenizer.from_pretrained('ctrl')
-        self.model.tokenizer.default_collate_pad = types.MethodType(utils.EffeciencyMixin.default_collate_pad,
-                                                                    self.model.tokenizer)                                        
-        self.model.tokenizer.pad_values  = { 'input_ids': 246532 , 'loss_mask':0 }                                   
-        self.model.tokenizer.pad_maxlens = { 'input_ids':self.max_input_len,  'loss_mask':self.max_input_len }
-        
+        self.model = CTRLLMHeadModel.from_pretrained(model_name)
+        self.model.tokenizer = CTRLTokenizer.from_pretrained(model_name)
+        self.model.tokenizer.default_collate_pad = types.MethodType(utils.EffeciencyMixin.default_collate_pad,self.model.tokenizer)                                        
+        self.model.tokenizer.pad_values  = { 'input_ids': 246532 , 'labels':-100 }                                   
+        self.model.tokenizer.pad_maxlens = { 'input_ids':self.max_input_len, 'labels':self.max_input_len }
+        self.model.tokenizer.model_max_length = self.max_input_len
+
         if self.mode in ['train_new','train_cont','test','finetune']:
             self.dir_data = utils.get_path(dir_data)
-            self.create_data_loaders( )
             self.accumulate_grad_batches = accumulate_grad_batches
+            self.create_data_loaders( )
             self.tag = tag
 
         if self.mode in ['train_new','train_cont','finetune']:
             self.max_epochs = max_epochs
-            self.lr_schedule = lr_schedule
             self.learning_rate = learning_rate
-
 
         if self.mode in ['inference']:
             self.eval() 
@@ -118,12 +119,12 @@ class TrainingModule(pl.LightningModule):
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--dir_data', default="./dataset_cmv/seq2seq", help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=5, type=int)
+        parser.add_argument('--max_epochs', default=6, type=int)
         parser.add_argument('--accumulate_grad_batches', default=30, type=int)
         parser.add_argument('-b','--batch_size', default=1, type=int)
-        parser.add_argument('--learning_rate', default=1e-3, type=float)
-        parser.add_argument('--workers', default=0, type=int) #TODO: change to 6
-        parser.add_argument('--gpus', default=1, type=int)
+        parser.add_argument('--learning_rate', default=2e-4, type=float)
+        parser.add_argument('--workers', default=6, type=int) #TODO: change to 6
+        parser.add_argument('--gpus', default=2, type=int)
         parser.add_argument('--mode',default='train_new', type=str, choices=['train_new','train_cont','test','inference','finetune'])
         parser.add_argument('--version', default=1,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16, required=False, type=int, help="Precision to use", choices=[16,32] )
@@ -153,7 +154,7 @@ class TrainingModule(pl.LightningModule):
 
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'batch_size', 'lr_schedule', 'learning_rate','precision','tag']} )
+                    'batch_size', 'precision','tag']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'model_name','max_input_len']} )
@@ -163,11 +164,11 @@ class TrainingModule(pl.LightningModule):
                 print("param files not found utilsing default or user entered params\n")
                 
             #Restore/update Training Module
-            training_module = TrainingModule(**tparams, model_params=mparams)
+            training_module = TrainingModule(**tparams, **mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
 
         elif tparams['mode'] == "finetune":
-            training_module = TrainingModule(**tparams, model_params=mparams)
+            training_module = TrainingModule(**tparams, **mparams)
             checkpoint = TrainingModule.get_ckpt_file( tparams['dir_checkpoints'])            
             state = checkpoint['state_dict']
             
@@ -186,7 +187,7 @@ class TrainingModule(pl.LightningModule):
             #restore/update param files from the checkpoint
             try:
                 tparams.update ( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-                    'lr_schedule', 'learning_rate','precision','optimizer_type']} )
+                     'precision','optimizer_type']} )
 
                 mparams.update( {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name','model_name','max_input_len']} )
@@ -194,7 +195,7 @@ class TrainingModule(pl.LightningModule):
                 pass
             
             #Restore/update Training Module
-            training_module = TrainingModule(**tparams, model_params=mparams)
+            training_module = TrainingModule(**tparams, **mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
 
         else:
@@ -203,7 +204,7 @@ class TrainingModule(pl.LightningModule):
         return training_module
 
     @staticmethod
-    def instatiate_trainer( tparams, tb_logger, training_module):
+    def instatiate_trainer( tparams, model_name, tb_logger, training_module):
         """[summary]
 
             Creates The Trainer and callbacks
@@ -212,16 +213,23 @@ class TrainingModule(pl.LightningModule):
         
         # Creating Callbacks
         callbacks = []        
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=2, 
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', save_top_k=3, 
             mode='min', dirpath=dir_checkpoints, 
             filename='{epoch:03d}_{val_loss:.5f}')
         
         checkpoint_callback._save_model  = types.MethodType(utils.monkey_save_model,checkpoint_callback) #monkey patch
 
+        if model_name == "ctrl":
+            val_check_interval = 0.1
+            patience = 30
+        elif model_name == "sshleifer/tiny-ctrl":
+            val_check_interval = 0.5
+            patience = 3
+
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=4,
+            patience=patience,
             verbose=False,
             mode='min'
         )
@@ -230,10 +238,24 @@ class TrainingModule(pl.LightningModule):
 
        
         if tparams['gpus'] in [0,1]:
-            accelerator=None
-        else:
-            accelerator = 'ddp'
+            
+            trainer_vars = { 'accelerator':None }
 
+        else:
+            if model_name == "ctrl":
+                trainer_vars = {
+                   #'plugins': DeepSpeedPlugin(stage=2 ),     
+                    #   'plugins':DDPPlugin(find_unused_parameters=False),
+                    "plugins" : 'ddp_sharded',
+                      'accelerator':'ddp',
+                                
+                            'amp_level': 'O1'
+                                }
+            else:
+                trainer_vars = {
+                    'accelerator':'ddp',
+                    'plugins':DDPPlugin(find_unused_parameters=False)
+                }
         
         if tparams['mode'] in ["train_new", "finetune"]:
             
@@ -243,13 +265,18 @@ class TrainingModule(pl.LightningModule):
                         logger=tb_logger,
                         precision=tparams['precision'], 
                         callbacks=callbacks,
-                        accelerator=accelerator,
-                        val_check_interval=0.33,
+                        #limit_train_batches = 5,
+                        #overfit_batches = 10,
+                        #accelerator=accelerator,
+                        #plugins=DDPPlugin(find_unused_parameters=False),
+                        val_check_interval=val_check_interval,
                         num_sanity_val_steps=0, 
-                        replace_sampler_ddp=False
-                        
-                        
-                        )
+                       replace_sampler_ddp=False,
+                    reload_dataloaders_every_n_epochs=1,
+
+                        #track_grad_norm=2 ,
+                        #gradient_clip_val = 1 ,
+                        **trainer_vars)
 
         elif tparams['mode'] in ["train_cont","inference"]:
             #restoring checkpoint             
@@ -261,19 +288,23 @@ class TrainingModule(pl.LightningModule):
                      logger=tb_logger,
                       
                     precision=tparams['precision'],
-                    callbacks=callbacks,accelerator=accelerator,
-                        val_check_interval=0.33,
+                    callbacks=callbacks,
+                        #accelerator=accelerator,
+                        val_check_interval=val_check_interval,
                         num_sanity_val_steps=0, 
-                        replace_sampler_ddp=False
+                        replace_sampler_ddp=False,
+                        reload_dataloaders_every_n_epochs=1
+                        #plugins=DDPPlugin(find_unused_parameters=False),
+                        #track_grad_norm=2
                         
                     )
 
             # load callback states
-            trainer.on_load_checkpoint(checkpoint)
+            #trainer.on_load_checkpoint(checkpoint)
             trainer.global_step = checkpoint['global_step']
             trainer.current_epoch = checkpoint['epoch']
-
-            # restore the optimizers
+            
+            # restore the optimizers    
             optimizer_states = checkpoint['optimizer_states']
             for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
                 optimizer.load_state_dict(opt_state)
@@ -309,6 +340,7 @@ class TrainingModule(pl.LightningModule):
                     logger=tb_logger,
                     log_every_n_steps=1,   
                     precision=tparams['precision'],
+                    track_grad_norm=2,
                     )
 
             # load callback states
@@ -376,7 +408,7 @@ class TrainingModule(pl.LightningModule):
 
         # Getting tparams
         tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'batch_size', 'lr_schedule', 'learning_rate','precision','splits','optimizer_type',
+            'batch_size','precision','splits','optimizer_type',
             'tag']}
 
         tparams['mode'] = 'inference'
@@ -403,46 +435,41 @@ class TrainingModule(pl.LightningModule):
         
         return model
 
-    @auto_move_data
+    #@auto_move_data
     def forward(self, input_ids):
-        return self.model(input_ids)
+        with torch.cuda.amp.autocast(enabled=True): 
+            return  self.model(input_ids)
 
     def step(self, batch, step_name):
         
-        
         dict_m_output = self.forward(batch['input_ids']) #(lm_logits and loss)
-        dict_m_output = self.loss(dict_m_output, labels=batch['input_ids'],
-                                    loss_mask=batch['loss_mask'] )
+        dict_m_output = self.loss(dict_m_output, labels=batch['labels']  )
         loss_key = f"{step_name}_loss"
         
         output = {}
 
         if step_name == 'train':
             output["loss"] = dict_m_output.loss
+            self.log( loss_key, dict_m_output.loss)
 
         else:
-            str_loss_key = loss_key       
-            self.log( str_loss_key, dict_m_output.loss)
+                   
+            self.log( loss_key, dict_m_output.loss)
             
-            output[str_loss_key]=dict_m_output.loss
+            output[loss_key]=dict_m_output.loss
 
 
         return  output 
 
-    def loss(self, dict_m_output, labels, loss_mask):
+    def loss(self, dict_m_output, labels):
         
         
     
         # Shift so that tokens < n predict n
         
-        shift_logits = dict_m_output.logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-        
-        loss_mask = loss_mask[..., :-1]
-        
-        shift_logits = shift_logits[loss_mask].contiguous()
-        shift_labels = shift_labels[loss_mask].contiguous()
-        
+        shift_logits = dict_m_output.logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+                
         # Flatten the tokens
         loss_fct = CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -483,7 +510,7 @@ class TrainingModule(pl.LightningModule):
     def create_data_loaders(self, shuffle=False, **kwargs):
        
         dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.model.tokenizer, 
-                workers=self.workers, mode=self.mode, gpus=self.gpus
+                workers=self.workers, mode=self.mode, gpus=self.gpus, agb=self.accumulate_grad_batches
                  )
 
         _dict_dl = dg()
@@ -510,10 +537,16 @@ class TrainingModule(pl.LightningModule):
     def configure_optimizers(self):
                     
         # optimial settings for T5
-        optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
-                              relative_step=True, warmup_init=True, lr=None)
+        optimizer = Adafactor(self.model.parameters(), scale_parameter=False, 
+                               relative_step=False, warmup_init=False, lr=self.learning_rate )
         
-        lr_scheduler = AdafactorSchedule(optimizer)
+        #optimizer = deepspeed.ops.adam.FusedAdam(self.model.parameters(), lr=self.learning_rate  )
+        
+        #optimizer = deepspeed.runtime.fp16.onebit.adam.OnebitAdam(self.model.parameters(), lr=self.learning_rate  )
+
+        lr_scheduler = transformers.get_constant_schedule_with_warmup(optimizer,
+                            num_warmup_steps= 0.10*self.total_steps(),
+                            )
     
 
         return [optimizer], [{ "scheduler":lr_scheduler ,"interval": "step", "monitor":"val_loss"}]
@@ -536,6 +569,7 @@ class DataLoaderGenerator():
                     tokenizer, 
                     workers=0, mode='train_new',
                     gpus=1,
+                    agb=1,
                     **kwargs):
         
         self.dir_data = dir_data
@@ -544,6 +578,7 @@ class DataLoaderGenerator():
         self.bs = batch_size
         self.workers  = workers
         self.mode = mode
+        self.accumulate_grad_batches = agb
 
 
     def prepare_dataloaders(self):
@@ -586,30 +621,35 @@ class DataLoaderGenerator():
             fn = glob.glob(  os.path.join( dir_data,"train","*") )[0]
             shuffle = True
             bs = self.bs
+            unique_features = True
 
         elif split_name == 'val':
             fn = glob.glob(  os.path.join( dir_data,"val","*") )[0]
             shuffle = False
             bs = self.bs
+            unique_features = False
 
         elif split_name == 'test':
             fn = glob.glob(  os.path.join( dir_data,"test","*") )[0]
             shuffle = False
             bs = self.bs
+            unique_features = False
 
-        dset = SingleDataset(fn, self.tokenizer) 
+        dset = SingleDataset(fn, self.tokenizer, unique_features=unique_features) 
 
         if self.gpus <= 1 or split_name not in ['inference','test'] :
-            sampler = SizedOrdered_Sampler(dset, bs, shuffle=shuffle )
+            sampler = SizedOrdered_Sampler(dset, bs, shuffle=shuffle, agb=self.accumulate_grad_batches )
         else:
-            sampler = SizedOrdered_DistributedSampler( dset, bs, shuffle=shuffle, gpus=self.gpus )
+            sampler = SizedOrdered_DistributedSampler( dset, bs, shuffle=shuffle, gpus=self.gpus, agb=self.accumulate_grad_batches )
 
 
         if split_name in ['train','val','test']:
             dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
                 shuffle=False, num_workers=self.workers,
                 collate_fn=lambda batch: self.tokenizer.default_collate_pad(batch),
-                pin_memory=True, sampler=sampler )
+                #pin_memory=True,
+                pin_memory=False,
+                sampler=sampler )
         else:
             dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
                 shuffle=shuffle, num_workers=self.workers,
@@ -626,11 +666,14 @@ class SingleDataset(torch.utils.data.Dataset):
 
         create a custom index which sorts the entries by their length
     """
-    def __init__(self, file_path, tokenizer ):
+    def __init__(self, file_path, tokenizer, unique_features=False ):
         self.fp = file_path
         self.tokenizer = tokenizer        
         self.data = pd.read_csv(self.fp , header=0 )
-                                
+
+        if unique_features:
+            self.data = self.data.sample(frac=1).drop_duplicates(subset=['prompt']).reset_index(drop=True)
+
     def __len__(self):
         return len(self.data)
     
@@ -649,7 +692,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
         #region RST
 
-        prompt = f"Opinion Title: {json.loads(datum['prompt'].values[0])}"
+        prompt = f"{json.loads(datum['prompt'].values[0])}"
         
         utterance = json.loads(datum['reference'].values[0])
         
@@ -658,11 +701,15 @@ class SingleDataset(torch.utils.data.Dataset):
 
     def getitem_tokenize(self, utterance, prompt):
 
-        comment_prompt = f" Comment: "
-        prompt =  prompt + comment_prompt
         
-        prompt_tok = self.tokenizer.encode(prompt,return_tensors="pt")[0]
-        utterance_tok = torch.cat( [self.tokenizer.encode(utterance,return_tensors="pt")[0] , 
+        prompt_tok = torch.cat( [ self.tokenizer.encode(f"Argument Title: {prompt}", return_tensors="pt", truncation=True)[0],
+                                torch.tensor( [246533], dtype=torch.long ) 
+                               #,self.tokenizer.encode("Comment:", return_tensors="pt", truncation=True)[0] 
+                               ],
+                                axis=-1
+                                )
+
+        utterance_tok = torch.cat( [self.tokenizer.encode(utterance, return_tensors="pt", truncation=True)[0] , 
                                     torch.tensor( [246533], dtype=torch.long ) ]
                                   ,axis=-1)
         
@@ -670,15 +717,20 @@ class SingleDataset(torch.utils.data.Dataset):
         # In the reddit data this indicates another person is speaking
         # so it aligns well to our interpretation of eos for argumentation
         
-        input_ids = torch.cat([prompt_tok,utterance_tok], axis=-1)
-        loss_mask = torch.cat( 
-                              ( input_ids.new_zeros( prompt_tok.numel()-1 ) ,
-                                    input_ids.new_full( [utterance_tok.numel()+1], 1 ) ), 
-                              axis=-1 ).to(torch.bool)
-                
+        input_ids = torch.cat([prompt_tok, utterance_tok], axis=-1)
+
+        # labels = torch.cat(
+        #     [ input_ids.new_full( [ 1 ], -100 ),
+        #         input_ids[ 1: ]
+        #     ], axis=-1
+        # )
+        labels = input_ids.detach().clone()
+        labels[:len(prompt_tok)] = -100
+
+                        
         encoded = {
             'input_ids':input_ids,
-            'loss_mask':loss_mask
+            'labels':labels
         }
         return encoded
 
@@ -689,7 +741,7 @@ class SizedOrdered_Sampler(Sampler[int]):
         data_source (Dataset): dataset to sample from
     """
     
-    def __init__(self, data_source, batch_size, shuffle) -> None:
+    def __init__(self, data_source, batch_size, agb, shuffle) -> None:
         self.data_source = data_source
         
         li_records = self.data_source.data.to_dict('records')
@@ -699,9 +751,9 @@ class SizedOrdered_Sampler(Sampler[int]):
         #Indices are sorted in order of the text lens of records in the datasets
         np_ordered_lens = np_txt_lens.argsort()
         
+        ebs = int( batch_size*agb )
         # We Randomly re-arrange them in batches of batch size
-        #li_chunked_lens = np.array_split( np_ordered_lens, self.__len__() //batch_size  )
-        li_chunked_lens = [ np_ordered_lens[idx:idx+batch_size] for idx in range(0, np_ordered_lens.size - batch_size, batch_size) ]
+        li_chunked_lens = [ np_ordered_lens[idx:idx+ebs] for idx in range(0, np_ordered_lens.size - ebs, ebs) ]
         
         if shuffle:
             random.shuffle( li_chunked_lens )
@@ -758,7 +810,7 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
             ...     train(loader)
         """
 
-    def __init__(self, dataset: Dataset, batch_size: int,
+    def __init__(self, dataset: Dataset, batch_size: int, agb,
                  num_replicas: Optional[int] = None,
                  rank: Optional[int] = None, 
                  seed: int = 0,
@@ -785,16 +837,17 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
         self.epoch = 0
         
         self.seed = seed
-    
-        li_records = self.data_source.to_dict('records')
+        data_source = dataset
+        li_records = data_source.data.to_dict('records')
         inp_lens = [ len( ujson.loads(record['prompt']).split(' ') )+len(ujson.loads(record['reference']).split(' ')) for record in li_records ]
         np_txt_lens = np.array(inp_lens)
 
         #Indices are sorted in order of the text lens of records in the datasets
         np_ordered_lens = np_txt_lens.argsort()
         
+        ebs = int( batch_size*agb )
             # We Randomly re-arrange them in batches of batch size
-        li_chunked_lens = [ np_ordered_lens[idx:idx+batch_size] for idx in range(0, np_ordered_lens.size-batch_size, batch_size) ]
+        li_chunked_lens = [ np_ordered_lens[idx:idx+ebs] for idx in range(0, np_ordered_lens.size-ebs, ebs) ]
 
             # Divide into n sublists,
             # Each sublist at index i, contains the indices for process at rank i
@@ -851,13 +904,13 @@ def main(tparams={}, mparams={}):
 
     # initiating training loop
     training_module = TrainingModule.instatiate_training_module( tparams, mparams)
-    trainer, training_module = TrainingModule.instatiate_trainer( tparams,  tb_logger, training_module)
+    trainer, training_module = TrainingModule.instatiate_trainer( tparams, mparams['model_name']  ,tb_logger, training_module)
     TrainingModule.start(trainer, tparams, training_module, mparams)
 
 def parse_model_specific_args(parent_parser):
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True, allow_abbrev=False)
                                     
-    parser.add_argument('--max_input_len', type=int, default=240)
+    parser.add_argument('--max_input_len', type=int, default=200)
     
     parser.add_argument('--model_name', type=str, default='ctrl')
     

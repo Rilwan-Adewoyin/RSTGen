@@ -31,6 +31,8 @@ from itertools import cycle, islice
 from torch.utils.data._utils.collate import default_convert, default_collate
 from pytorch_lightning.utilities import rank_zero_only
 from torch.nn import CrossEntropyLoss
+from transformers.optimization import Adafactor, AdafactorSchedule
+from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 
 from sklearn import preprocessing as sklp
 
@@ -1054,7 +1056,7 @@ class TrainingModule(pl.LightningModule):
         parser.add_argument('--lr_schedule', default='cosine_warmup', required=False, choices =['cosine_warmup','LROnPlateau','hard_restarts','constant'])
         parser.add_argument('--version', default=99,required=False, type=int, help="The Experimental Versioning for this run" )
         parser.add_argument('--precision', default=16, required=False, type=int, help="Precision to use", choices=[16,32] )
-        parser.add_argument('--optimizer_type', default="AdamW",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
+        parser.add_argument('--optimizer_type', default="Adafactor",required=False, type=str, help="Optimizer to use", choices=["AdamW","Adafactor"] )
         parser.add_argument('--tag',default='',required=True, type=str)
         parser.add_argument('--override',default=False, type = lambda x: bool(int(x)), choices=["0","1"] )
         parser.add_argument('--inference_context_utt', default=4, type=int)
@@ -1157,7 +1159,7 @@ class TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=4,
+            patience=8,
             verbose=False,
             mode='min'
         )
@@ -1166,9 +1168,12 @@ class TrainingModule(pl.LightningModule):
 
        
         if tparams['gpus'] in [0,1]:
-            accelerator=None
+            trainer_vars = {} #accelerator=None
+            
         else:
-            accelerator = 'ddp'
+            trianer_vars = { 'accelerator':'ddp',
+                                'plugins':DeepSpeedPlugin( stage=2 )
+                                 }
 
         
         if tparams['mode'] in ["train_new", "finetune"]:
@@ -1179,9 +1184,11 @@ class TrainingModule(pl.LightningModule):
                         logger=tb_logger,
                         #log_every_n_steps=20,
                         precision=tparams['precision'], callbacks=callbacks,
-                        accelerator=accelerator,
+                        #accelerator=accelerator,
                         num_sanity_val_steps=0, 
-                        val_check_interval=0.5,
+                        #limit_train_batches = 200,
+                        val_check_interval=0.25,
+                        **trianer_vars,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1198,9 +1205,11 @@ class TrainingModule(pl.LightningModule):
                      logger=tb_logger,
                       
                     precision=tparams['precision'],
-                    callbacks=callbacks,accelerator=accelerator,
+                    callbacks=callbacks,
+                    #accelerator=accelerator,
                         num_sanity_val_steps=0, 
-                        val_check_interval=0.5,
+                        val_check_interval=0.25,
+                        **trianer_vars,
                         #track_grad_norm = True,
                         #overfit_batches=25,
                         #fast_dev_run=2, 
@@ -1398,64 +1407,64 @@ class TrainingModule(pl.LightningModule):
             loss = torch.stack([x[f"{step_name}_loss"] for x in outputs]).mean()
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
         
-        if step_name == "val" and _get_rank() == 0 :
+        # if step_name == "val" and _get_rank() == 0 :
              
-            # Making directory if it doesnt exist
-            dir_infer = os.path.join(self.trainer.log_dir,"inference")
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer,exist_ok=True)
+        #     # Making directory if it doesnt exist
+        #     dir_infer = os.path.join(self.trainer.log_dir,"inference")
+        #     if not os.path.exists(dir_infer):
+        #         os.makedirs(dir_infer,exist_ok=True)
 
-            # Adding true values and making csv files if thy dont already exists
-            for idx, encoded_input in enumerate(self.inference_samples):
-                fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
+        #     # Adding true values and making csv files if thy dont already exists
+        #     for idx, encoded_input in enumerate(self.inference_samples):
+        #         fp =  os.path.join( dir_infer,f"example_{idx:03d}.csv")
 
-                # If there file does not exists we add the true observed records
-                if not os.path.exists(fp):
+        #         # If there file does not exists we add the true observed records
+        #         if not os.path.exists(fp):
                     
-                    df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
-                    rst_rels = encoded_input.pop('orig_rst_rels')
-                    topics = encoded_input.pop('orig_topics')
-                    utterance = encoded_input.pop('orig_utt')
-                    prompt = encoded_input.pop('orig_prompt')
-                    claim = encoded_input.pop('orig_claim')
+        #             df = pd.DataFrame(columns=[ 'epoch' ,'rst_rels','topics','utterance'])
+        #             rst_rels = encoded_input.pop('orig_rst_rels')
+        #             topics = encoded_input.pop('orig_topics')
+        #             utterance = encoded_input.pop('orig_utt')
+        #             prompt = encoded_input.pop('orig_prompt')
+        #             claim = encoded_input.pop('orig_claim')
                     
-                    datum = { 'val_round': -1,
-                                'rst_rels': ', '.join( sum( rst_rels, ())),
-                                "topics": ', '.join(sum( topics, () )),
-                                "prompt":prompt,
-                                "claim": claim,
-                                "utterance":utterance[0] }
+        #             datum = { 'val_round': -1,
+        #                         'rst_rels': ', '.join( sum( rst_rels, ())),
+        #                         "topics": ', '.join(sum( topics, () )),
+        #                         "prompt":prompt,
+        #                         "claim": claim,
+        #                         "utterance":utterance[0] }
                 
-                    df = df.append(datum, ignore_index=True)
-                    df.to_csv( fp, index=False)
+        #             df = df.append(datum, ignore_index=True)
+        #             df.to_csv( fp, index=False)
                 
-                # Loading in dataframe of previous predictions
-                df = pd.read_csv(fp)    
+        #         # Loading in dataframe of previous predictions
+        #         df = pd.read_csv(fp)    
 
-                # creating predition andding to existing results
-                encoded_input.pop('orig_rst_rels', None)
-                encoded_input.pop('orig_topics', None)
-                encoded_input.pop('orig_utt', None)
-                encoded_input.pop('orig_prompt',None)
-                encoded_input.pop('orig_claim',None)
+        #         # creating predition andding to existing results
+        #         encoded_input.pop('orig_rst_rels', None)
+        #         encoded_input.pop('orig_topics', None)
+        #         encoded_input.pop('orig_utt', None)
+        #         encoded_input.pop('orig_prompt',None)
+        #         encoded_input.pop('orig_claim',None)
 
-                for k in encoded_input.keys():
-                    encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
+        #         for k in encoded_input.keys():
+        #             encoded_input[k] = encoded_input[k].to(torch.device('cuda:0') )
 
-                output = self.model.generate(encoded_input, **self.inference_generation_params)
-                output = output[0].detach().to('cpu')
-                decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
-                                    skip_special_tokens=True)
-                datum = {
-                    'val_round':df['val_round'].max()+1,
-                    'rst_rels': '',
-                    'topics':'',
-                    "prompt":'',
-                    "claim": '',
-                    'utterance':json.dumps(decoded_text) }
-                df = df.append(datum, ignore_index=True)
-                df.to_csv( fp, index=False)
-                # Saving to file
+        #         output = self.model.generate(encoded_input, **self.inference_generation_params)
+        #         output = output[0].detach().to('cpu')
+        #         decoded_text = self.model.nlg_tokenizer.e2m_tokenizer.decode(output,
+        #                             skip_special_tokens=True)
+        #         datum = {
+        #             'val_round':df['val_round'].max()+1,
+        #             'rst_rels': '',
+        #             'topics':'',
+        #             "prompt":'',
+        #             "claim": '',
+        #             'utterance':json.dumps(decoded_text) }
+        #         df = df.append(datum, ignore_index=True)
+        #         df.to_csv( fp, index=False)
+        #         # Saving to file
                    
     def create_data_loaders(self, shuffle=False, **kwargs):
        
@@ -1497,22 +1506,19 @@ class TrainingModule(pl.LightningModule):
                             warmup_steps, self.total_steps(), 0.5 )
 
             return [optimizer], [{ "scheduler":lr_schedule ,"interval": "step", "monitor":"val_loss"}]
-        
-        elif self.optimizer_type == "Adafactor":
-            optimizer = torch.optim.Adafactor(
-                self.model.parameters(), lr=self.learning_rate,
-                eps=(1e-30, 1e-3),
-                clip_threshold=1.0,
-                decay_rate=-0.8,
-                beta1=None,
-                weight_decay=0.0,
-                relative_step=False,
-                scale_parameter=True,
-                warmup_init=False
-                )
 
-            return [optimizer]
-            raise NotImplementedError
+        elif self.optimizer_type == "Adafactor":
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=False, 
+                                relative_step=False, warmup_init=False, lr=self.learning_rate )
+            
+            lr_scheduler = get_constant_schedule_with_warmup(optimizer,
+                                num_warmup_steps= 0.10*self.total_steps(),
+                                )
+        
+
+            return [optimizer], [{ "scheduler":lr_scheduler ,"interval": "step", "monitor":"val_loss"}]
+
+
 
     def return_params(self):
         params = {}
@@ -1772,3 +1778,4 @@ if __name__ == '__main__':
 
 # CUDA_VISIBLE_DEVICES=4 python3 finetune_nlgv3_dyploc.py --workers 6 --gpus 1 --batch_size 10 --version 0 --accumulate_grad_batches 3 --mode finetune --me 7 --max_input_len 290 --base_model_name "gpt2-medium" --prefix_prompt_max_len 30 --prefix_claim_max_len 40
    
+# CUDA_VISIBLE_DEVICES=3,4 python3 finetune_nlgv3_dyploc.py --workers 12 --gpus 2 --batch_size 16 --version 0 --accumulate_grad_batches 1 --mode finetune --me 7 --max_input_len 290 --base_model_name "gpt2-medium" --prefix_prompt_max_len 30 --prefix_claim_max_len 40

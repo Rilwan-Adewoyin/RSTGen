@@ -1592,12 +1592,14 @@ class SingleDataset(torch.utils.data.Dataset):
 
         create a custom index which sorts the entries by their length
     """
-    def __init__(self, file_path, tokenizer, inference_context_utt=0 ):
+    def __init__(self, file_path, tokenizer, inference_context_utt=0):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.inference_context_utt = inference_context_utt
                 
         self.data = pd.read_csv(self.fp, sep=',', header=0 )
+
+
                         
     def __len__(self):
         return len(self.data)
