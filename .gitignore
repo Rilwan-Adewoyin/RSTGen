@@ -27,6 +27,10 @@ rl_conv/pretrain/NLG/models/*
 rl_conv/pretrain/NLG/RST_sampler/*
 rl_conv/pretrain/NLG/RSTMarkov/*
 
+rl_conv/pretrain/Dyploc/*
+rl_conv/pretrain/pair-emnlp2020/*
+
+
 rl_conv/pretrain/.ipynb_checkpoints
 *bash.exe.stackdump
 *.ipynb
