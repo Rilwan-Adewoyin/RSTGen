@@ -11,7 +11,7 @@ from torch._C import Value
 #os.environ['NCCL_P2P_DISABLE'] = '1'
 os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
-#os.environ['CUDA_LAUNCH_BLOCKING']="1"
+#os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 import torch
 import torch.nn as nn
@@ -279,11 +279,6 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
                             self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'],
                             self.nlg_tokenizer.e2m_tokenizer.added_tokens_encoder['<|pad|>'] ]
         
-        # input_embeds, attention_mask, position_embeds, labels = self.nlg_tokenizer.compress_padding( li_input_ids , li_pad_token_ids,
-        #                                             input_embeds=input_embeds,
-        #                                              attention_mask=attention_mask,
-        #                                              position_embeds=position_embeds,
-        #                                              labels = labels) 
         input_embeds,position_embeds = self.nlg_tokenizer.compress_padding( li_input_ids , li_pad_token_ids,
                                                     input_embeds,
                                                     (position_embeds, 1)
@@ -602,13 +597,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         tknzd_utt = self.encode_utterance(utterance, pad_utterance, generate_mode ) 
         
             # calc the ending cumulative dim for, rst, topics, utt, segments,
-        # r_dim = self.context_len['rst']               # tnsr_rst_rels.shape[0]
-        # rt_dim = r_dim + self.context_len['topics']    # dr_dim + tnsr_topics_phrase.shape[1]
-        
-        # if pad_utterance == True:
-        #     utt_dim = rt_dim + self.context_len['utt']  
-        # else:
-        #     utt_dim = rt_dim + tknzd_utt.shape[-1]
+
 
         r_dim = rst_start_token.shape[-1] + tnsr_rst_rels.shape[-1]
         rt_dim = r_dim+ tnsr_topics_phrase.shape[-1]
@@ -617,12 +606,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         # Building Attention Mask
         attn_mask = torch.tril( torch.ones([utt_dim, utt_dim]), diagonal=rt_dim )
             #correcting for padding in rst section
-        # attn_mask[ r_dim-rst_pad_count:r_dim ,:] = 0
-        # attn_mask[ :, r_dim-rst_pad_count:r_dim] = 0
 
-            #correcting for padding in topic section
-        # attn_mask[ rt_dim-topics_pad_count: rt_dim, :  ] = 0
-        # attn_mask[ :, rt_dim-topics_pad_count: rt_dim ] = 0
 
             # Implementing causal masking for each topic subphrase 
                 # First, each topic subphrase only attends to other words within that topic subphrase (including ta token) and not the other topcics
@@ -1575,6 +1559,8 @@ class SingleDataset(torch.utils.data.Dataset):
         self.inference_context_utt = inference_context_utt
                 
         skiprows = self.line_start if self.line_start!=0 else None
+        
+        
         with open(self.fp, 'r') as f:
             if self.line_start == 0:
             
@@ -1588,8 +1574,9 @@ class SingleDataset(torch.utils.data.Dataset):
                     names=names, skiprows=skiprows,
                     nrows=(self.line_end-self.line_start) )
         
-        self.np_textlens = self.data.txt_preproc.str.len().to_numpy() #.argsort()
+
         
+
     def __len__(self):
         return (self.line_end - self.line_start)
     
