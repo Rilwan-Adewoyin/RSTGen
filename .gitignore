@@ -23,6 +23,7 @@ rl_conv/pretrain/NLG/dataset_opensubs
 rl_conv/pretrain/NLG/dataset_*
 rl_conv/pretrain/NLG/dataset*
 rl_conv/pretrain/NLG/models
+rl_conv/pretrain/NLG/tokenizers
 rl_conv/pretrain/NLG/models/*
 rl_conv/pretrain/NLG/RST_sampler/*
 rl_conv/pretrain/NLG/RSTMarkov/*

@@ -5,6 +5,9 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, GPT2LMH
 dirname = os.path.dirname(__file__)
 from datetime import date
 
+from itertools import (combinations, combinations_with_replacement, cycle,
+                       islice, permutations)
+
 import regex as re
 import torch
 from torch import nn
