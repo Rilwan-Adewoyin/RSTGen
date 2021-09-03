@@ -62,7 +62,7 @@ def main( batch_process_size = 10, mp_count=1 ):
         
                 
         # loading dataset
-        with open(os.path.join(dir_sourcedset,dset_section+".jsonl") ) as f:
+        with open(os.path.join(dir_sourcedset,dset_section+".jsonl"),"r" ) as f:
             li_records = [json.loads(line) for line in f]
             total_batch_count = int( math.ceil( len(li_records) / batch_size ) )
 

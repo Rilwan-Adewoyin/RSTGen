@@ -73,7 +73,7 @@ from transformers import CTRLTokenizer, CTRLLMHeadModel
 
 class TrainingModule(pl.LightningModule):
 
-    def __init__(self, max_input_len, batch_size=20, 
+    def __init__(self, max_input_len=1024, batch_size=20, 
                     dir_data=None, 
                     accumulate_grad_batches=1,
                     max_epochs=25,
@@ -402,26 +402,12 @@ class TrainingModule(pl.LightningModule):
             raise NotImplementedError   
     
     @staticmethod
-    def load_ctrlmodel(model_name="ctrl", model_version=0, max_input_len=None, device="cuda:0"):
+    def load_ctrlmodel(model_name="ctrl", model_version=0, device="cuda:0"):
         # Loading in NLG model
         checkpoint = TrainingModule.get_ckpt_file(f'./models/{model_name}/version_{model_version}/checkpoints')
-
-        # Getting tparams
-        tparams = {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'batch_size','precision','splits','optimizer_type',
-            'tag']}
-
-        tparams['mode'] = 'inference'
-
-        mparams =  {k:v for k,v in checkpoint['hyper_parameters'].items() if k in [
-            'model_name','max_input_len']}
-        
-        
-        if max_input_len != None:
-            mparams['max_input_len'] = max_input_len
             
         # Loading Training Module
-        training_module = TrainingModule(**tparams, model_params=mparams )
+        training_module = TrainingModule(mode='inference',model_name=model_name)
         training_module.load_state_dict(checkpoint['state_dict'])
         model = training_module.model
 

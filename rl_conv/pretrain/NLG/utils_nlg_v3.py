@@ -189,25 +189,58 @@ class RstTokenizerMixin():
     @staticmethod
     @lru_cache()
     def left_right_seq_from_root_to_edu_pos( edukp_pos: int):
-            # from root_pos find the sequence of left/rights down the tree to each edukp_pos
+        # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
-        parent_pos = edukp_pos
         li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
-        while abs(parent_pos)!=0:
-            parent_pos = (parent_pos-1 )/2
+        while edukp_pos!=0:
+            parent_pos = RstTokenizerMixin.parent_node(edukp_pos) #(parent_pos-1 )/2
             # child node is left child node if (child_node_pos-1 /2)==int
             # child node is right child node if (child_node_pos-1 /2)=/int
-            if parent_pos.is_integer():
-                child_position_rel_to_parent = 'L'
-            else:
+            if edukp_pos%2==0:
                 child_position_rel_to_parent = 'R'
+            else:
+                child_position_rel_to_parent = 'L'
             
             li_leftright_seq = [child_position_rel_to_parent] + li_leftright_seq
 
             parent_pos = math.floor(parent_pos)
-        
+            edukp_pos = parent_pos
+            
         return li_leftright_seq
+
+    @staticmethod
+    @lru_cache()
+    def seq_from_root_to_edu_pos( edukp_pos: int):
+        # from root_pos find the sequence of left/rights down the tree to each edukp_pos
+
+        parent_pos = edukp_pos
+        li_seq = [] #sequence of left-rights to get from the root to the edukp_pos
+
+        while parent_pos!=0:
+            parent_pos = RstTokenizerMixin.parent_node(parent_pos) #(parent_pos-1 )/2
+            # child node is left child node if (child_node_pos-1 /2)==int
+            # child node is right child node if (child_node_pos-1 /2)=/int
+
+            
+            li_seq = [parent_pos] + li_seq
+
+            parent_pos = math.floor(parent_pos)
+        
+        return li_seq
+
+    @staticmethod
+    @lru_cache()
+    def parent_node(edukp_pos: int ):
+        
+        if edukp_pos > 0:
+            parent_pos = (edukp_pos-1 )/2
+        else:
+            parent_pos = 0
+                    
+        parent_pos = math.floor(parent_pos)  
+            
+        return parent_pos
 
     def clamp_values(self, x, max):
 
@@ -216,8 +249,66 @@ class RstTokenizerMixin():
         # we use this since the rst positions in our tree are often too large 
         # for torch.long to handle
         while x.max() >= max:
-            x = np.where( x<max, x, np.floor_divide(x-1,2) )                    
+            x = np.where( x<=max, x, np.floor_divide(x-1,2) )                    
         return x.astype( int )
+
+    def rst_vectors(self, version="combinations", relations="all", **kwargs):
+            """
+                Allows the user to select partiuclar rst_vectors in order to control their output
+
+                version: rule to decide how to compose relations
+                relations: A list of the relations to utilise
+             """
+            count = kwargs.get('count',1)
+            assert ( count>0 and count<7 )
+
+            #selecting sub rst relations to evaluate
+            rst_rel_li = [ rel for rel in self.rst_rel_li if ( rel in relations) or relations=="all" ]
+
+            if version == "independent":
+                rst_names = [[rel] for rel in rst_rel_li]
+
+                rst_rel_encoded = [ self.rst_rel_labeler.transform(rel) for rel in rst_names]
+            
+            
+            if version=="combinations":
+                
+                combination_count = kwargs.get('combinatoric_count',3)
+                iter_rst_comb = combinations( rst_rel_li, combination_count )
+                li_rst_comb =  list(iter_rst_comb)
+                random.shuffle(li_rst_comb)
+                li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
+                
+                rst_names = li_rst_comb
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_comb) for rst_comb in li_rst_comb] #list of list of each relation
+            
+            elif version=="permutations":
+                
+                combination_count = kwargs.get('combinatoric_count',3)
+                iter_rst_perm = permutations( rst_rel_li, combination_count )
+                li_rst_perm =  iter_rst_perm.tolist()
+                random.shuffle(li_rst_perm)
+
+                li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]   
+                
+                rst_names = li_rst_perm
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_perm) for rst_perm in li_rst_perm] #list of list of each relation
+
+            elif version=="combinations_with_replacement":
+                
+                combination_count = kwargs.get('combinatoric_count',3)
+                iter_rst_combwr = combinations_with_replacement( rst_rel_li, combination_count )
+                li_rst_combwr =  list(iter_rst_combwr)
+                random.shuffle(li_rst_combwr)
+
+                li_rst_combwr = li_rst_combwr[: kwargs.get("return_count",10) ]           
+                rst_names = li_rst_combwr
+
+                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_combwr) for rst_combwr in li_rst_combwr] #list of list of each relation
+
+            return rst_rel_encoded, rst_names
+
+
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
     def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
@@ -242,6 +333,7 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
 
         x = self.fixed_rst_encoding(x)
         x = self.ffd( x )
+        x = torch.nn.functional.gelu(x)
         return x
     
     def make_rst_encoding(self):
@@ -318,14 +410,12 @@ class EffeciencyMixin():
 
         return batched_padded_subtens
 
-    def default_collate_pad(self, batch):
+    def default_collate_pad(self, batch, pad_values, pad_maxlens):
         r"""Puts each data field into a tensor with outer dimension batch size
-
-
         """
 
-        pad_values = self.pad_values
-        pad_maxlens = self.pad_maxlens
+        # pad_values = self.pad_values
+        # pad_maxlens = self.pad_maxlens
         elem = batch[0]
         elem_type = type(elem)
 
@@ -350,54 +440,93 @@ class EffeciencyMixin():
             dict_output = {}
             for key in elem:
                 li_ = [d[key] for d in batch if d[key]!=None]
-
-                #it = iter(batch)
-                if len(li_)>0:
+                if len(li_)<=1:
+                    continue
+                if len(li_)>1:
                     elem_size = len(li_[0])
                 else:
                     elem_size = 0
-
-                if not all(len(elem_) == elem_size for elem_ in li_):
+                
+                if key != 'decoder_cross_attention_mask':
+                    bool_size_check = all(len(elem_) == elem_size for elem_ in li_) 
+                else: 
+                    bool_size_check = all( len(elem_) == elem_size for elem_ in li_) and all( elem_.shape[1] == li_[0].shape[1] for elem_ in li_) 
+                
+                if not bool_size_check :
                     # raise RuntimeError('each element in list of batch should be of equal size')
                     # it = iter(batch)
                     largest_seq = max( len(elem_) for elem_ in li_ )
                     
-                    if li_[0].dim() == 1:
+                    try:
                         
-                        if largest_seq>pad_maxlens.get(key):
+                        if li_[0].dim() == 1:
+                            
+                            if largest_seq>pad_maxlens.get(key):
+                                for idx in range(len(li_)):
+                                    if len(li_[idx])>pad_maxlens.get(key):
+                                        li_[idx] = li_[idx][:pad_maxlens.get(key)]
+                            
+                            padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key,0) ) 
+                            #unstacking
+                            li_ = torch.unbind(padded_li, 0)
+                        
+                            #handling 2d attention mask
+                        elif li_[0].dim() == 2:
+                            
                             for idx in range(len(li_)):
-                                if len(li_[idx])>pad_maxlens.get(key):
-                                    li_[idx] = li_[idx][:pad_maxlens.get(key)]
-                        
-                        padded_li = pad_sequence(li_, batch_first=True, padding_value=pad_values.get(key,0) ) 
-                        #unstacking
-                        li_ = torch.unbind(padded_li, 0)
+                                elem_ = li_[idx]
+                                
+                                if key != 'decoder_cross_attention_mask':
+
+                                    missing_dims = min( largest_seq, pad_maxlens.get(key) )  - len(elem_)
+
+                                    if missing_dims > 0:
+                                        # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
+                                        # adding paddings value 0 - to dim 0 which reflects the 
+
+                                        elem_ = torch.nn.functional.pad( elem_, (0, missing_dims, 0, missing_dims), 
+                                            mode='constant', value=0.0 )
+                                                            
+                                    elif missing_dims < 0:
+                                        elem_ = elem_[ :missing_dims, :missing_dims ]
+                                
+                                else:
+                                    largest_seq_2 = max( elem_.shape[1] for elem_ in li_ )
+                                    
+                                    missing_dims1 = min( largest_seq, pad_maxlens.get('utt_tok_ids') )  - len(elem_)
+                                    missing_dims2 = min( largest_seq_2, pad_maxlens.get(key) ) - elem_.shape[1]
+
+                                    if missing_dims1 > 0:
+                                        # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
+                                        # adding paddings value 0 - to dim 0 which reflects the 
+
+                                        elem_ = torch.nn.functional.pad( elem_, (0, 0, 0, missing_dims1), 
+                                            mode='constant', value=pad_values.get(key) )
+                                    
+                                    elif missing_dims1 < 0:
+                                        elem_ = elem_[ :missing_dims1, : ]
+
+                                    if missing_dims2 > 0:
+                                        # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
+                                        # adding paddings value 0 - to dim 0 which reflects the 
+
+                                        elem_ = torch.nn.functional.pad( elem_, (0, missing_dims2, 0, 0), 
+                                            mode='constant', value=pad_values.get(key) )
+                                    
+                                    elif missing_dims2 < 0:
+                                        elem_ = elem_[ :, :missing_dims2 ]
+
+                                li_[idx] = elem_
                     
-                        #handling 2d attention mask
-                    elif li_[0].dim() == 2:
-                        
-                        for idx in range(len(li_)):
-                            elem_ = li_[idx]
-                            
-                            missing_dims = min( largest_seq, pad_maxlens.get(key) )  - len(elem_)
-
-                            if missing_dims > 0:
-                                # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
-                                # adding paddings value 0 - to dim 0 which reflects the 
-
-                                elem_ = torch.nn.functional.pad( elem_, (0, missing_dims, 0, missing_dims), 
-                                    mode='constant', value=0.0 )
-                                                    
-                            elif missing_dims < 0:
-                                elem_ = elem_[ :missing_dims, :missing_dims ]
-                            
-                            li_[idx] = elem_
-
-                dict_output[key] = self.default_collate_pad( li_ )    
+                    except Exception as e:
+                        print(key)
+                        raise e 
+                    
+                dict_output[key] = self.default_collate_pad( li_, pad_values, pad_maxlens )    
             return dict_output
 
         elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-            return elem_type(*(self.default_collate_pad(samples,pad_values) for samples in zip(*batch)))
+            return elem_type(*(self.default_collate_pad(samples,pad_values, pad_maxlens) for samples in zip(*batch)))
         
         elif isinstance(elem, collections.abc.Sequence):
             # check to make sure that the elements in batch have consistent size
@@ -406,12 +535,9 @@ class EffeciencyMixin():
             if not all(len(elem) == elem_size for elem in it):
                 raise RuntimeError('each element in list of batch should be of equal size')
             transposed = zip(*batch)
-            return [self.default_collate_pad(samples) for samples in transposed]
+            return [self.default_collate_pad(samples,pad_values, pad_maxlens) for samples in transposed]
         
         raise TypeError(default_collate_err_msg_format.format(elem_type))
-
-    
-    
 
 #endregion
 
