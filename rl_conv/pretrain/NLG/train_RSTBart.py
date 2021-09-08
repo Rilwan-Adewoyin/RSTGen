@@ -76,9 +76,6 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
             bsz, 1, tgt_len, src_len).to(dtype)
 
     else:
-        print(ndim)
-        print(mask.size())
-        print("\n\n\n\n")
         raise ValueError("Encoder Attention mask should have three dimensions Decoder Attention mask should have two dimensions")
         
     inverted_mask = 1.0 - expanded_mask
@@ -134,6 +131,7 @@ class RSTBart(BartForConditionalGeneration):
         self.max_len_rst = config.max_len_rst
         self.max_len_key_phrase = config.max_len_key_phrase
         self.max_len_utt = config.max_len_utt
+        self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
 
         self.model.forward = types.MethodType(bart_forward, self.model)
         self.model.encoder.forward = types.MethodType(
@@ -417,7 +415,7 @@ class RSTBart(BartForConditionalGeneration):
         parser.add_argument('--max_len_key_phrase', type=int, default=40)
         parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
-        parser.add_argument('--rst_tree_aligned_attention', type=lambda x: bool(int(x), default=False))
+        parser.add_argument('--rst_tree_aligned_attention', type=lambda x: bool(int(x)), default=False)
         mparams = parser.parse_known_args()[0]
         return mparams
 
@@ -636,7 +634,7 @@ def bart_forward(self,
 
 class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
 
-    rst_tree_aligned_attention = False  # rst_tree_aligned_attention
+    rst_tree_aligned_attention = False  
 
     # Setting up RST
 
@@ -695,7 +693,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         # Building Encoder Attention Mask
         attention_mask = self.prepare_encoder_attention_mask(
-            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=None, li_kp_rstpos=None)
+            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=rst_pos, li_kp_rstpos=li_kp_rstpos)
 
         # Creating labels/targets
         if utterance_prompt != None:
@@ -902,12 +900,12 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # so first re-order in terms of depth (which is just re-ordering by value )
             # Then starting from the end of the list find the direct tree of nodes to the parent
             # Store each pos and parent in a dictionary of keys=child, value=parent
-            dict_rstpos_parents = {}
+            dict_rstpos_parents = torch.nn.ParameterDict()
 
             for pos in torch.cat((rst_pos, li_kp_rstpos)):
-
+                
                 if pos not in dict_rstpos_parents:
-                    dict_rstpos_parents[pos] = torch.tensor(
+                    dict_rstpos_parents[str(pos)] = torch.tensor(
                         RSTTokenizer.seq_from_root_to_edu_pos(pos), dtype=torch.long)
 
             # Creating vector indicating which positions attend to which other positions
@@ -915,7 +913,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             li_tens_pos = []
             for pos in rst_pos:
 
-                li_parent_tree = dict_rstpos_parents[pos]
+                li_parent_tree = dict_rstpos_parents[str(pos)]
 
                 pos_tree_aligned_attn = (
                     all_pos[..., None] == li_parent_tree).any(-1).squeeze()  # TODO, this
@@ -925,7 +923,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # Each kp pos is an already an edu
             li_tens_kp = []
             for pos in li_kp_rstpos:
-                li_parent_tree = dict_rstpos_parents[pos]
+                li_parent_tree = dict_rstpos_parents[str(pos)]
 
                 pos_tree_aligned_attn = (
                     all_pos[..., None] == li_parent_tree).any(-1).squeeze()  # TODO, this
@@ -1025,7 +1023,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 class RSTBart_TrainingModule(pl.LightningModule):
 
     def __init__(self,
-
                  mconfig,
                  batch_size=20,
                  dir_data=None,
@@ -1051,7 +1048,10 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
                                                                                                                'max_rst_depth',
-                                                                                                               'max_len_utt', 'rst_pos_maxidx'] if hasattr(mconfig, name)
+                                                                                                               'max_len_utt', 
+                                                                                                               'rst_pos_maxidx',
+                                                                                                               'rst_pos_maxidx',
+                                                                                                               'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
 
@@ -1266,8 +1266,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         else:
 
             trainer_vars = {'accelerator': 'ddp',
-                            'plugins': DeepSpeedPlugin(stage=2)
-                            }
+                            'plugins': DeepSpeedPlugin(stage=2) }
 
         if tparams['mode'] in ["train_new"]:
 
@@ -1283,8 +1282,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     num_sanity_val_steps=0,
                                                     # replace_sampler_ddp=False,
                                                     replace_sampler_ddp=False,
-                                                    # limit_train_batches=20,
-                                                    # limit_val_batches=7,
+                                                    
+                                                    limit_train_batches=20,
+                                                    limit_val_batches=7,
                                                    
                                                     #track_grad_norm = True,
                                                     # overfit_batches=25,
