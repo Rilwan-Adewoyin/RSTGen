@@ -1575,8 +1575,6 @@ class SingleDataset(torch.utils.data.Dataset):
                     nrows=(self.line_end-self.line_start) )
         
 
-        
-
     def __len__(self):
         return (self.line_end - self.line_start)
     

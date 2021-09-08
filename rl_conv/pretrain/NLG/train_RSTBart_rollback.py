@@ -29,12 +29,6 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-sharing_strategy = "file_system"
-torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
-def set_worker_sharing_strategy(worker_id: int) -> None:
-    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
 
 
 import torch.distributed as dist
@@ -1307,10 +1301,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     # val_check_interval=None,
                                                     
                                                     num_sanity_val_steps=0,
-                                                    # replace_sampler_ddp=False,
                                                     replace_sampler_ddp=False,
-                                                    limit_train_batches= len( training_module.train_dl )-100 ,
-                                                    limit_val_batches= len( training_module.val_dl )-100 ,
                                                    
                                                     #track_grad_norm = True,
                                                     # overfit_batches=25,
@@ -1325,7 +1316,6 @@ class RSTBart_TrainingModule(pl.LightningModule):
             checkpoint = RSTBart_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
-            # training_module.load_state_dict(checkpoint['state_dict'])
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
