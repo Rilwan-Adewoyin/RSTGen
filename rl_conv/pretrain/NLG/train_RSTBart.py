@@ -1,10 +1,8 @@
 import os
 
-from transformers.utils.dummy_pt_objects import LED_PRETRAINED_MODEL_ARCHIVE_LIST
 
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
 import tokenizers
@@ -29,13 +27,6 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-sharing_strategy = "file_system"
-torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
-def set_worker_sharing_strategy(worker_id: int) -> None:
-    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
-
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -67,8 +58,6 @@ from utils_nlg_v3 import EmbeddingRstPos
 
 from multiprocessing import freeze_support
 
-
-
 T_co = TypeVar('T_co', covariant=True)
 
 # patched method
@@ -91,9 +80,6 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
             bsz, 1, tgt_len, src_len).to(dtype)
 
     else:
-        print(ndim)
-        print(mask.size())
-        print("\n\n\n\n")
         raise ValueError("Encoder Attention mask should have three dimensions Decoder Attention mask should have two dimensions")
         
     inverted_mask = 1.0 - expanded_mask
@@ -149,7 +135,7 @@ class RSTBart(BartForConditionalGeneration):
         self.max_len_rst = config.max_len_rst
         self.max_len_key_phrase = config.max_len_key_phrase
         self.max_len_utt = config.max_len_utt
-
+        self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
         self.model.forward = types.MethodType(bart_forward, self.model)
         self.model.encoder.forward = types.MethodType(
             bart_encoder_forward, self.model.encoder)
@@ -426,7 +412,7 @@ class RSTBart(BartForConditionalGeneration):
         parser.add_argument('--max_len_key_phrase', type=int, default=40)
         parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
-        parser.add_argument('--rst_tree_aligned_attention', type=lambda x: bool(int(x), default=False))
+        parser.add_argument('--rst_tree_aligned_attention', type=lambda x: bool(int(x)), default=False)
         mparams = parser.parse_known_args()[0]
         return mparams
 
@@ -644,9 +630,7 @@ def bart_forward(self,
     )
 
 class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
-#class RSTTokenizer(BartTokenizer, utils.EffeciencyMixin, utils.RstTokenizerMixin):
-
-    rst_tree_aligned_attention = False  # rst_tree_aligned_attention
+    rst_tree_aligned_attention = False  
 
     # Setting up RST2
 
@@ -705,7 +689,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         # Building Encoder Attention Mask
         attention_mask = self.prepare_encoder_attention_mask(
-            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=None, li_kp_rstpos=None)
+            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=rst_pos, li_kp_rstpos=li_kp_rstpos)
 
         # Creating labels/targets
         if utterance_prompt != None:
@@ -924,12 +908,12 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # so first re-order in terms of depth (which is just re-ordering by value )
             # Then starting from the end of the list find the direct tree of nodes to the parent
             # Store each pos and parent in a dictionary of keys=child, value=parent
-            dict_rstpos_parents = {}
+            dict_rstpos_parents = torch.nn.ParameterDict()
 
             for pos in torch.cat((rst_pos, li_kp_rstpos)):
-
+                
                 if pos not in dict_rstpos_parents:
-                    dict_rstpos_parents[pos] = torch.tensor(
+                    dict_rstpos_parents[str(pos)] = torch.tensor(
                         RSTTokenizer.seq_from_root_to_edu_pos(pos), dtype=torch.long)
 
             # Creating vector indicating which positions attend to which other positions
@@ -937,7 +921,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             li_tens_pos = []
             for pos in rst_pos:
 
-                li_parent_tree = dict_rstpos_parents[pos]
+                li_parent_tree = dict_rstpos_parents[str(pos)]
 
                 pos_tree_aligned_attn = (
                     all_pos[..., None] == li_parent_tree).any(-1).squeeze()  # TODO, this
@@ -947,7 +931,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # Each kp pos is an already an edu
             li_tens_kp = []
             for pos in li_kp_rstpos:
-                li_parent_tree = dict_rstpos_parents[pos]
+                li_parent_tree = dict_rstpos_parents[str(pos)]
 
                 pos_tree_aligned_attn = (
                     all_pos[..., None] == li_parent_tree).any(-1).squeeze()  # TODO, this
@@ -1048,7 +1032,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 class RSTBart_TrainingModule(pl.LightningModule):
 
     def __init__(self,
-
                  mconfig,
                  batch_size=20,
                  dir_data=None,
@@ -1074,7 +1057,10 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
                                                                                                                'max_rst_depth',
-                                                                                                               'max_len_utt', 'rst_pos_maxidx'] if hasattr(mconfig, name)
+                                                                                                               'max_len_utt', 
+                                                                                                               'rst_pos_maxidx',
+                                                                                                               'rst_pos_maxidx',
+                                                                                                               'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
 
@@ -1116,6 +1102,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
             'position_ids': mconfig.max_len_key_phrase + mconfig.max_len_rst,
 
         }
+        self.RSTTokenizer.pad_maxlens = self.pad_maxlens
 
         if self.mode in ['train_new', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
@@ -1136,7 +1123,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
             train_params_to_save = self.return_params()
             mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
-                lambda p: p != 'self', inspect.getargspec(RSTBart_Config.__init__).args))}
+                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTBart_Config.__init__).parameters.keys()) ))}
 
             self.hparams.update({**train_params_to_save, **mparams_to_save})
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
@@ -1278,7 +1265,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience= 4, #max(2,int(0.5/val_check_interval) ) ,            
+            patience= max(2,int(1/val_check_interval) ) ,            
             verbose=False,
             mode='min'
         )
@@ -1286,13 +1273,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
         callbacks.append(early_stop_callback)
 
         if tparams['gpus'] in [0, 1]:
-            accelerator = None
             trainer_vars = {}
         else:
 
             trainer_vars = {'accelerator': 'ddp',
-                            'plugins': DeepSpeedPlugin(stage=2)
-                            }
+                            'plugins': DeepSpeedPlugin(stage=2) }
 
         if tparams['mode'] in ["train_new"]:
             a = len( training_module.train_dl )
@@ -1304,20 +1289,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
                                                     val_check_interval=val_check_interval,
-                                                    # val_check_interval=None,
-                                                    
-                                                    num_sanity_val_steps=0,
-                                                    # replace_sampler_ddp=False,
-                                                    replace_sampler_ddp=False,
-                                                    limit_train_batches= len( training_module.train_dl )-100 ,
-                                                    limit_val_batches= len( training_module.val_dl )-100 ,
                                                    
-                                                    #track_grad_norm = True,
-                                                    # overfit_batches=25,
-                                                    #fast_dev_run=2,
-                                                    # log_gpu_memory=True,
+                                                    num_sanity_val_steps=0,
+                                                    replace_sampler_ddp=False,
+                                                    replace_sampler_ddp=False,
                                                     **trainer_vars,
-                                                    move_metrics_to_cpu=True,
                                                     )
 
         elif tparams['mode'] in ["train_cont", "inference"]:
@@ -1325,25 +1301,18 @@ class RSTBart_TrainingModule(pl.LightningModule):
             checkpoint = RSTBart_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
-            # training_module.load_state_dict(checkpoint['state_dict'])
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                                                     logger=tb_logger,
 
                                                     precision=tparams['precision'],
-                                                    callbacks=callbacks, accelerator=accelerator,
+                                                    callbacks=callbacks, 
                                                     val_check_interval=val_check_interval,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-                                                    #track_grad_norm = True,
-                                                    # overfit_batches=25,
-                                                    # fast_dev_run=2,
-                                                    # log_gpu_memory=True
                                                     **trainer_vars,
-                                                    limit_train_batches= len( training_module.train_dl )-100 ,
-                                                    limit_val_batches= len( training_module.val_dl )-100 ,
-                                                    move_metrics_to_cpu=True,
+                                       
                                                     )
 
             # load callback states
@@ -1714,10 +1683,11 @@ class DataLoaderGenerator():
                          for ls, fs in zip(line_starts, files_sizes)]
             inference = False
             bs = self.batch_size
-            workers = max( 1, self.workers -2 )
+            workers = max( 0, self.workers -2 )
+
             shuffle=True
 
-            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch, self.pad_values, self.pad_maxlens)
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
 
             prefetch_factor = 1
             drop_last=False
@@ -1732,7 +1702,7 @@ class DataLoaderGenerator():
             bs = self.batch_size if self.batch_size != -1 else 30
             workers = 1 if self.workers==1 else 2
 
-            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch, self.pad_values, self.pad_maxlens)
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
             prefetch_factor = 1
             drop_last=False
 
@@ -1744,7 +1714,7 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             def collate_fn(batch): return self.tokenizer.default_collate_pad(
-                batch, self.pad_values, self.pad_maxlens)
+                batch)
             workers = 3
             shuffle = False
             prefetch_factor = 4
@@ -1786,11 +1756,7 @@ class DataLoaderGenerator():
 
                                                  pin_memory=False,
                                                  collate_fn=collate_fn,
-                                                #  reload_dataloaders_every_epoch=True,
-                                                prefetch_factor = prefetch_factor,
-                                                # timeout=60,
-                                                worker_init_fn =set_worker_sharing_strategy
-                                               
+                                                prefetch_factor = prefetch_factor,                                               
                                                 )
 
                                                  
@@ -1811,8 +1777,6 @@ class SingleDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.line_start = line_start
         self.line_end = line_end
-        self.cache = False
-
         self.inference = inference
 
         skiprows = self.line_start if self.line_start != 0 else None
@@ -1857,7 +1821,6 @@ class SingleDataset(torch.utils.data.Dataset):
             # len of keyphrase
             self.np_keyphrase_lens = np.array([len(li_pos_kp) + len(sum([pos_kp[1].split(
                 ) for pos_kp in json.loads(li_pos_kp)], [])) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
-            # +len(li_pos_kp) factor in the number of kp tokens we add
 
             dict_cached_order = {'np_textlens': self.np_textlens,
                                 'np_rstlens': self.np_rstlens,
@@ -1914,49 +1877,35 @@ class SingleDataset(torch.utils.data.Dataset):
 
     def getitem_extract_datum(self, index):
 
-        try:
-            datum = self.data[index]
+        datum = self.data[index]
 
-            # region RST
-            # try:
-            li_rst = json.loads(datum['rst'])
-            # list of dictionaries
-            rst_rels = [_dict['rel'] for _dict in li_rst]
-            rst_ns = [_dict['ns'] for _dict in li_rst]
-            rst_pos = [_dict['pos'] for _dict in li_rst]
+        # region RST
+        li_rst = json.loads(datum['rst'])
+        # list of dictionaries
+        rst_rels = [_dict['rel'] for _dict in li_rst]
+        rst_ns = [_dict['ns'] for _dict in li_rst]
+        rst_pos = [_dict['pos'] for _dict in li_rst]
 
-            # sorting the order to be left to right in binary tree
-            sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: (
-                RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]))]
-            rst_rels = [rst_rels[idx] for idx in sorted_order]
-            rst_ns = [rst_ns[idx] for idx in sorted_order]
-            rst_pos = [rst_pos[idx] for idx in sorted_order]
-            # endregion
+        # sorting the order to be left to right in binary tree
+        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: (
+            RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]))]
+        rst_rels = [rst_rels[idx] for idx in sorted_order]
+        rst_ns = [rst_ns[idx] for idx in sorted_order]
+        rst_pos = [rst_pos[idx] for idx in sorted_order]
+        # endregion
 
-            # Key phrase scores
-            li_pos_kp = json.loads(datum['li_pos_kp'] )
-            # top 3 important prhases from utterance
-            li_kp_rstpos, li_kp = zip(*li_pos_kp)
-            li_kp_rstpos = tuple(int(pos) for pos in li_kp_rstpos)
+        # Key phrase scores
+        li_pos_kp = json.loads(datum['li_pos_kp'] )
+        # top 3 important prhases from utterance
+        li_kp_rstpos, li_kp = zip(*li_pos_kp)
+        li_kp_rstpos = tuple(int(pos) for pos in li_kp_rstpos)
 
-            # Utterance
-            utterance = ujson.loads(datum['txt_preproc'])
+        # Utterance
+        utterance = ujson.loads(datum['txt_preproc'])
 
-            #pos and edus
-            dict_pos_edu = json.loads(datum['dict_pos_edu'])        
-        
-        except Exception as e:
-            
-            rst_rels = []
-            rst_ns = []
-            rst_pos =[]
-
-            li_pos_kp = []
-            li_kp_rstpos = []
-            utterance = ""
-            dict_pos_edu = {}
-
-
+        #pos and edus
+        dict_pos_edu = json.loads(datum['dict_pos_edu'])        
+   
         return rst_rels, rst_ns, rst_pos, li_kp, li_kp_rstpos, utterance, dict_pos_edu
 
 class SizedOrdered_Sampler(Sampler[int]):
@@ -2209,7 +2158,6 @@ def main(tparams={}, mparams={}):
     RSTBart_TrainingModule.start(trainer, tparams, training_module, mparams)
 
 if __name__ == '__main__':
-    freeze_support()
 
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 

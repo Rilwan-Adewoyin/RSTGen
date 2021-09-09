@@ -9,7 +9,7 @@ from torch._C import Value
 #os.environ["TOKENIZERS_PARALLELISM"] = "false"
 #os.environ["NCCL_P2P_LEVEL"] = "3"
 #os.environ['NCCL_P2P_DISABLE'] = '1'
-os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
+#os.environ['NCCL_SOCKET_IFNAME'] =  'lo' 
 #os.environ['NCCL_SOCKET_IFNAME'] =  'enp3s0'
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
@@ -426,7 +426,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         if os.path.isdir(dir_tokenizer):
             self.e2m_tokenizer = AutoTokenizer.from_pretrained(dir_tokenizer,use_fast=False)
 
-            self.special_token_count = len(eval(self.e2m_tokenizer.special_tokens_map.get('additional_special_tokens','')))
+            self.special_token_count = 2
 
         # retreiving   base tokenizer from online or from local distillgpt2
         else:
@@ -1049,18 +1049,18 @@ class TrainingModule(pl.LightningModule):
 
        
         if tparams['gpus'] in [0,1]:
-            accelerator=None
-            trainer_vars = None
+            #accelerator=None
+            trainer_vars = {}
         else:
 
-            trianer_vars = { 'accelerator':'ddp',
+            trainer_vars = { 'accelerator':'ddp',
                     'plugins':DeepSpeedPlugin( stage=2 )
                         }
 
         
         if tparams['mode'] in ["train_new"]:
             
-            trainer = pl.Trainer.from_argparse_args(argparse.Namespace( **tparams),
+            trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                         progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                         default_root_dir=tparams['dir_checkpoints'],
                         logger=tb_logger,
@@ -1075,7 +1075,7 @@ class TrainingModule(pl.LightningModule):
                         #overfit_batches=25,
                         #fast_dev_run=2, 
                         #log_gpu_memory=True
-                        **trianer_vars,
+                        **trainer_vars,
 
                         )
             #training_module.init_data()
@@ -1488,7 +1488,7 @@ class DataLoaderGenerator():
         
         #getting all files from all different subreddits/types of conversation
         fns = glob.glob(  os.path.join( utils.get_path(dir_data),"*", "*") )
-        fns = [fn for fn in fns if os.path.split(fn)[-1]!="lock"]
+        fns = [fn for fn in fns if os.path.split(fn)[-1]!="lock" and "dict_len" not in fn]
         #getting number of utterances records in each file
         files_sizes = [ int(fn[-10:]) for fn in fns]
 
@@ -1499,6 +1499,7 @@ class DataLoaderGenerator():
             #line_ends = [ 100 for ls,fs in zip(line_starts, files_sizes)  ]
             ifc = 0
             bs = self.bs
+            shuffle = True
         
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
@@ -1514,6 +1515,7 @@ class DataLoaderGenerator():
             #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             ifc = 0
             bs = self.bs
+            shuffle = False
 
         elif split_name == 'inference':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
@@ -1522,22 +1524,25 @@ class DataLoaderGenerator():
             sampler = None
             ifc = self.inference_context_utt
             bs = 1
+            shuffle = False
 
         li_dsets = [ SingleDataset(_f, self.tokenizer, line_start, line_end, ifc) 
                         for _f, line_start, line_end in zip(fns, line_starts, line_ends) ]
             
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
                                 
-        if self.gpus <= 1 or split_name not in ['inference','test'] :
-            sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle )
-        else:
-            sampler = SizedOrdered_DistributedSampler( concat_dset, bs, shuffle=shuffle, gpus=self.gpus )
+        # if self.gpus <= 1 or split_name not in ['inference','test'] :
+        #     sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle )
+        # else:
+        #     sampler = SizedOrdered_DistributedSampler( concat_dset, bs, shuffle=shuffle, gpus=self.gpus )
+        sampler = None
  
         
         dataloader = torch.utils.data.DataLoader(concat_dset, batch_size=bs,
                 num_workers=self.workers,
                 sampler = sampler,
-                collate_fn =  self.tokenizer.default_collate_pad
+                collate_fn =  self.tokenizer.default_collate_pad,
+                shuffle = shuffle
                 )
         return dataloader
 
@@ -1620,7 +1625,6 @@ class SingleDataset(torch.utils.data.Dataset):
         rst_rels = [ rst_rels[idx] for idx in sorted_order ]
         rst_ns = [ rst_ns[idx] for idx in sorted_order ]
         rst_pos = [ rst_pos[idx] for idx in sorted_order ]
-            
         #endregion
 
         
@@ -1832,7 +1836,10 @@ if __name__ == '__main__':
         os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = '65302'
 
-    main(vars(tparams), vars(mparams))
+    try:
+        main(vars(tparams), vars(mparams))
+    except Exception:
+        print(traceback.format_exc())
 
 
 # dullduks server version 1 - No Freezing, Full RST
