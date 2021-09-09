@@ -1806,6 +1806,7 @@ class SingleDataset(torch.utils.data.Dataset):
         self.inference = inference
 
         skiprows = self.line_start if self.line_start != 0 else None
+        
         with open(self.fp, 'r') as f:
             if self.line_start == 0:
 
@@ -1822,15 +1823,15 @@ class SingleDataset(torch.utils.data.Dataset):
         fp_cached_order = os.path.join(os.path.dirname(
             file_path), f"dict_lens_{line_start}_to_{line_end}.pkl")
 
-        # if os.path.exists( fp_cached_order):
-        #     os.remove(fp_cached_order)
+        # # if os.path.exists( fp_cached_order):
+        # #     os.remove(fp_cached_order)
 
-    
+        # rollback
         if os.path.exists(fp_cached_order):
             dict_cached_order = pickle.load(open(fp_cached_order, "rb"))
             self.np_textlens = dict_cached_order['np_textlens']
-            self.np_rstlens = dict_cached_order['np_rstlens']
-            self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
+        #     self.np_rstlens = dict_cached_order['np_rstlens']
+        #     self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
 
         else:
             # len of text
@@ -1840,22 +1841,22 @@ class SingleDataset(torch.utils.data.Dataset):
                 [self.tokenizer.encode(ujson.loads(txt), return_tensors='np', add_special_tokens=False,
                                     truncation=False, padding='do_not_pad').size for txt in self.data.txt_preproc.values.tolist()]
             )
-            # len of rst
-            self.np_rstlens = np.array(
-                [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
+        #     # len of rst
+        #     self.np_rstlens = np.array(
+        #         [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
 
-            # len of keyphrase
-            self.np_keyphrase_lens = np.array([len(li_pos_kp) + len(sum([pos_kp[1].split(
-                ) for pos_kp in json.loads(li_pos_kp)], [])) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
-            # +len(li_pos_kp) factor in the number of kp tokens we add
+        #     # len of keyphrase
+        #     self.np_keyphrase_lens = np.array([len(li_pos_kp) + len(sum([pos_kp[1].split(
+        #         ) for pos_kp in json.loads(li_pos_kp)], [])) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
+        #     # +len(li_pos_kp) factor in the number of kp tokens we add
 
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens}
+        #     dict_cached_order = {'np_textlens': self.np_textlens,
+        #                         'np_rstlens': self.np_rstlens,
+        #                         'np_keyphrase_lens': self.np_keyphrase_lens}
 
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
+        #     pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
 
-        self.max_rst_len = np.zeros((self.__len__()), dtype=np.int32).tolist()
+        # self.max_rst_len = np.zeros((self.__len__()), dtype=np.int32).tolist()
         
         self.data = self.data.to_dict('records')
 
@@ -1896,7 +1897,7 @@ class SingleDataset(torch.utils.data.Dataset):
                 li_kp_rstpos=li_kp_rstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                max_rst_len=self.max_rst_len[index]
+                max_rst_len= 30 #self.max_rst_len[index]
             )
   
 
@@ -1959,16 +1960,22 @@ class SizedOrdered_Sampler(Sampler[int]):
     def __init__(self, data_source, batch_size, shuffle ) -> None:
         self.data_source = data_source
         self.batch_size = batch_size
+        
+        #rollback
         np_txt_lens = np.concatenate(
             [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-        np_rst_lens = np.concatenate(
-            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-        np_key_phrase_lens = np.concatenate(
-            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
+        # np_rst_lens = np.concatenate(
+        #     [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
+        # np_key_phrase_lens = np.concatenate(
+        #     [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
 
         # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
         np_ordered_lens = np.lexsort(
-            (np_rst_lens, np_key_phrase_lens, np_txt_lens))
+            # (np_rst_lens,
+            #  np_key_phrase_lens, 
+             np_txt_lens
+            #  )
+        )
         # We Randomly re-arrange them in batches of batch size
         
         #v1
@@ -1990,29 +1997,31 @@ class SizedOrdered_Sampler(Sampler[int]):
             random.shuffle(li_chunked_lens)
 
         # Getting max sizes for rst in each chunk
-        self.li_chunk_max_rst_len = [
-            np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
+        #rollback
+        # self.li_chunk_max_rst_len = [
+        #     np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
 
         if self.batch_size != -1:
             self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
         else:
             self.li_chunked_ordered_lens = li_chunked_lens  
+        
+        #rollback
+        # # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
+        # for chunk_idx, data_idxs in enumerate(li_chunked_lens):
+        #     max_rst_len = self.li_chunk_max_rst_len[chunk_idx]
 
-        # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-        for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-            max_rst_len = self.li_chunk_max_rst_len[chunk_idx]
+        #     for data_idx in data_idxs:
+        #         dataset_idx = bisect.bisect_right(
+        #             self.data_source.cumulative_sizes, data_idx)
 
-            for data_idx in data_idxs:
-                dataset_idx = bisect.bisect_right(
-                    self.data_source.cumulative_sizes, data_idx)
+        #         if dataset_idx == 0:
+        #             sample_idx = data_idx
+        #         else:
+        #             sample_idx = data_idx - \
+        #                 self.data_source.cumulative_sizes[dataset_idx - 1]
 
-                if dataset_idx == 0:
-                    sample_idx = data_idx
-                else:
-                    sample_idx = data_idx - \
-                        self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                self.data_source.datasets[dataset_idx].max_rst_len[sample_idx] = max_rst_len
+        #         self.data_source.datasets[dataset_idx].max_rst_len[sample_idx] = max_rst_len
 
     def __iter__(self):
         return iter(self.li_chunked_ordered_lens)
@@ -2199,7 +2208,7 @@ def main(tparams={}, mparams={}):
     RSTBart_TrainingModule.start(trainer, tparams, training_module, mparams)
 
 if __name__ == '__main__':
-    freeze_support()
+    # freeze_support()
 
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 
