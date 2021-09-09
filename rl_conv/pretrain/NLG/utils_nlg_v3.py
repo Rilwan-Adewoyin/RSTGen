@@ -196,7 +196,7 @@ class RstTokenizerMixin():
 
         li_leftright_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
-        while edukp_pos!=0:
+        while edukp_pos>0:
             parent_pos = RstTokenizerMixin.parent_node(edukp_pos) #(parent_pos-1 )/2
             # child node is left child node if (child_node_pos-1 /2)==int
             # child node is right child node if (child_node_pos-1 /2)=/int
@@ -209,6 +209,9 @@ class RstTokenizerMixin():
 
             parent_pos = math.floor(parent_pos)
             edukp_pos = parent_pos
+        
+        if edukp_pos<0:
+            edukp_pos = 0
             
         return li_leftright_seq
 
@@ -220,7 +223,7 @@ class RstTokenizerMixin():
         parent_pos = edukp_pos
         li_seq = [] #sequence of left-rights to get from the root to the edukp_pos
 
-        while parent_pos!=0:
+        while parent_pos>0:
             parent_pos = RstTokenizerMixin.parent_node(parent_pos) #(parent_pos-1 )/2
             # child node is left child node if (child_node_pos-1 /2)==int
             # child node is right child node if (child_node_pos-1 /2)=/int
@@ -252,7 +255,7 @@ class RstTokenizerMixin():
         # we use this since the rst positions in our tree are often too large 
         # for torch.long to handle
         while x.max() >= max:
-            x = np.where( x<=max, x, np.floor_divide(x-1,2) )                    
+            x = np.where( x<max, x, np.floor_divide(x-1,2) )                    
         return x.astype( int )
 
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
@@ -413,17 +416,16 @@ class EffeciencyMixin():
 
         return batched_padded_subtens
 
-    def default_collate_pad(self, batch, pad_values, pad_maxlens):
+    def default_collate_pad(self, batch): #, pad_values, pad_maxlens):
         r"""Puts each data field into a tensor with outer dimension batch size
         """
 
-        # pad_values = self.pad_values
-        # pad_maxlens = self.pad_maxlens
+        pad_values = self.pad_values
+        pad_maxlens = self.pad_maxlens
         elem = batch[0]
         elem_type = type(elem)
 
         if isinstance(elem, torch.Tensor):
-                    
             out = None
             if torch.utils.data.get_worker_info() is not None:
                 # If we're in a background process, concatenate directly into a
@@ -525,11 +527,11 @@ class EffeciencyMixin():
                         print(key)
                         raise e 
                     
-                dict_output[key] = self.default_collate_pad( li_, pad_values, pad_maxlens )    
+                dict_output[key] = self.default_collate_pad( li_ )    
             return dict_output
 
         elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-            return elem_type(*(self.default_collate_pad(samples,pad_values, pad_maxlens) for samples in zip(*batch)))
+            return elem_type(*(self.default_collate_pad(samples) for samples in zip(*batch)))
         
         elif isinstance(elem, collections.abc.Sequence):
             # check to make sure that the elements in batch have consistent size
@@ -538,7 +540,7 @@ class EffeciencyMixin():
             if not all(len(elem) == elem_size for elem in it):
                 raise RuntimeError('each element in list of batch should be of equal size')
             transposed = zip(*batch)
-            return [self.default_collate_pad(samples,pad_values, pad_maxlens) for samples in transposed]
+            return [self.default_collate_pad(samples ) for samples in transposed]
         
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 

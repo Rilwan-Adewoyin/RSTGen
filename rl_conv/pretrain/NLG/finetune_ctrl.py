@@ -635,7 +635,8 @@ class DataLoaderGenerator():
                 collate_fn=lambda batch: self.tokenizer.default_collate_pad(batch),
                 #pin_memory=True,
                 pin_memory=False,
-                sampler=sampler )
+                sampler=sampler,
+                multiprocessing_context=torch.multiprocessing.get_context('spawn') )
         else:
             dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
                 shuffle=shuffle, num_workers=self.workers,
@@ -907,6 +908,8 @@ def parse_model_specific_args(parent_parser):
 
 
 if __name__ == '__main__':
+    torch.multiprocessing.set_start_method('spawn', force=True)
+
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False) 
     
     # add model specific args
