@@ -7,7 +7,7 @@ from datetime import date
 
 from itertools import (combinations, combinations_with_replacement, cycle,
                        islice, permutations)
-
+import random
 import regex as re
 import torch
 from torch import nn
@@ -114,7 +114,8 @@ def monkey_save_model(self, trainer, filepath: str):
 
     # delegate the saving to the trainer
     if self.save_function is not None:
-        self.save_function(filepath, self.save_weights_only)
+        # self.save_function(filepath, self.save_weights_only)
+        trainer.save_checkpoint(filepath)
     
     self.to_yaml()
 #endregion
@@ -254,8 +255,10 @@ class RstTokenizerMixin():
             # to reduce to
         # we use this since the rst positions in our tree are often too large 
         # for torch.long to handle
+
         while x.max() >= max:
-            x = np.where( x<max, x, np.floor_divide(x-1,2) )                    
+            x = np.where( x<max, x, np.floor_divide(x-1,2) )     
+
         return x.astype( int )
 
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
@@ -333,6 +336,9 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
         
         
     def forward(self, x ):
+        if x.numel()==0:
+            return x
+            
         while x.max() >= self.max_rst_index:
             x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
    
@@ -420,6 +426,9 @@ class EffeciencyMixin():
         r"""Puts each data field into a tensor with outer dimension batch size
         """
 
+        if isinstance(batch,collections.abc.Mapping):
+            return batch
+            
         pad_values = self.pad_values
         pad_maxlens = self.pad_maxlens
         elem = batch[0]
@@ -498,8 +507,8 @@ class EffeciencyMixin():
                                 else:
                                     largest_seq_2 = max( elem_.shape[1] for elem_ in li_ )
                                     
-                                    missing_dims1 = min( largest_seq, pad_maxlens.get('utt_tok_ids') )  - len(elem_)
-                                    missing_dims2 = min( largest_seq_2, pad_maxlens.get(key) ) - elem_.shape[1]
+                                    missing_dims1 = min( largest_seq, pad_maxlens.get(key)[0] )  - len(elem_)
+                                    missing_dims2 = min( largest_seq_2, pad_maxlens.get(key)[1] ) - elem_.shape[1]
 
                                     if missing_dims1 > 0:
                                         # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
