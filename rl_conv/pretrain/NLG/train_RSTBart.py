@@ -1108,7 +1108,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                                                                                'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
-        self.model = RSTBart(mconfig, new_vocab_size=len(self.RSTTokenizer) )
+        self.model = RSTBart(mconfig, new_vocab_size=len(self.RSTTokenizer))
 
         self.pad_values = {'rst_start_token': mconfig.pad_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
@@ -1318,7 +1318,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 10,       
+            patience = 20,       
             verbose=False,
             mode='min'
         )
@@ -1785,7 +1785,7 @@ class DataLoaderGenerator():
             line_ends = [ls+int(fs*self.splits['val'])
                          for ls, fs in zip(line_starts, files_sizes)]
             
-            shuffle = False
+            shuffle = True
             inference = False
             bs = self.batch_size
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
@@ -2273,4 +2273,7 @@ if __name__ == '__main__':
         print(traceback.format_exc())
 
 # dullduks server version 1 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 3 --gpus 1 --tag RstBart --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTBart --learning_rate 3e-4 
+# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RstBart --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTBart --learning_rate 3e-4 
+
+# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 32 --version 12  --precision 16 --mode train_new --workers 14 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention scheme"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 13  --precision 16 --mode train_new --workers 14 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with aligned attention scheme"
