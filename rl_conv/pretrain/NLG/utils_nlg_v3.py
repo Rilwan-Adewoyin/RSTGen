@@ -83,7 +83,6 @@ def load_pretrained_tokenizer_local( model_name='NLG'):
     
     return res
 
-
 def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     dated_trained = date.today().strftime("%d-%m-%Y")
     
@@ -574,8 +573,6 @@ class EffeciencyMixin():
 
 #region Generation Mixins
 
-    # region Huggingface v4.7.0
-    # endregion
 
     #region Huggingface v4.2.0
 class GenerationMixin42_gpt:
