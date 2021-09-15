@@ -1218,6 +1218,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                                                                                'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
+
+        self.model = RSTBart(mconfig, new_vocab_size=len(self.RSTTokenizer))
+
         if mconfig.rst_tree_aligned_attention: 
             self.model.RSTTokenizer = self.RSTTokenizer
 
@@ -1439,7 +1442,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 10,       
+            patience = 20,       
             verbose=False,
             mode='min'
         )
@@ -1470,7 +1473,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     limit_train_batches = 0.05,
                                                     limit_val_batches = 0.05,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=10,
+                                                    num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     # track_grad_norm=2,
                                                     # gradient_clip_val=1.5,
@@ -1486,8 +1489,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    limit_train_batches = 100,
-                                                    limit_val_batches = 10,
+                                                    limit_train_batches = 0.15,
+                                                    limit_val_batches = 0.15,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
@@ -1881,7 +1884,7 @@ class DataLoaderGenerator():
 
         # getting all files from all different subreddits/types of conversation
         #debugging
-        fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))[:10]
+        fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
             fn)[-1] != "lock" and "dict_len" not in fn]
                 
@@ -1906,7 +1909,7 @@ class DataLoaderGenerator():
             line_ends = [ls+int(fs*self.splits['val'])
                          for ls, fs in zip(line_starts, files_sizes)]
             
-            shuffle = False
+            shuffle = True
             inference = False
             bs = self.batch_size
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
@@ -2392,5 +2395,8 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# dullduks server version 1 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 3 --gpus 1 --tag RstBart --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTBart --learning_rate 3e-4 
+# enigma 3 gpus normal attention
+# CUDA_VISIBLE_DEVICES=0,1,2 python3 train_RSTBart.py --batch_size 32 --version 12  --precision 16 --mode train_new --workers 28 --scale_grad_by_freq 1 --max_epochs 10 --gpus 3 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention scheme"
+
+# dullducks 1 gpu focused attention
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 13  --precision 16 --mode train_new --workers 14 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 20 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with aligned attention scheme" --accumulate_grad_batches 3
