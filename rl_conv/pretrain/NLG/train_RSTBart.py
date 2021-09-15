@@ -60,6 +60,19 @@ from multiprocessing import freeze_support
 
 T_co = TypeVar('T_co', covariant=True)
 
+mp1 = os.path.abspath(os.path.join('..'))
+mp2 = "../DockerImages/feng_hirst_rst_parser"
+mp3 = "../DockerImages/feng_hirst_rst_parser/src"
+mp4 = "../DockerImages/feng_hirst_rst_parser/model"
+modules_paths = [mp1, mp2, mp3, mp4]
+import sys
+
+for path_ in modules_paths:
+    if path_ not in sys.path:
+        sys.path.append(path_)
+from torch.nn.utils.rnn import pad_sequence
+
+from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 # patched method
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -75,9 +88,10 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
             bsz, 1, tgt_len, src_len).to(dtype)
 
     elif ndim == 3:
-        bsz, tgt_len, src_len = mask.size()
+        bsz, tgt_len_, src_len = mask.size()
+        
         expanded_mask = mask[:, None, :, :].expand(
-            bsz, 1, tgt_len, src_len).to(dtype)
+            bsz, 1, tgt_len_, src_len).to(dtype)
 
     else:
         raise ValueError("Encoder Attention mask should have three dimensions Decoder Attention mask should have two dimensions")
@@ -98,7 +112,7 @@ class RSTBart_Config(BartConfig):
                  max_len_key_phrase=30,
                  max_len_utt=256,
                  rst_tree_aligned_attention=False,
-                 rst_pos_maxidx=4094,
+                 max_rst_pos=4094,
                  **kwargs):
 
         super().__init__(**kwargs)
@@ -116,7 +130,7 @@ class RSTBart_Config(BartConfig):
                            'Explanation', 'Joint', 'Manner-Means', 'Topic-Comment',
                            'Summary', 'Temporal', 'Topic-Change', 'same-unit', 'textual-organization']
         self.rst_ns_li = ['NN', 'NS', 'SN']
-        self.rst_pos_maxidx = rst_pos_maxidx
+        self.max_rst_pos = max_rst_pos
         self.rst_added_tokens = 2
         #self.force_bos_token_to_be_generated = True
         self.forced_bos_token_id=self.bos_token_id
@@ -159,13 +173,13 @@ class RSTBart(BartForConditionalGeneration):
         self.embed_rst_ns.weight.data.normal_(
             mean=0.0, std=self.config.init_std**(1/2))
 
-        self.embed_rst_pos = EmbeddingRstPos(max_rst_index=self.config.rst_pos_maxidx,
+        self.embed_rst_pos = EmbeddingRstPos(max_rst_index=self.config.max_rst_pos,
                                              max_rst_level=RSTTokenizer.node_level(
-                                                 self.config.rst_pos_maxidx),
+                                                 self.config.max_rst_pos),
                                              rst_encoding_ndim=self.config.d_model,
                                              init_val=self.config.init_std**(1/2) )
 
-        self.embed_token_type = torch.nn.Embedding(self.config.rst_added_tokens + 1, self.config.d_model,  # -1 since <|pad|> is a special token. +1 for padding token
+        self.embed_token_type = torch.nn.Embedding(self.config.rst_added_tokens + 1, self.config.d_model,  # -1 since <pad> is a special token. +1 for padding token
                                                    padding_idx=self.config.rst_added_tokens,
                                                    scale_grad_by_freq=self.scale_grad_by_freq)  # The maximum value this can take is based on the different types of input
         self.embed_token_type.weight.data.normal_(
@@ -179,7 +193,7 @@ class RSTBart(BartForConditionalGeneration):
                 rst_ns=None,
                 rst_pos=None,
                 key_phrase_ids=None,
-                li_kp_rstpos=None,
+                li_kprstpos=None,
                 position_ids=None,
                 attention_mask=None,
 
@@ -189,6 +203,9 @@ class RSTBart(BartForConditionalGeneration):
                 input_ids=None,
                 decoder_attention_mask=None,
                 decoder_cross_attention_mask=None,
+                
+                decoder_context_rst_pos=None,
+                decoder_edu_rstpos=None,
 
                 head_mask=None,
                 decoder_head_mask=None,
@@ -225,7 +242,7 @@ class RSTBart(BartForConditionalGeneration):
                 rst_ns,
                 rst_pos,
                 key_phrase_ids,
-                li_kp_rstpos,
+                li_kprstpos,
                 position_ids)
 
         outputs = self.model(input_ids,
@@ -240,6 +257,8 @@ class RSTBart(BartForConditionalGeneration):
                              past_key_values=past_key_values,
                              inputs_embeds=inputs_embeds,
                              decoder_inputs_embeds=decoder_inputs_embeds,
+                            decoder_context_rst_pos=decoder_context_rst_pos,
+                            decoder_edu_rstpos=decoder_edu_rstpos,
                              use_cache=use_cache,
                              output_attentions=output_attentions,
                              output_hidden_states=output_hidden_states,
@@ -277,20 +296,23 @@ class RSTBart(BartForConditionalGeneration):
         rst_ns,
         rst_pos,
         key_phrase_ids,
-        li_kp_rstpos,
+        li_kprstpos,
         position_ids
      ):
         # RST context embedding
         rst_start_token_embed = self.model.encoder.embed_tokens(rst_start_token_id) * self.model.encoder.embed_scale
         rst_rel_embed = self.embed_rst_rels(rst_rel) 
         rst_ns_embed = self.embed_rst_ns(rst_ns)
-        rst_pos_embed = self.embed_rst_pos(rst_pos)
+        rst_pos_embed = self.embed_rst_pos(rst_pos) 
+
+        if rst_pos_embed.numel() == 0:
+            rst_pos_embed = torch.zeros_like(rst_rel_embed) 
         rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) * self.model.encoder.embed_scale
 
         # Key Phrase context embedding
         topics_phrase_embed = self.model.encoder.embed_tokens(
             key_phrase_ids) * self.model.encoder.embed_scale
-        topics_rst_pos_embed = self.embed_rst_pos(li_kp_rstpos) * self.model.encoder.embed_scale
+        topics_rst_pos_embed = self.embed_rst_pos(li_kprstpos) * self.model.encoder.embed_scale
         topics_embed = topics_rst_pos_embed + topics_phrase_embed
 
         inputs_embeds = torch.cat([
@@ -300,8 +322,10 @@ class RSTBart(BartForConditionalGeneration):
         ], axis=-2)
 
         # Position Embedding
-        position_embed = super(type(self.model.encoder.embed_positions), self.model.encoder.embed_positions).forward(
-            position_ids + self.model.encoder.embed_positions.offset)
+        position_embed = super(type(self.model.encoder.embed_positions), 
+                            self.model.encoder.embed_positions).forward(
+                                position_ids + self.model.encoder.embed_positions.offset)
+        
         inputs_embeds += position_embed
 
         return inputs_embeds
@@ -314,20 +338,49 @@ class RSTBart(BartForConditionalGeneration):
         head_mask=None,
         decoder_head_mask=None,
         cross_attn_head_mask=None,
+        decoder_cross_attention_mask=None,
         use_cache=None,
         encoder_outputs=None,
+        decoder_context_rst_pos = None,
+        decoder_edu_rstpos = None,
         **kwargs
         ):
         # cut decoder_input_ids if past is used
+        if self.rst_tree_aligned_attention:
+
+            if past is not None:
+                # calculating the new cross attention mask
+                curr_edu_pos = self.get_curr_edu_pos(decoder_input_ids, decoder_edu_rstpos)
+
+
+                decoder_input_ids = decoder_input_ids[:, -1:]
+                
+                
+                decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rst_pos,
+                                                                                                past = None,
+                                                                                                curr_edu_pos = curr_edu_pos )
+            
+            else:
+                # calculating the new cross attention mask
+                curr_edu_pos = self.get_curr_edu_pos(decoder_input_ids, decoder_edu_rstpos)
+                
+                if decoder_input_ids.shape[1]!= decoder_cross_attention_mask.shape[-2]:
+                    decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rst_pos,
+                                                                                                past = decoder_cross_attention_mask,
+                                                                                                curr_edu_pos = curr_edu_pos )
+
+                
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
+        
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
             "past_key_values": past,
             "decoder_input_ids": decoder_input_ids,
             "attention_mask": attention_mask,
+            "decoder_cross_attention_mask":decoder_cross_attention_mask,
             "head_mask": head_mask,
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
@@ -337,7 +390,7 @@ class RSTBart(BartForConditionalGeneration):
 
     def _prepare_encoder_decoder_kwargs_for_generation(
         self, input_ids: torch.LongTensor, model_kwargs
-    ) -> Dict[str, Any]:
+     ) -> Dict[str, Any]:
         if "encoder_outputs" not in model_kwargs:
             # retrieve encoder hidden states
             encoder = self.get_encoder()
@@ -348,7 +401,7 @@ class RSTBart(BartForConditionalGeneration):
                                 'rst_ns',
                                 'rst_pos',
                                 'key_phrase_ids',
-                                'li_kp_rstpos',
+                                'li_kprstpos',
                                 'position_ids']
             }
             encoder_kwargs = {
@@ -362,6 +415,28 @@ class RSTBart(BartForConditionalGeneration):
                 input_ids, return_dict=True, **encoder_kwargs)
         return model_kwargs
 
+    def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos ):
+        """
+        li_edu_rst_pos: the list of possible edus positions for each text in this batch
+        """
+        
+        
+        # Decode the output ids to get a text
+        li_gen_text = [ self.RSTTokenizer.decode(ids, skip_special_tokens=True) for ids in decoder_input_ids ]  
+        
+                            # run edu splitter on text generated so far
+        li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= ujson.dumps([li_gen_text]), 
+                                            skip_parsing=True, redirect_output=True)
+        # calculating edu of current text
+        li_edu_count = [ ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
+        
+        li_edu_rstpos =  [ tens if not ( -1 in tens) else tens[: (tens==-1).nonzero(as_tuple=True)[0] ] for tens in edu_rstpos.unbind(dim=0) ]
+        
+        curr_edu_pos = [ edu_rstpos[ min( edu_rstpos.numel()-1 , max(0 ,edu_count-1) ) ] for edu_count, edu_rstpos in zip(li_edu_count, li_edu_rstpos) ]
+        
+            
+        return curr_edu_pos
+    
     @classmethod
     def load_model(cls, model_name="RSTBart", model_version=0, mparams_new={}, device="cuda:0"):
 
@@ -559,6 +634,9 @@ def bart_forward(self,
                  past_key_values=None,
                  inputs_embeds=None,
                  decoder_inputs_embeds=None,
+
+                            decoder_context_rst_pos=None,
+                            decoder_edu_rstpos=None,
                  use_cache=None,
                  output_attentions=None,
                  output_hidden_states=None,
@@ -647,20 +725,20 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     rst_ns_labeler = sklp.LabelEncoder()
     rst_ns_labeler.fit(rst_ns_li)
 
-    rst_pos_maxidx = 4094
+    max_rst_pos = 4094
 
     # Setting up context lengths
     max_len_rst = 12
     max_len_key_phrase = 24
     max_len_utt = 1024
-    max_len_key_phrase = 4094
+    max_rst_pos = 4094
 
     special_token_count = 2
 
-    rst_start_token = "<|rst|>"
-    keyphrase_start_token = "<|kp|>"
+    rst_start_token = "<rst>"
+    keyphrase_start_token = "<kp>"
 
-    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kp_rstpos,
+    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None, max_rst_len=None):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -675,8 +753,8 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         rst_rel, rst_ns, rst_pos, rst_pad_len = self.encode_rst(
             rst_rel, rst_ns, rst_pos, max_rst_len)
-        key_phrase_ids, li_kp_rstpos, ta_tokens_pos, kp_phrase_lens = self.encode_keyphrase(
-            li_kp, li_kp_rstpos)
+        key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens = self.encode_keyphrase(
+            li_kp, li_kprstpos)
 
         r_len = 1 + rst_rel.shape[-1]
         rt_len = r_len + key_phrase_ids.shape[-1]
@@ -690,15 +768,20 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         # Building Encoder Attention Mask
             # prepending 0 to rst_pos in order to factor in 
         attention_mask = self.prepare_encoder_attention_mask(
-            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]) , li_kp_rstpos=li_kp_rstpos)
+            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]),
+            li_kprstpos=li_kprstpos)
 
+        # Creating labels/targets
         # Creating labels/targets
         if utterance_prompt != None:
             # utterance_prompt = self.bos_token + utterance_prompt
-            utterance_prompt = self.eos_token + self.bos_token + " " + utterance_prompt
+            utterance_prompt = self.eos_token + self.bos_token + utterance_prompt
 
             utt_prompt_tok_ids = self.encode(
-                utterance_prompt, add_special_tokens=False,
+                utterance_prompt, 
+                add_special_tokens=False,
+                # add_special_tokens=True,
+
                 return_attention_mask=False,
                 padding='do_not_pad',
                         truncation=False,
@@ -708,30 +791,44 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             )[0]
 
             decoder_input_ids = utt_prompt_tok_ids.contiguous()
-            utt_len = utt_prompt_tok_ids.shape[-1]
+            # utt_len = utt_prompt_tok_ids.shape[-1]
+            # labels = None
+
+            #labels = utt_tok_ids
             labels = None
+            # decoder_input_ids = shift_tokens_right(utt_prompt_tok_ids[:-1].unsqueeze(0), 
+            #     self.pad_token_id ,
+            #     decoder_start_token_id=self.eos_token_id)[0]
+            utt_len = decoder_input_ids.shape[-1]
+                
 
         if utterance != None:
-            utterance = self.eos_token + self.bos_token + " " + utterance + self.eos_token
-                        
+            #utterance = self.eos_token + self.bos_token + " " + utterance + self.eos_token
+            utterance = self.bos_token + utterance + self.eos_token + self.pad_token
             utt_tok_ids = self.encode(
                 utterance, 
-                add_special_tokens=False,
+               add_special_tokens=False,
+                # add_special_tokens=True,
+
                 return_attention_mask=False,
                 padding='do_not_pad',
                         truncation=True,
-                max_length=self.max_len_utt+1,
+                #                max_length=self.max_len_utt+1,
+                max_length=self.max_len_utt,
+
                 return_tensors='pt',
                 return_length=False,
             )[0]
 
-            decoder_input_ids = utt_tok_ids[:-1].contiguous()
+            labels = utt_tok_ids
+            decoder_input_ids = shift_tokens_right(labels.unsqueeze(0), 
+                self.pad_token_id ,
+                decoder_start_token_id=self.eos_token_id)[0]
             utt_len = decoder_input_ids.shape[-1]
-            labels = utt_tok_ids[1:].contiguous()
-
+                
 
         decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat( [ rst_pos[0:1], rst_pos]),
-                                                                         li_kp_rstpos, utt_len,
+                                                                         li_kprstpos, utt_len,
                                                                          rt_len)
 
         # Changing attention masks to compensate for the Variable RST batching
@@ -743,20 +840,29 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             decoder_cross_attention_mask[:, r_len-rst_pad_len:r_len] = 0
             decoder_cross_attention_mask[r_len-rst_pad_len:r_len, :] = 0
 
-        return {'rst_start_token_id': self.rst_start_token_id,
+        output =  {'rst_start_token_id': self.rst_start_token_id,
                 
                 'rst_rel': rst_rel, 'rst_ns': rst_ns, 'rst_pos': rst_pos,
 
                 'key_phrase_ids': key_phrase_ids.contiguous(),
-                'li_kp_rstpos': li_kp_rstpos.contiguous(),
+                'li_kprstpos': li_kprstpos.contiguous(),
+
                 'position_ids': position_ids.contiguous(),
 
                 'attention_mask': attention_mask,
                 'labels': labels,
 
                 'decoder_input_ids': decoder_input_ids,
-                'decoder_cross_attention_mask': decoder_cross_attention_mask
+                'decoder_cross_attention_mask': decoder_cross_attention_mask,
+                
                 }
+        
+        if self.rst_tree_aligned_attention:
+            output['decoder_context_rst_pos']= torch.cat( [ rst_pos[0:1], rst_pos, li_kprstpos ] )
+            output['decoder_edu_rstpos'] = torch.tensor( sorted( list( int(val) for val in dict_pos_edu.keys()), key=RSTTokenizer.edukp_pos_sort_function ) , 
+                                                dtype=torch.int32 )
+        
+        return output
 
     def encode_rst(self, rst_rels, rst_ns, rst_pos, variable_padding_size=None):
         """Converts rst_rels in a series of vectors
@@ -768,56 +874,64 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 rst_ns
             Also includes an encoding for rst_ns and rst_pos
         """
-        try:
-            rst_rel_encoded = self.rst_rel_labeler.transform(
-                rst_rels) 
-            tnsr_rels = torch.LongTensor(rst_rel_encoded)
-
-            # Encoding the rst ns
-            rst_ns_encoded = self.rst_ns_labeler.transform(
-                rst_ns)  
-            tnsr_ns = torch.LongTensor(rst_ns_encoded)
-
-            tnsr_pos = torch.LongTensor(self.clamp_values(
-                np.array(rst_pos), utils.MAX_LONG_VALUE))  
-
-            # padding ns and pos
-            # The ns and pos embedding layer uses the index value 0 as a padding index
-            # For this index the vector is initialized to zer0 and as such never updates
-            len_ = tnsr_rels.shape[0]
-
-            if variable_padding_size != None:
-
-                if len_ > self.max_len_rst - 1:
-                    tnsr_rels   = tnsr_rels[:self.max_len_rst-1]
-                    tnsr_ns     = tnsr_ns[:self.max_len_rst-1]
-                    tnsr_pos    = tnsr_pos[:self.max_len_rst-1]
-                    _ = 0
-
-                else:
-                    _ = min( variable_padding_size,self.max_len_rst - 1) - len_ 
-                    if _ != 0:
-                        tnsr_rels = torch.nn.functional.pad(
-                            tnsr_rels, (0, _), value=self.pad_values['rst_rel'])
-                        tnsr_ns = torch.nn.functional.pad(
-                            tnsr_ns, (0, _), value=self.pad_values['rst_ns'])
-                        tnsr_pos = torch.nn.functional.pad(
-                            tnsr_pos, (0, _), value=self.pad_values['rst_pos'])
-
-            else:
-                if len_ > self.max_len_rst - 1:
-                    tnsr_rels = tnsr_rels[:self.max_len_rst-1]
-                    tnsr_ns = tnsr_ns[:self.max_len_rst-1]
-                    tnsr_pos = tnsr_pos[:self.max_len_rst-1]
-                _ = 0
         
-        except Exception as e:
-            tnsr_rels = torch.tensor( [], dtype=torch.long )
-            tnsr_ns = torch.tensor( [], dtype=torch.long )
-            tnsr_pos = torch.tensor( [], dtype=torch.long )
-            _ = 0
+        rst_rel_encoded = self.rst_rel_labeler.transform(
+            rst_rels) 
+        tnsr_rels = torch.LongTensor(rst_rel_encoded)
 
-        return tnsr_rels, tnsr_ns, tnsr_pos, _
+        # Encoding the rst ns
+        rst_ns_encoded = self.rst_ns_labeler.transform(
+            rst_ns)  
+        tnsr_ns = torch.LongTensor(rst_ns_encoded)
+
+        tnsr_pos = torch.LongTensor(self.clamp_values(
+            np.array(rst_pos), utils.MAX_LONG_VALUE))  
+
+        # padding ns and pos
+        # The ns and pos embedding layer uses the index value 0 as a padding index
+        # For this index the vector is initialized to zer0 and as such never updates
+        len_ = tnsr_rels.shape[0]
+
+        if variable_padding_size != None:
+
+            pad_len = min( variable_padding_size, self.max_len_rst) -1
+
+            if len_ > pad_len:
+                tnsr_rels   = tnsr_rels[:pad_len]
+                tnsr_ns     = tnsr_ns[:pad_len]
+                tnsr_pos    = tnsr_pos[:pad_len]
+                diff = 0
+
+            elif len_ < pad_len:
+                diff = pad_len - len_
+                tnsr_rels = torch.nn.functional.pad(
+                    tnsr_rels, (0, diff), value=self.pad_values['rst_rel'])
+                tnsr_ns = torch.nn.functional.pad(
+                    tnsr_ns, (0, diff), value=self.pad_values['rst_ns'])
+                tnsr_pos = torch.nn.functional.pad(
+                    tnsr_pos, (0, diff), value=self.pad_values['rst_pos'])
+            else:
+                diff = 0
+
+        else:
+            if len_ > self.max_len_rst - 1:
+                tnsr_rels = tnsr_rels[:self.max_len_rst-1]
+                tnsr_ns = tnsr_ns[:self.max_len_rst-1]
+                tnsr_pos = tnsr_pos[:self.max_len_rst-1]
+                diff = 0
+
+            elif len_ < self.max_len_rst +1 :
+                diff = self.max_len_rst -1 - len_
+                tnsr_rels = torch.nn.functional.pad(
+                    tnsr_rels, (0, diff), value=self.pad_values['rst_rel'])
+                tnsr_ns = torch.nn.functional.pad(
+                    tnsr_ns, (0, diff), value=self.pad_values['rst_ns'])
+                tnsr_pos = torch.nn.functional.pad(
+                    tnsr_pos, (0, diff), value=self.pad_values['rst_pos'])
+            else:
+                diff = 0
+        
+        return tnsr_rels, tnsr_ns, tnsr_pos, diff
 
     def encode_keyphrase(self, topics, kp_rst_pos):
         """[summary]
@@ -832,10 +946,10 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             Returns:
                 [type]: [description]
         """
-        try:
+        if len(topics)!=0:
             max_len = self.max_len_key_phrase
 
-            str_topics = ''.join(['<|kp|> '+topic for topic in topics])
+            str_topics = ''.join(['<kp> '+topic for topic in topics])
             dict_encoding = self(str_topics, add_special_tokens=False,
                                 return_attention_mask=False,
                                 truncation=True,
@@ -849,17 +963,16 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # Repeating each score in the case where the score is allocated to a phrase topic which is broken down into constituent words
             # e.g. topics - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
             # have to do it after tokenization due to bytepair encoding
-            # get index of where <|kp|> tokens occur
+            # get index of where <kp> tokens occur
             kp_idxs = np.where(
                 topic_phrases == self.keyphrase_start_token_id_np )[0]
-
 
             topic_phrases = torch.LongTensor(topic_phrases)
 
             # filtering out idxs if index is larger than padding value
             kp_idxs = kp_idxs[kp_idxs < max_len]
 
-            # get difference in index position between <|kp|> tag n and <|kp|> tag n+1 ( for final tag use difference between tag and end of list)
+            # get difference in index position between <kp> tag n and <kp> tag n+1 ( for final tag use difference between tag and end of list)
             kp_phrase_lens = np.diff(kp_idxs, append=topic_phrases.numel())
 
             # copies each score phrase_len times to cover that phrase and handles case where there is no phrase
@@ -868,16 +981,15 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             kp_rst_pos = sum(kp_rst_pos, [])  # flattening list
             tnsr_rst_pos = torch.LongTensor(self.clamp_values(
                 np.array(kp_rst_pos), utils.MAX_LONG_VALUE))
-
-        except Exception as e:
-            topic_phrases = np.array([])
+        else:
+            topic_phrases = torch.LongTensor([])
             tnsr_rst_pos = torch.LongTensor([])
-            kp_idxs = np.array([],dtype=np.int64)
-            kp_phrase_lens = np.array([], dtype=np.int32)
-            
+            kp_idxs = np.array([])
+            kp_phrase_lens = np.array([])
+
         return topic_phrases, tnsr_rst_pos, kp_idxs, kp_phrase_lens
 
-    def prepare_encoder_attention_mask(self, r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=None, li_kp_rstpos=None):
+    def prepare_encoder_attention_mask(self, r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=None, li_kprstpos=None):
 
         if self.rst_tree_aligned_attention == False:
             attention_mask = torch.ones([rt_len, rt_len])
@@ -906,14 +1018,14 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             # Store each pos and parent in a dictionary of keys=child, value=parent
             dict_rstpos_parents = torch.nn.ParameterDict()
 
-            for pos in torch.cat((rst_pos, li_kp_rstpos)):
+            for pos in torch.cat((rst_pos, li_kprstpos)):
                 
                 if pos not in dict_rstpos_parents:
                     dict_rstpos_parents[str(pos)] = torch.nn.parameter.Parameter( torch.tensor(
                         RSTTokenizer.seq_from_root_to_edu_pos(pos) + [int(pos)] , dtype=torch.long), requires_grad=False )
 
-            # Creating vector indicating which rst encoding positions attend to which other rst encoding positions
-            all_pos = torch.cat((rst_pos, li_kp_rstpos))
+            # Creating vector indicating which positions attend to which other positions
+            all_pos = torch.cat((rst_pos, li_kprstpos))
             li_tens_pos = []
             for pos in all_pos:
 
@@ -924,64 +1036,97 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
                 li_tens_pos.append(pos_tree_aligned_attn)
 
-            attention_mask = torch.stack(li_tens_pos, dim=0)
+            attention_mask = torch.stack(li_tens_pos, dim=0).to(torch.float)
 
         return attention_mask
 
-    def prepare_cross_attention_mask(self, dict_pos_edu, rst_pos, li_kp_rstpos,
-                                     utt_len=None, rt_len=None):
+    def prepare_cross_attention_mask(self, dict_pos_edu=None, rst_pos=None, li_kprstpos=None,
+                                     utt_len=None, rt_len=None, past=None, curr_edu_pos=None, context_rst_pos=None):
 
         if self.rst_tree_aligned_attention:
+            #training
+            if past == None and curr_edu_pos==None:
+                li_attn_vectors = []
+                # dict_rstpos_parents = {}
+                dict_rstpos_parents = torch.nn.ParameterDict()
+                
+                all_pos = torch.cat((rst_pos, li_kprstpos))
 
-            li_attn_vectors = []
-            # dict_rstpos_parents = {}
-            dict_rstpos_parents = torch.nn.ParameterDict()
+                li_pos_edu_idslen = sorted( [[pos, edu, None] for pos, edu in dict_pos_edu.items()],
+                                        key=lambda x: RSTTokenizer.edukp_pos_sort_function(
+                                            int(x[0]) )
+                                        )
+                # Adding special tokens to edu to mirror the encoded utterance
+                li_pos_edu_idslen[0][1] =  self.eos_token + self.bos_token + li_pos_edu_idslen[0][1]
+                
+                li_pos_edu_idslen[-1][1] =  li_pos_edu_idslen[-1][1] + self.eos_token
+                
+                
+                # Find the tokenized length of each edu
+                # And get the seqeunce of parents for each edu position
+                # Note this ignores the length of the start and end token
+                for idx in range(len(li_pos_edu_idslen)):
+                                    
+                    li_pos_edu_idslen[idx][2] = len( self.encode(
+                        li_pos_edu_idslen[idx][1], add_special_tokens=False) )
+
+                    # if idx==0:
+                    #     li_pos_edu_idslen[idx][2] += 2
+                    # elif idx==len(li_pos_edu_idslen):
+                    #     li_pos_edu_idslen[idx][2] += 1
+                    
+                    pos = li_pos_edu_idslen[idx][0]
+                    
+                    if pos not in dict_rstpos_parents:
+                        dict_rstpos_parents[pos] = torch.nn.parameter.Parameter( torch.tensor(
+                            RSTTokenizer.seq_from_root_to_edu_pos(int(pos)) + [int(pos)] , dtype=torch.long), requires_grad=False )
+
+
+                # Then cycle through these lengths, and create the masking over the encoder
+                    # Each edu should only attend to the rst and keyp phrases with pos in its parents pos
+                    # Remember to create a 3 extras, for the starting eos and bos token and the ending eos token
+                for pos, edu_txt, edu_txt_len in li_pos_edu_idslen:
+
+                    li_parent_tree = dict_rstpos_parents[pos]
+
+                    pos_tree_aligned_attn = (
+                        all_pos[..., None] == li_parent_tree).any(-1).squeeze() 
+                    
+                    # Repeating by tokenized length of EDU
+                    pos_tree_aligned_attn = einops.repeat(pos_tree_aligned_attn,
+                        'd -> l d', l=edu_txt_len )
+
+                    li_attn_vectors.append(pos_tree_aligned_attn)
+
+                # need to transpose since _expand_mask requires masks to be bsz, 1, tgt_len, src_len
+                attention_mask = torch.cat(li_attn_vectors, dim=0).to(torch.float)
+                
+                if attention_mask.shape[0] >utt_len:
+                    attention_mask = attention_mask[:utt_len, :]
             
-            all_pos = torch.cat((rst_pos, li_kp_rstpos))
-
-            li_pos_edu_idslen = sorted( [[pos, edu, None] for pos, edu in dict_pos_edu.items()],
-                                       key=lambda x: RSTTokenizer.edukp_pos_sort_function(
-                                           int(x[0]) )
-                                       )
-
-            # Find the tokenized length of each edu
-            # And get the seqeunce of parents for each edu position
-            # Note this ignores the length of the start and end token
-            for idx in range(len(li_pos_edu_idslen)):
-                                
-                li_pos_edu_idslen[idx][2] = len( self.encode(
-                    li_pos_edu_idslen[idx][1], add_special_tokens=False) )
-
-                # if idx==0:
-                #     li_pos_edu_idslen[idx][2] += 2
-                # elif idx==len(li_pos_edu_idslen):
-                #     li_pos_edu_idslen[idx][2] += 1
+            #generating
+            else:
+                #here
+                all_pos = context_rst_pos
                 
-                pos = li_pos_edu_idslen[idx][0]
+                li_batch_new_attn = []
+                for pos in curr_edu_pos: 
                 
-                if pos not in dict_rstpos_parents:
-                    dict_rstpos_parents[pos] = torch.nn.parameter.Parameter( torch.tensor(
-                        RSTTokenizer.seq_from_root_to_edu_pos(int(pos)) + [int(pos)] , dtype=torch.long), requires_grad=False )
+                    li_parent_tree = torch.tensor( RSTTokenizer.seq_from_root_to_edu_pos(pos.item()) + [pos.item()], device=all_pos.device )
+                    
+                    pos_tree_aligned_attn = (
+                            all_pos[..., None] == li_parent_tree).any(-1).squeeze()
 
-
-            # Then cycle through these lengths, and create the masking over the encoder
-                # Each edu should only attend to the rst and keyp phrases with pos in its parents pos
-                # Remember to create a 3 extras, for the starting eos and bos token and the ending eos token
-            for pos, edu_txt, edu_txt_len in li_pos_edu_idslen:
-
-                li_parent_tree = dict_rstpos_parents[pos]
-
-                pos_tree_aligned_attn = (
-                    all_pos[..., None] == li_parent_tree).any(-1).squeeze() 
+                    li_batch_new_attn.append(pos_tree_aligned_attn)
                 
-                # Repeating by tokenized length of EDU
-                pos_tree_aligned_attn = einops.repeat(pos_tree_aligned_attn,
-                    'd -> l d', l=edu_txt_len )
-
-                li_attn_vectors.append(pos_tree_aligned_attn)
-
-            # need to transpose since _expand_mask requires masks to be bsz, 1, tgt_len, src_len
-            attention_mask = torch.cat(li_attn_vectors, dim=0)
+                # batch_new_attn = torch.cat(li_batch_new_attn, axis=0)
+                
+                batch_new_attn = pad_sequence(li_batch_new_attn, batch_first=True, padding_value=0 )
+                attention_mask = batch_new_attn.unsqueeze(1)
+                
+                if past != None:
+                    attention_mask = torch.cat([past, attention_mask], axis=1)
+                        
         else:
             attention_mask = torch.ones((utt_len, rt_len))
 
@@ -990,9 +1135,9 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     @classmethod
     def from_pretrained(cls,
                         dir_tokenizer="./tokenizers/RSTBart",
-                        base_tokenizer_name="facebook/wbart-base",
+                        base_tokenizer_name="facebook/bart-base",
                         rst_params={},
-                        **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, rst_pos_maxidx
+                        **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
@@ -1012,11 +1157,9 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
 
-        tokenizer.rst_start_token_id = tokenizer.encode(
-            tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id = tokenizer.encode(
-            tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id_np =  tokenizer.keyphrase_start_token_id.numpy()
+        tokenizer.rst_start_token_id        = tokenizer.encode( tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
+        tokenizer.keyphrase_start_token_id  = tokenizer.encode( tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
+        tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
 
         for k, v in rst_params.items():
             setattr(cls, k, v)
@@ -1052,11 +1195,13 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                                                                                'max_len_key_phrase',
                                                                                                                'max_rst_depth',
                                                                                                                'max_len_utt', 
-                                                                                                               'rst_pos_maxidx',
-                                                                                                               'rst_pos_maxidx',
+                                                                                                               'max_rst_pos',
+                                                                                                               'max_rst_pos',
                                                                                                                'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
+        if mconfig.rst_tree_aligned_attention: 
+            self.model.RSTTokenizer = self.RSTTokenizer
 
         self.pad_values = {'rst_start_token': mconfig.pad_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
@@ -1064,7 +1209,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                            'rst_pos': self.model.embed_rst_pos.padding_idx,
 
                            'key_phrase_ids': mconfig.pad_token_id,
-                           'li_kp_rstpos': self.model.embed_rst_pos.padding_idx,
+                           'li_kprstpos': self.model.embed_rst_pos.padding_idx,
 
                            'position_ids': mconfig.pad_token_id,
 
@@ -1073,27 +1218,37 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
                            'labels': -100,
                            'decoder_input_ids': mconfig.pad_token_id,
-                           'decoder_cross_attention_mask': 0
+                           'decoder_cross_attention_mask': 0.0,
+
+                            'decoder_edu_rstpos': -1,
+                                
+                            'decoder_context_rst_pos': -1
+   
+
+                           
                            }
         self.RSTTokenizer.pad_values = self.pad_values
 
         self.pad_maxlens = {
             'rst_start_token': 1,
             'rst_rel': mconfig.max_len_rst-1,
-
             'rst_ns': mconfig.max_len_rst-1,
             'rst_pos': mconfig.max_len_rst-1,
 
             'key_phrase_ids': mconfig.max_len_key_phrase,
-            'li_kp_rstpos': mconfig.max_len_key_phrase,
+            'li_kprstpos': mconfig.max_len_key_phrase,
 
             'utt_tok_ids': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
             'labels': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
             'decoder_input_ids': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
 
             'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase,  # axis:max_length
-            'decoder_cross_attention_mask': mconfig.max_len_rst+mconfig.max_len_key_phrase,
+            'decoder_cross_attention_mask': [ mconfig.max_len_utt , mconfig.max_len_rst+mconfig.max_len_key_phrase ] , #max_lens in both 2d dimensions
+
             'position_ids': mconfig.max_len_key_phrase + mconfig.max_len_rst,
+            
+            'decoder_edu_rstpos': mconfig.max_rst_pos // 2,
+            'decoder_context_rst_pos':mconfig.max_len_rst + mconfig.max_len_key_phrase
 
         }
         self.RSTTokenizer.pad_maxlens = self.pad_maxlens
@@ -1103,11 +1258,16 @@ class RSTBart_TrainingModule(pl.LightningModule):
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
+            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.RSTTokenizer,
+                                 workers=self.workers, mode=self.mode, gpus=self.gpus,
+                                 pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
+                                 )
+
             if self.mode == "test":
                 self.create_data_loaders(['test'])
             else:
                 self.create_data_loaders(['train', 'val', 'inference'] )
-                self.inference_samples = list(islice(self.inference_dl, 10))
+                self.inference_samples = list(islice(self.inference_dl, 3))
                 del self.inference_dl
 
         if self.mode in ['train_new', 'train_cont']:
@@ -1123,24 +1283,21 @@ class RSTBart_TrainingModule(pl.LightningModule):
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
 
-            bad_words = ["<|rst|>", "<|kp|>", "<|pad|>", r"\n", "[\u2026]"]
+            bad_words = ["<rst>", "<kp>", ]
             bad_words_ids = [self.RSTTokenizer.encode(
                 bad_word,) for bad_word in bad_words]
             bad_words_ids = bad_words_ids + \
                 [self.RSTTokenizer.encode(bad_word) for bad_word in bad_words]
             bad_words_ids = bad_words_ids 
 
-            self.inference_generation_params = {'num_beams': 1, 
-                                                #'temperature': 1.1, 
-                                                #'repetition_penalty': 1.2,
-                                                #'top_k': 50,
-                                                #'top_p': 0.85,
-                                                #'length_penalty': 1.5,
+            self.inference_generation_params = {#'num_beams': 1, 
+
                                                 'early_stopping': True,
-                                                'do_sample': False,
-                                                'bad_words_ids': bad_words_ids, 
-                                                #'no_repeat_ngram_size': 3,
-                                                'min_length': 5, 'max_length': 180}
+                                                'do_sample':True, 
+                                                'top_k':50, 
+                                                'top_p':0.95, 
+                                                'no_repeat_ngram_size': 2,
+                                                'min_length': 5, 'max_length': 10 }
 
         if self.mode in ['inference']:
             self.eval()
@@ -1255,11 +1412,10 @@ class RSTBart_TrainingModule(pl.LightningModule):
         checkpoint_callback._save_model = types.MethodType(
             utils.monkey_save_model, checkpoint_callback)  # monkey patch
 
-        val_check_interval = 0.5
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience= max(2,int(1/val_check_interval) ) ,            
+            patience = 4,       
             verbose=False,
             mode='min'
         )
@@ -1271,7 +1427,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
         else:
 
             trainer_vars = {'accelerator': 'ddp',
-                            'plugins': DeepSpeedPlugin(stage=2) }
+                            # 'plugins': DeepSpeedPlugin(stage=2) 
+                            'plugins' : DDPPlugin(find_unused_parameters=True)
+                            }
 
         if tparams['mode'] in ["train_new"]:
             a = len( training_module.train_dl )
@@ -1282,9 +1440,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=val_check_interval,
-                                                   
-                                                    num_sanity_val_steps=0,
+                                                    # val_check_interval=val_check_interval,
+                                                    limit_train_batches = 200,
+                                                    limit_val_batches = 10,
+                                                    reload_dataloaders_every_n_epochs=1,
+                                                    num_sanity_val_steps=10,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
                                                     )
@@ -1296,12 +1456,12 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
-                                                    progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
                                                     logger=tb_logger,
-
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=val_check_interval,
+                                                    limit_train_batches = 4000,
+                                                    #limit_val_batches = 1000,
+                                                    reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
@@ -1441,6 +1601,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
         if step_name == 'train':
             output["loss"] = loss
+            self.log('train_loss',loss, logger=True, on_step=True)
 
         else:
             str_loss_key = loss_key
@@ -1514,7 +1675,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     utterance = encoded_input.pop('orig_utt')
                     dict_pos_edu = encoded_input.pop('orig_dict_pos_edu')
 
-                    orig_li_kp_rstpos = encoded_input.pop('orig_li_kp_rstpos')
+                    orig_li_kprstpos = encoded_input.pop('orig_li_kprstpos')
 
                     datum = {
                         'epoch': -1,
@@ -1527,7 +1688,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                         "utterance": utterance,
                         "dict_pos_edu": json.dumps(dict_pos_edu),
 
-                        "li_kprstpos": json.dumps(orig_li_kp_rstpos),
+                        "li_kprstpos": json.dumps(orig_li_kprstpos),
                     }
 
                     df = df.append(datum, ignore_index=True)
@@ -1541,7 +1702,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 encoded_input.pop('orig_key_phrase', None)
                 encoded_input.pop('orig_utt', None)
                 encoded_input.pop('orig_dict_pos_edu', None)
-                encoded_input.pop('orig_li_kp_rstpos', None)
+                encoded_input.pop('orig_li_kprstpos', None)
                 encoded_input.pop('labels', None)
 
                 for k in list(encoded_input.keys()):
@@ -1553,7 +1714,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     output = output[0].to('cpu')
                 
                 decoded_text = self.RSTTokenizer.decode(output,
-                                                    skip_special_tokens=True)
+                                                    skip_special_tokens=False)
                 datum = {
                     'epoch': self.current_epoch,
                     'rst_rels': '',
@@ -1565,7 +1726,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     'rst_pos': ''
                 }
 
-                pd.DataFrame.from_records([datum]).to_csv(fp, index=True, mode='a', header=False)
+                pd.DataFrame.from_records([datum]).to_csv(fp, index=False, mode='a', header=False)
                 # Saving to file
         
         else:
@@ -1579,20 +1740,23 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                  )
 
         if 'train' in modes:
-            self.train_dl = dg.prepare_dataloader(
+            self.train_dl = self.dg.prepare_dataloader(
                 split_name='train')
         if 'val' in modes:
-            self.val_dl = dg.prepare_dataloader(
+            self.val_dl = self.dg.prepare_dataloader(
                 split_name='val')
         if 'test' in modes:
-            self.test_dl = dg.prepare_dataloader(
+            self.test_dl = self.dg.prepare_dataloader(
                 split_name='test')
         if 'inference' in modes:
-            self.inference_dl = dg.prepare_dataloader(
+            self.inference_dl = self.dg.prepare_dataloader(
                 split_name='inference')
 
     def train_dataloader(self):
-        return self.train_dl
+        # return self.train_dl
+
+        return self.dg.prepare_dataloader(
+                split_name='train')
 
     def val_dataloader(self):
         return self.val_dl
@@ -1677,14 +1841,9 @@ class DataLoaderGenerator():
                          for ls, fs in zip(line_starts, files_sizes)]
             inference = False
             bs = self.batch_size
-            workers = 1 if self.workers in [1,2] else max( 0, self.workers-2 )
-
             shuffle=True
-
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
-
-            prefetch_factor = 1
-            drop_last=False
+            prefetch_factor = 3
 
 
         elif split_name == 'val':
@@ -1694,12 +1853,9 @@ class DataLoaderGenerator():
             shuffle = False
             inference = False
             bs = self.batch_size if self.batch_size != -1 else 30
-            workers = 1 if self.workers==1 else 2
 
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
-            prefetch_factor = 1
-            drop_last=False
-
+            prefetch_factor = 3
 
         elif split_name == 'test':
             line_starts = [int(fs*(1-self.splits['test']))
@@ -1709,9 +1865,8 @@ class DataLoaderGenerator():
             bs = self.batch_size
             def collate_fn(batch): return self.tokenizer.default_collate_pad(
                 batch)
-            workers = 3
             shuffle = False
-            prefetch_factor = 4
+            prefetch_factor = 2
             drop_last=False
             
 
@@ -1723,21 +1878,18 @@ class DataLoaderGenerator():
             inference = True
             shuffle=False
             bs = None
-            collate_fn = default_convert
-            workers = 1
+            #collate_fn = default_convert
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
             prefetch_factor = 2
-            drop_last=False
-        
-        #debugging
         li_dsets = [SingleDataset(_f, self.tokenizer, line_start, line_end, inference )
                     for _f, line_start, line_end in zip(fns, line_starts, line_ends)]
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
-        if self.gpus <= 1 and split_name not in ['inference', 'test','val']:
+        if self.gpus <= 1 and split_name not in ['inference', 'test']:
             sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle)
 
-        elif self.gpus > 1 and split_name not in ['inference', 'test', 'val']:
+        elif self.gpus > 1 and split_name not in ['inference', 'test' ]:
             sampler = SizedOrdered_DistributedSampler(
                 concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
         else:
@@ -1745,7 +1897,7 @@ class DataLoaderGenerator():
 
         dataloader = torch.utils.data.DataLoader(concat_dset, 
                                                 batch_size= bs if self.batch_size!=-1 else 1 ,
-                                                 num_workers=workers,
+                                                 num_workers=self.workers,
                                                  sampler=sampler if self.batch_size!=-1 else None,
                                                  batch_sampler=sampler if self.batch_size==-1 else None,
 
@@ -1833,7 +1985,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
 
-        rst_rels, rst_ns, rst_pos, li_kp, li_kp_rstpos, utterance, dict_pos_edu = self.getitem_extract_datum(
+        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu = self.getitem_extract_datum(
             index)
 
         if self.inference == True:
@@ -1842,7 +1994,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
             encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
                                                   li_kp=li_kp,
-                                                  li_kp_rstpos=li_kp_rstpos,
+                                                  li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu)
 
@@ -1854,14 +2006,14 @@ class SingleDataset(torch.utils.data.Dataset):
             encoded['orig_key_phrase'] = li_kp
 
             encoded['orig_dict_pos_edu'] = dict_pos_edu
-            encoded['orig_li_kp_rstpos'] = li_kp_rstpos
+            encoded['orig_li_kprstpos'] = li_kprstpos
 
         elif self.inference==False:
 
             encoded = self.tokenizer.encode_input(
                 rst_rels, rst_ns, rst_pos,
                 li_kp=li_kp,
-                li_kp_rstpos=li_kp_rstpos,
+                li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
                 max_rst_len=self.max_rst_len[index]
@@ -1891,9 +2043,13 @@ class SingleDataset(torch.utils.data.Dataset):
 
         # Key phrase scores
         li_pos_kp = json.loads(datum['li_pos_kp'] )
-        # top 3 important prhases from utterance
-        li_kp_rstpos, li_kp = zip(*li_pos_kp)
-        li_kp_rstpos = tuple(int(pos) for pos in li_kp_rstpos)
+        if len(li_pos_kp)>0:
+            # top 3 important prhases from utterance
+            li_kprstpos, li_kp = zip(*li_pos_kp)
+            li_kprstpos = tuple(int(pos) for pos in li_kprstpos)
+        else:
+            li_kp = []
+            li_kprstpos = []
 
         # Utterance
         utterance = ujson.loads(datum['txt_preproc'])
@@ -1901,7 +2057,7 @@ class SingleDataset(torch.utils.data.Dataset):
         #pos and edus
         dict_pos_edu = json.loads(datum['dict_pos_edu'])        
    
-        return rst_rels, rst_ns, rst_pos, li_kp, li_kp_rstpos, utterance, dict_pos_edu
+        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu
 
 class SizedOrdered_Sampler(Sampler[int]):
     r"""Samples elements sequentially, always in the same order.
@@ -2015,7 +2171,7 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
             >>> sampler = DistributedSampler(dataset) if is_distributed else None
             >>> loader = DataLoader(dataset, shuffle=(sampler is None),
             ...                     sampler=sampler)
-            >>> for epoch in range(start_epoch, n_epochs):
+            >>> for epoch in rDange(start_epoch, n_epochs):
             ...     if is_distributed:
             ...         sampler.set_epoch(epoch)
             ...     train(loader)
@@ -2027,6 +2183,9 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
                  seed: int = 0,
                  shuffle: bool = False,
                  gpus: int = 2) -> None:
+
+        self.batch_size = batch_size
+
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError(
@@ -2115,10 +2274,13 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
                 
     def __iter__(self) -> Iterator[T_co]:
 
-        return iter(self.li_li_sizeorderedidx[self.rank])
+        return iter(self.li_li_chunked_ordered_lens[self.rank])
 
     def __len__(self) -> int:
-        return self.num_samples
+        if self.batch_size != -1:
+            return len(self.data_source)
+        else:
+            return len( self.li_li_chunked_ordered_lens[0] )
 
     def set_epoch(self, epoch: int) -> None:
         r"""
@@ -2167,7 +2329,7 @@ if __name__ == '__main__':
 
     if tparams.gpus not in [0, 1]:
         os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '65302'
+        os.environ['MASTER_PORT'] = '65502'
 
     try:
         main(vars(tparams), vars(mparams))
