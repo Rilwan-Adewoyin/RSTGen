@@ -1496,7 +1496,6 @@ class DataLoaderGenerator():
         if split_name == 'train':
             line_starts = [0]*len(files_sizes)
             line_ends = [ ls+int(fs*self.splits['train']) for ls,fs in zip(line_starts, files_sizes)  ]
-            #line_ends = [ 100 for ls,fs in zip(line_starts, files_sizes)  ]
             ifc = 0
             bs = self.bs
             shuffle = True
@@ -1504,7 +1503,6 @@ class DataLoaderGenerator():
         elif split_name == 'val':
             line_starts = [ int(fs*self.splits['train']) for fs in files_sizes  ]
             line_ends = [ ls+int(fs*self.splits['val']) for ls,fs in zip(line_starts, files_sizes)  ]
-            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             shuffle = False
             ifc = 0
             bs = self.bs
@@ -1512,7 +1510,6 @@ class DataLoaderGenerator():
         elif split_name == 'test':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends = files_sizes
-            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             ifc = 0
             bs = self.bs
             shuffle = False
@@ -1520,7 +1517,6 @@ class DataLoaderGenerator():
         elif split_name == 'inference':
             line_starts = [ int(fs*(1-self.splits['test']) ) for fs in files_sizes  ]
             line_ends =  files_sizes
-            #line_ends = [ ls+40 for ls,fs in zip(line_starts, files_sizes)  ]
             sampler = None
             ifc = self.inference_context_utt
             bs = 1

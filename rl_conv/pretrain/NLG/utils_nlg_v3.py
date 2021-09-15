@@ -113,12 +113,23 @@ def monkey_save_model(self, trainer, filepath: str):
         self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
 
     # delegate the saving to the trainer
-    if self.save_function is not None:
+    # if self.save_function is not None:
         # self.save_function(filepath, self.save_weights_only)
         trainer.save_checkpoint(filepath)
     
-    self.to_yaml()
+        self.to_yaml()
 #endregion
+
+def mpatch_save_model(func):
+
+    def inner(self, *args):
+
+        func(*args)
+
+        self.to_yaml()
+
+    return inner
+
 
 #region RST helper
 
@@ -426,8 +437,14 @@ class EffeciencyMixin():
         r"""Puts each data field into a tensor with outer dimension batch size
         """
 
-        if isinstance(batch,collections.abc.Mapping):
-            return batch
+        if len(batch)==1 :
+            # case: inference
+            elem = batch[0]
+            elem.pop('labels',None)
+            for key in elem:
+                if "orig" not in key:
+                    elem[key] = elem[key].unsqueeze(0)
+            return elem
             
         pad_values = self.pad_values
         pad_maxlens = self.pad_maxlens
