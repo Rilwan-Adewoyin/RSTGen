@@ -322,7 +322,28 @@ def li_edu_adder( li_dict_rsttext):
 
     #TODO: Parser wrapper seperates at apostrophes
     # corrects any formatting errors caused by the segmenter
-    li_li_edus = edu_fixer( li_textwedutoken )
+    li_li_edus = edu_fixer( li_textwedutoken, li_text )
+
+
+    #debugging check there aren't spaces between puntuation and word before
+    for idx_, idx in enumerate(li_idx):
+        li_dict_rsttext[idx]['li_edus'] = li_li_edus[idx_]
+
+    return li_dict_rsttext
+
+def edu_fixer(li_textwedutoken, li_text):
+        
+    li_li_edus = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]
+    
+    for li_edutext in li_li_edus:
+        for idx2,elem in enumerate(li_edutext):
+            elem.reverse() #reversing list of words in an edu
+            it = enumerate(elem)
+            edu_len = len(elem) 
+            elem_new =  [next(it)[1]+str_ if ( idx!=edu_len-1 and (str_[0] == "'" or str_ in ["n't", ".", "?", "!", ",", "[", "]" ]) ) else str_ for idx,str_ in it]
+            elem_new.reverse()
+
+            li_edutext[idx2] = elem_new
 
     # for each utterance, merge list of words into one text
     li_li_edus = [ [ ' '.join( edus ) for edus in li_edus ] for li_edus in li_li_edus ]
@@ -341,27 +362,7 @@ def li_edu_adder( li_dict_rsttext):
         li_edus =  [ re.sub(pattern_brackets_rm_space, r'(\1)', edu_text) for edu_text in li_edus ]
         li_edus =  [ re.sub(pattern_punctuation_space, r'\1', edu_text) for edu_text in li_edus ]
 
-    #debugging check there aren't spaces between puntuation and word before
-    for idx_, idx in enumerate(li_idx):
-        li_dict_rsttext[idx]['li_edus'] = li_li_edus[idx_]
-
-    return li_dict_rsttext
-
-def edu_fixer(li_textwedutoken):
-        
-    li_li_edutext = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]
-    
-    for li_edutext in li_li_edutext:
-        for idx2,elem in enumerate(li_edutext):
-            elem.reverse() #reversing list of words in an edu
-            it = enumerate(elem)
-            edu_len = len(elem) 
-            elem_new =  [next(it)[1]+str_ if ( idx!=edu_len-1 and (str_[0] == "'" or str_ in ["n't", ".", "?", "!", ",", "[", "]" ]) ) else str_ for idx,str_ in it]
-            elem_new.reverse()
-
-            li_edutext[idx2] = elem_new
-    
-    return li_li_edutext
+    return li_li_edus
 
 
 def split(sequence, sep):

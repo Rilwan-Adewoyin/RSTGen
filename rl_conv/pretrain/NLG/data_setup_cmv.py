@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from operator import itemgetter
 import regex as re
 import sys
+import contextlib
 import copy
 import csv
 import pandas as pd
@@ -28,9 +29,9 @@ for path_ in modules_paths:
         sys.path.append(path_)
 
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
+from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
-from data_setup import _tree_to_rst_code, _parse_trees
-from data_setup_v3 import edu_fixer, find_child_edus
+from utils_nlg_v3 import non_parseable_remover, edu_fixer, position_edus, _tree_to_rst_code, _parse_trees
 from dataset_cmv.pair_repo.compute_topic_signatures import TopicSignatureConstruction
 
 import string
@@ -46,9 +47,9 @@ regex_bulletpoints = re.compile( "[ ]*>[ ]*")
 def main( batch_process_size = 10, mp_count=1 ):
 
     conversions_map = {
-        "train":["nlg",'nlg_pair',"seq2seq"],
-        "val":["nlg", "nlg_pair","seq2seq"],
-        "test":["nlg","pair","seq2seq","nlg_pair"]
+        "train":["dyploc_rst",'dyploc_pair_rst',"dyploc_seq2seq"],
+        "val":["dyploc_rst", "dyploc_pair_rst","dyploc_seq2seq"],
+        "test":["dyploc_rst","dyploc_pair","dyploc_seq2seq","dyploc_pair_rst"]
     }
 
 
@@ -72,7 +73,7 @@ def main( batch_process_size = 10, mp_count=1 ):
         
         batches_completed = 0
         li_records = li_records[batch_size*batches_completed:]
-
+        print("Operating on ",dset_section," dataset")
         while len(li_records) > 0:
 
             batch_li_records = li_records[:batch_size]
@@ -99,34 +100,39 @@ def main( batch_process_size = 10, mp_count=1 ):
                 rrs_1, rrs_2 = tee(res_rst_skw,2)
 
                 res_rst_skw_edu = pool.imap(li_edu_parse_records, rrs_1)
+                res_rst_skw_edu = pool.imap( non_parseable_remover, res_rst_skw_edu ) # removing text with grammar so bad that it can not be parsed properly
+                res_rst_skw_edu = pool.imap( position_edus, res_rst_skw_edu)
                 rrse_1, rrse_2 = tee( res_rst_skw_edu, 2)
 
-                res_dyploc_to_nlg = pool.imap( convert_dyploc_to_nlg, rrse_1 )
-                res_dyploc_to_nlgpair = pool.imap( convert_dyploc_to_nlgpair, rrse_2  )
+                res_dyploc_to_rst = pool.imap( convert_dyploc_to_rst, rrse_1 )
+                res_dyploc_to_pair_rst = pool.imap( convert_dyploc_to_pair_rst, rrse_2  )
                 res_dyploc_to_seq2seq = pool.imap( convert_dyploc_to_seqseq, res_2  )
                 
                 if dset_section in ['val','test']:
                     res_dyploc_to_pair = pool.imap( convert_dyploc_to_pair, rrs_2 )
                 
                 # #getting results
-                li_recs_nlg = sum( list(res_dyploc_to_nlg), [] )
-                li_recs_nlgpair = sum( list(res_dyploc_to_nlgpair), [] )
+                li_recs_dyploc_rst = sum( list(res_dyploc_to_rst), [] )
+                li_recs_dyploc_pair_rst= sum( list(res_dyploc_to_pair_rst), [] )
                 li_recs_seq2seq = sum( list(res_dyploc_to_seq2seq), [] )   
+                   
 
+                # packing results
+                dict_li_records = {}
+                dict_li_records['dyploc_pair_rst']=li_recs_dyploc_pair_rst
+                dict_li_records['dyploc_rst']=li_recs_dyploc_rst
+                # dict_li_records['dyploc_seq2seq']=li_recs_seq2seq
+
+                
                 if dset_section in ['test']:
-                    li_recs_pair = sum( list(res_dyploc_to_pair), [] )
-                    
-
-            # packing results
-            dict_li_records = {'nlg_pair':li_recs_nlgpair,
-                    'nlg':li_recs_nlg, 'seq2seq':li_recs_seq2seq}
-            
-            if dset_section in ['test']:
-                dict_li_records['pair'] = li_recs_pair
-            
+                    # li_recs_dyploc_pair = sum( list(res_dyploc_to_pair), [] )
+                    # dict_li_records['dyploc_pair'] = li_recs_dyploc_pair
+                    pass
+                
             #saving
             for m_format in model_formats :
-                _save_data( dict_li_records[m_format], dset_section, m_format )
+                if m_format in dict_li_records:
+                    _save_data( dict_li_records[m_format], dset_section, m_format )
 
             li_records = li_records[batch_size:]
             batches_completed +=1
@@ -171,7 +177,7 @@ def preprocess(li_records):
         #removing weird  symbols from reference
         reference = re.sub(regex_bulletpoints, "", reference)
 
-        li_records[idx]['reference'] = reference
+        li_records[idx]['txt_preproc'] = reference
         li_records[idx]['title'] = title
             
     return li_records
@@ -179,15 +185,21 @@ def preprocess(li_records):
 def rst_tree_parse_records(li_records):
 
     # region Parsing RST trees from reference sentences
-    li_refs = [ record['reference'] for record in li_records ]
-    
-    li_li_unparsed_tree = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_refs]), 
-                                                skip_parsing=False, redirect_output=True)
+    li_refs = [ record['txt_preproc'] for record in li_records ]
 
-    li_unparsed_tree = sum( li_li_unparsed_tree, [] )
+    with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+        rst_parser = DiscourseParser(verbose=False, skip_parsing=False,
+                        global_features=True)
+    
+        li_unparsed_tree = rst_parser.parse_li_utterances(  li_refs )
+        
+        rst_parser.unload()
+
+
     li_subtrees = _parse_trees(li_unparsed_tree)
     
     li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
+
 
     # Attaching the rst trees to the records
         # and removing records which could not be parsed
@@ -197,7 +209,7 @@ def rst_tree_parse_records(li_records):
             li_rst_dict.pop(idx)
             li_records.pop(idx)
 
-        elif len(li_records[idx]['rst'])==1 and li_records[idx]['rst'][0]['ns'] == 'a' :
+        elif len(li_rst_dict[idx])==1 and li_rst_dict[idx][0]['ns'] == 'a' :
             li_rst_dict.pop(idx)
             li_records.pop(idx)
 
@@ -205,9 +217,6 @@ def rst_tree_parse_records(li_records):
             li_records[idx]['rst'] = li_rst_dict[idx]
             
     return li_records
-
-
-    
 
 def li_edu_parse_records(li_records):
     # getting edus
@@ -217,25 +226,24 @@ def li_edu_parse_records(li_records):
             # get keyphrase position of each context word in target
     li_records = copy.deepcopy(li_records)
 
-    li_refs = [ record['reference'] for record in li_records ]
+    li_refs = [ record['txt_preproc'] for record in li_records ]
+
+    with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+        rst_parser = DiscourseParser(verbose=False, skip_parsing=True,
+                        global_features=True)
     
-    li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= json.dumps([li_refs]), 
-                                                skip_parsing=True, redirect_output=True)
+        li_textwedutoken = rst_parser.parse_li_utterances(  li_refs )
+        
+        rst_parser.unload()
+
+
         # corrects Parser wrapper seperates at apostrophes
-    li_li_edus = edu_fixer( li_textwedutoken )
-
-        # for each utterance, merge list of words into one text
-    li_li_edus = [ [ ' '.join( edus ) for edus in li_edus ] for li_edus in li_li_edus ]
-
-    
-    li_li_edus = [ [edutxt.replace(" n't", "n't").replace(" / ", "/").replace(" '", "'").replace("- LRB -", "(").replace("- RRB -", ")").replace("-LRB-", "(").replace("-RRB-", ")")
-                    if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_refs) ]
+    li_li_edus = edu_fixer( li_textwedutoken, li_refs )
 
     for idx in range(len(li_records)):
         li_records[idx]['li_edus'] = li_li_edus[idx]
 
     return li_records
-
 
 def salience_keywords_parse(li_records):
     #extract kp_set_str from dyploc context
@@ -246,11 +254,9 @@ def salience_keywords_parse(li_records):
     tsc.receive_data()
     tsc.calculate_llr()
     li_records = tsc.return_records() #adds a 'kp_set_str' to each record
-
-
     return li_records
 
-def convert_dyploc_to_nlg( li_records ):
+def convert_dyploc_to_rst( li_records ):
 
     try:
 
@@ -258,19 +264,6 @@ def convert_dyploc_to_nlg( li_records ):
 
         for idx in range(len(li_records)):
             li_records[idx].pop('kp_set_str',None)
-
-        
-        #positioning edus
-        for idx in range(len(li_records)):
-            
-            li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
-            li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
-
-            li_edu = li_records[idx].pop('li_edus',None)
-
-            dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
-            
-            li_records[idx]['dict_pos_edu'] = dict_pos_edu
         
 
         #extracting keyphrases
@@ -349,7 +342,6 @@ def convert_dyploc_to_nlg( li_records ):
             li_records[idx]['prompt'] = li_records[idx].pop('title',None)
 
             li_records[idx].pop('dyploc_context',None)
-            li_records[idx].pop('dict_pos_edu',None)
             
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
@@ -377,7 +369,7 @@ def convert_dyploc_to_pair( li_records ):
 
         for idx in range(len(li_records)):
                 
-            li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_set_str'], li_records[idx]['reference'], tokenizer )
+            li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_set_str'], li_records[idx]['txt_preproc'], tokenizer )
 
             li_records[idx]['prompt'] = li_records[idx].pop('title',None)
 
@@ -452,24 +444,11 @@ def pair_template_maker(  kp_set_str, reference, tokenizer ):
         print(traceback.format_exc())
         raise e
 
-def convert_dyploc_to_nlgpair(li_records):    
+def convert_dyploc_to_pair_rst(li_records):    
     try:
         li_records = copy.deepcopy(li_records)
         
-        # form dict_pos_kp from kp_set_str and li_edus
         
-        #positioning edus
-        for idx in range(len(li_records)):
-            
-            li_rst_pos = [ rst_node['pos'] for rst_node in li_records[idx]['rst'] ]
-            li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
-
-            li_edu = li_records[idx].pop('li_edus')
-
-            dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edu ) }
-            
-            li_records[idx]['dict_pos_edu'] = dict_pos_edu
-
         # positioning keyphrase using dict_pos_edu and kp_set_str
         for idx in reversed(range(len(li_records))):
             
@@ -512,7 +491,6 @@ def convert_dyploc_to_nlgpair(li_records):
             li_records[idx]['prompt'] = li_records[idx].pop('title',None)
 
             li_records[idx].pop('kp_set_str',None)
-            li_records[idx].pop('dict_pos_edu',None)
             
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
@@ -582,10 +560,10 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=100,
+    parser.add_argument('-bps','--batch_process_size', default=160,
                              help='', type=int)        
    
-    parser.add_argument('--mp_count', default=10, type=int)
+    parser.add_argument('--mp_count', default=8, type=int)
 
     args = parser.parse_args()
     

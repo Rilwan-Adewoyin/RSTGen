@@ -321,11 +321,12 @@ class RSTGPT2_Config(GPT2Config):
 
     def __init__(self,
                  base_model_name='gpt2',
-                 model_name="RSTGPT2",
+                 model_name="RSTGPT2_pair",
                  scale_grad_by_freq=True,
                  max_len_rst=28,
                  max_len_key_phrase=30,
-                 max_len_utt=256,
+                 max_len_utt=256, 
+                 max_len_qprompt = 45,
                  rst_tree_aligned_attention=False,
                  max_rst_pos=4094,
                  **kwargs):
@@ -338,6 +339,7 @@ class RSTGPT2_Config(GPT2Config):
         self.max_len_utt = max_len_utt
         self.max_len_rst = max_len_rst
         self.max_len_key_phrase = max_len_key_phrase
+        self.max_len_qprompt = max_len_qprompt
         self.rst_tree_aligned_attention = rst_tree_aligned_attention
         self.rst_rel_li = ['Attribution',
                            'Background', 'Cause', 'Comparison', 'Condition',
@@ -355,6 +357,7 @@ class RSTGPT2_Config(GPT2Config):
             'base_model':self.base_model_name,
             'scale_grad_by_freq':self.scale_grad_by_freq,
             'max_len_utt':self.max_len_utt,
+            'max_len_qprompt':self.max_len_qprompt,
             'max_len_rst':self.max_len_rst,
             'max_len_key_phrase':self.max_len_key_phrase,
             'rst_tree_aligned_attention':self.rst_tree_aligned_attention       
@@ -372,7 +375,8 @@ class RSTGPT2(GPT2LMHeadModel):
         self.scale_grad_by_freq = config.scale_grad_by_freq
         self.max_len_rst = config.max_len_rst
         self.max_len_key_phrase = config.max_len_key_phrase
-        self.max_len_utt = config.max_len_utt
+        self.max_len_utt = config.max_len_utt 
+        self.max_len_qprompt = config.max_len_qprompt
         self.rst_tree_aligned_attention = config.rst_tree_aligned_attention        
 
         self.transformer.forward = types.MethodType(GPT2_forward, self.transformer)
@@ -766,7 +770,7 @@ class RSTGPT2(GPT2LMHeadModel):
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                 'base_model_name', 'model_name', 'max_len_key_phrase',
-                'max_len_rst', 'max_len_utt',
+                'max_len_rst', 'max_len_utt','max_len_qprompt',
                 'scale_grad_by_freq','rst_tree_aligned_attention']}
 
             # overriding with new keys
@@ -804,8 +808,9 @@ class RSTGPT2(GPT2LMHeadModel):
             parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--base_model_name',
                             default='gpt2', required=False)
-        parser.add_argument('--model_name', default='RSTGPT2', required=False)
+        parser.add_argument('--model_name', default='RSTGPT2_pair', required=False)
         parser.add_argument('--max_len_utt', type=int, default=250)
+        parser.add_argument('--max_len_qprompt', type=int, default=45)
         parser.add_argument('--max_len_rst', type=int, default=30)
         parser.add_argument('--max_len_key_phrase', type=int, default=40)
         parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
@@ -839,6 +844,8 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     max_len_key_phrase = 24
     max_len_utt = 1024
     max_rst_pos = 4094
+    max_len_qprompt = 45
+
 
     special_token_count = 2
 
@@ -847,7 +854,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None, 
-                     rst_len=None, key_phrase_len=None,
+                     rst_len=None, key_phrase_len=None, qprompt=None,
                      exclude_from_output=[], device=None):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -867,8 +874,8 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             li_kp, li_kprstpos, key_phrase_len)
 
 
-        input_ids_utt, labels, utt_len = self.encode_utterance( utterance, utterance_prompt, 
-                    context_len = 1 + rst_rel.shape[-1] + key_phrase_ids.shape[-1]  )
+        input_ids_utt, labels, utt_len, qpromptlen = self.encode_utterance( utterance, utterance_prompt, 
+                    context_len = 1 + rst_rel.shape[-1] + key_phrase_ids.shape[-1], qprompt=qprompt  )
 
         # Lengths of each input
         r_len = 1 + rst_rel.shape[-1]
@@ -892,13 +899,15 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             li_kprstpos=li_kprstpos,
             dict_pos_edu = dict_pos_edu,
             training = (utterance!=None and utterance_prompt==None),
-            utterance_ids=input_ids_utt 
+            utterance_ids=input_ids_utt ,
+            qpromptlen = qpromptlen
             )
 
         attention_mask = self.prepare_attention_mask_handle_padding(
                                 attention_mask,     
                                  r_len, rst_pad_len, rst_len,
-                                rt_len, kp_pad_len, key_phrase_len )
+                                rt_len, kp_pad_len, key_phrase_len,
+                                 )
 
 
         output =  {'rst_start_token_id': self.rst_start_token_id,
@@ -916,9 +925,6 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                     'labels': labels,                
                 }
         
-        # #ensuring interoparability with huggingface generate code
-        # if utterance_prompt != None:
-        #     output['input_ids'] = input_ids_utt.contiguous()
         
         if self.rst_tree_aligned_attention:
             output['context_rstpos']= torch.cat( [ rst_pos[0:1], rst_pos, li_kprstpos ] )
@@ -1085,11 +1091,19 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         return key_phrase_ids, tnsr_rst_pos, kp_idxs, kp_phrase_lens, diff
 
-    def encode_utterance(self, utterance=None, utterance_prompt=None, context_len=None ):
+    def encode_utterance(self, utterance=None, utterance_prompt=None, context_len=None, qprompt=None ):
 
         # Creating labels/targets
         if utterance_prompt != None:
-            utterance_prompt = self.eos_token + utterance_prompt
+
+            qprompt_tok_ids = self.encode(
+                self.eos_token + qprompt, 
+                add_special_tokens=False,
+                return_attention_mask=False,
+                padding='do_not_pad',
+                truncation=False,
+                max_length=self.max_len_qprompt,
+                return_tensors='pt')[0]
 
             utt_prompt_tok_ids = self.encode(
                 utterance_prompt, 
@@ -1100,13 +1114,23 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 max_length=self.max_len_utt,
                 return_tensors='pt')[0]
 
-            utt_ids = utt_prompt_tok_ids.contiguous()
+            utt_ids = torch.cat( [qprompt_tok_ids,utt_prompt_tok_ids]).contiguous()
             labels = None
             utt_len = utt_ids.shape[-1]
-                
-
+            qprompt_len = qprompt_tok_ids.shape[-1]
+              
         if utterance != None:
-            utterance = self.eos_token + utterance + self.eos_token 
+
+            qprompt_tok_ids = self.encode(
+                self.eos_token + qprompt, 
+                add_special_tokens=False,
+                return_attention_mask=False,
+                padding='do_not_pad',
+                truncation=False,
+                max_length=self.max_len_qprompt,
+                return_tensors='pt')[0]
+
+            utterance = utterance + self.eos_token 
             utt_tok_ids = self.encode(
                 utterance, 
                 add_special_tokens=False,
@@ -1115,10 +1139,11 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 max_length=self.max_len_utt,
                 return_tensors='pt',
             )[0]
-
-            utt_ids = utt_tok_ids.contiguous()
-            labels = torch.cat( [ torch.full( size=(context_len,), fill_value=-100, dtype=torch.long) , utt_ids] )
+            
+            utt_ids = torch.cat( [qprompt_tok_ids,utt_tok_ids]).contiguous()
+            labels = torch.cat( [ torch.full( size=(context_len+qprompt_tok_ids.shape[0],), fill_value=-100, dtype=torch.long) , utt_tok_ids] )
             utt_len = utt_ids.shape[-1]
+            qprompt_len = qprompt_tok_ids.shape[-1]
         
         
         return utt_ids, labels, utt_len 
@@ -1127,6 +1152,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                                 ta_tokens_pos=None, kp_phrase_lens=None, 
                                 rst_pos=None, li_kprstpos=None,
                                 dict_pos_edu=None,
+                                qpromptlen = None,
                                 
                                 #generation
                                 curr_edu_pos=None,
@@ -1163,9 +1189,9 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                     
                 # Implementing causal attention mask for text
                 attention_mask[ rt_len: , : ] = torch.tril( torch.ones( [ rtu_len-rt_len, rtu_len ] ), diagonal=rt_len  )
-
-                #debugging - remove rst input only
-                # attention_mask[ rt_len:, :rt_len ] = 0
+                
+                # qprompt should not attend to RST information
+                attention_mask[ rt_len:rt_len+qpromptlen, :] = 0 
 
             #TODO: make sure padding is handled in prev_mask
             else:
@@ -1255,7 +1281,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                         # list of tuples containing pairs where indices represent matching tokens
                     matching_indexes = [] 
                     max_non_matches_till_id1_skip = 4
-                    # This is 0(n^2) 
+                    # This is 0(nm) 
                     for idx1, id1 in enumerate(utterance_ids):
                         
                         id1_matches_checked = 0 
@@ -1334,8 +1360,9 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
                 #region Combining both sections of attention
                 attention_mask[..., :rt_len, :rt_len ] = attention_mask_context
-                attention_mask[..., rt_len:, :rt_len ] = attention_mask_utt_context
-                attention_mask[..., rt_len: , rt_len:] = attention_mask_utt
+                attention_mask[..., rt_len+qpromptlen:, :rt_len ] = attention_mask_utt_context
+                attention_mask[..., rt_len: , rt_len:] = attention_mask_utt #includes qprompt
+                attention_mask[..., rt_len:rt_len+qpromptlen, :rt_len] = 0 #qprompt does not attend to earlier input
 
                 #correcting the kp phrases to have causal attention
                     #Second each kp has causal masking on the tokens within the topic phrase
@@ -1496,12 +1523,12 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             'key_phrase_ids': mconfig.max_len_key_phrase,
             'li_kprstpos': mconfig.max_len_key_phrase,
 
-            'input_ids_utt': mconfig.max_len_utt,
-            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,
+            'input_ids_utt': mconfig.max_len_utt + self.max_len_qprompt,
+            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + self.max_len_qprompt,
 
-            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,  # axis:max_length
+            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + self.max_len_qprompt,  # axis:max_length
 
-            'position_ids_kp_utt': mconfig.max_len_key_phrase+mconfig.max_len_utt,
+            'position_ids_kp_utt': mconfig.max_len_key_phrase+mconfig.max_len_utt+self.max_len_qprompt,
             
             'edu_rstpos': mconfig.max_rst_pos // 2,
             'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase }
@@ -1557,7 +1584,6 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--max_epochs', default=8, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
-        parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
 
         parser.add_argument('--learning_rate', default=1e-4, type=float)
         parser.add_argument('--workers', default=16, type=int)  # TODO: change to 6
@@ -2086,15 +2112,12 @@ class DataLoaderGenerator():
                  gpus=1,
                  pad_values={},
                  pad_maxlens={},
-                 batching_style='effecient',
                  **kwargs):
 
         self.dir_data = dir_data
         self.tokenizer = tokenizer
-        self.splits = {'train': 0.6, 'val': 0.2, 'test': 0.2}
 
         self.batch_size = batch_size
-        self.batching_style = batching_style
         self.workers = workers
         self.mode = mode
         self.gpus = gpus
@@ -2110,91 +2133,46 @@ class DataLoaderGenerator():
         """
         dir_data = self.dir_data
 
-        # getting all files from all different subreddits/types of conversation
-        #debugging
-        fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
-        fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn]#[:10 ]
-                
-        # getting number of utterances records in each file
-        files_sizes = [int(fn[-10:]) for fn in fns]
-
-        # defining starting line and total lines to use for dataset
-        
+           
         if split_name == 'train':
-            line_starts = [0]*len(files_sizes)
-            line_ends = [ls+int(fs*self.splits['train'])
-                         for ls, fs in zip(line_starts, files_sizes)]
-            inference = False
-            bs = self.batch_size
-            shuffle=True
-            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
-            prefetch_factor = self.workers*2
-
-        elif split_name == 'val':
-            line_starts = [int(fs*self.splits['train']) for fs in files_sizes]
-            line_ends = [ls+int(fs*self.splits['val'])
-                         for ls, fs in zip(line_starts, files_sizes)]
             
+            fn = glob.glob(  os.path.join( dir_data,"train","*") )[0]
             shuffle = True
             inference = False
             bs = self.batch_size
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
-            prefetch_factor = self.workers*2
 
-        elif split_name == 'test':
-            line_starts = [int(fs*(1-self.splits['test']))
-                           for fs in files_sizes]
-            line_ends = files_sizes
+
+        elif split_name == 'val':
+            fn = glob.glob(  os.path.join( dir_data,"val","*") )[0]
+            shuffle = True
             inference = False
             bs = self.batch_size
-            def collate_fn(batch): return self.tokenizer.default_collate_pad(
-                batch)
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
+
+
+        elif split_name == 'test':
+            fn = glob.glob(  os.path.join( dir_data,"test","*") )[0]
             shuffle = False
-            prefetch_factor = self.workers*2
+            bs = self.batch_size
+            inference = False
             
         elif split_name == 'inference':
-            line_starts = [int(fs*(1-self.splits['test']))
-                           for fs in files_sizes]
-            line_ends = files_sizes
-            sampler = None
-            inference = True
-            shuffle=False
+            fn = glob.glob(  os.path.join( dir_data,"test","*") )[0]
+            shuffle = True
             bs = 1
-            #collate_fn = default_convert
+            inference = False
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
-            prefetch_factor = self.workers*2
 
-        li_dsets = [SingleDataset(_f, self.tokenizer, line_start, line_end, inference )
-                    for _f, line_start, line_end in zip(fns, line_starts, line_ends)]
+        dset = SingleDataset(fn, self.tokenizer, inference) 
+                                              
+        dataloader = torch.utils.data.DataLoader(dset, batch_size=bs,
+            shuffle=shuffle, num_workers=self.workers,
+            collate_fn=collate_fn,
+            pin_memory=True )
 
-        concat_dset = torch.utils.data.ConcatDataset(li_dsets)
-
-        if self.gpus <= 1 and split_name not in ['inference', 'test']:
-            sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle, batching_style=self.batching_style)
-
-        elif self.batching_style=='effecient' and self.gpus > 1 and split_name not in ['inference', 'test' ]:
-            # raise NotImplementedError("have to implement the batching style in distributed sampler")
-            sampler = SizedOrdered_DistributedSampler(
-                concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
-        else:
-            sampler = None
-
-        dataloader = torch.utils.data.DataLoader(concat_dset, 
-                                                batch_size= bs if self.batch_size!=-1 else 1 ,
-                                                 num_workers=self.workers,
-                                                
-                                                 sampler=sampler if self.batch_size!=-1 else None,
-
-                                                 batch_sampler=sampler if self.batch_size==-1 else None,
-                                                # shuffle = True if (sampler==None) else False,
-                                                 pin_memory=True,
-                                                 collate_fn=collate_fn,
-                                                # prefetch_factor = prefetch_factor,                                               
-                                                )
-
-                                                 
         return dataloader
+
 
 # concat basically makes all entries one long list of sequential indexes
 # sampler creates a randomised index list to sample from list above
@@ -2206,91 +2184,12 @@ class SingleDataset(torch.utils.data.Dataset):
 
         create a custom index which sorts the entries by their length
     """
-    def __init__(self, file_path, tokenizer, line_start, line_end, inference,**kwargs):
+    def __init__(self, file_path, tokenizer, inference,**kwargs):
         self.fp = file_path
         self.tokenizer = tokenizer
-        self.line_start = line_start
-        self.line_end = line_end
         self.inference = inference
 
-        skiprows = self.line_start if self.line_start != 0 else None
-        with open(self.fp, 'r') as f:
-            if self.line_start == 0:
-
-                self.data = pd.read_csv(file_path, sep=',', header=0,
-                                        skiprows=skiprows, nrows=(self.line_end-self.line_start))
-
-            else:
-                names = open(file_path, "r").readline().strip().split(',')
-
-                self.data = pd.read_csv(file_path, sep=',',
-                                        names=names, skiprows=skiprows,
-                                        nrows=(self.line_end-self.line_start))
-
-        fp_cached_order = os.path.join(os.path.dirname(
-            file_path), f"gpt2_dict_lens_{line_start}_to_{line_end}.pkl")
-
-        # # resetting the cached order files
-        # if os.path.exists( fp_cached_order) and "australia" in self.fp:
-        #     os.remove(fp_cached_order)
-
-    
-        if os.path.exists(fp_cached_order):
-            dict_cached_order = pickle.load(open(fp_cached_order, "rb"))
-            self.np_textlens = dict_cached_order['np_textlens']
-            self.np_rstlens = dict_cached_order['np_rstlens']
-            self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
-
-        else:
-            # len of text
-            # self.np_textlens = self.data.txt_preproc.str.len().to_numpy() #.argsort()
-
-            self.np_textlens = np.stack(
-                [self.tokenizer.encode(ujson.loads(txt), return_tensors='np', add_special_tokens=False,
-                                    truncation=False, padding='do_not_pad').size for txt in self.data.txt_preproc.values.tolist()]
-            )
-            # np_rstlens and np_keyphrase_lens used by the sampler
-
-            # len of rst
-            self.np_rstlens = np.array(
-                [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
-
-            # len of keyphrase
-            
-            # self.np_keyphrase_lens = np.array( [len(li_pos_kp) +
-            #                                          len( sum( [pos_kp[1].split() for pos_kp in json.loads(li_pos_kp)], []) ) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
-
-            li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
-
-            li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-
-            li_kp = [ ''.join(['<|kp|> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
-
-            self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
-                                        add_special_tokens=False, 
-                                        truncation=False,
-                                        padding = 'do_not_pad',
-                                        return_tensors=None).__len__() for kp in li_kp ] )
-
-
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens}
-
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-
-        # # These ones below are used during the RSTTokenizers encode_input function to pad rst and kp
-        # #v1 We initialize the rst/kp  lengths as the max lengths of our training set
-        # # In the Sampler, we change the max length to that of its pre-prescribed batch
-        # self.rst_len = [tokenizer.max_len_rst]*self.__len__()
-        # self.key_phrase_len = [tokenizer.max_len_key_phrase]*self.__len__()
-
-        #v2 We initialize the rst/kp lengths as the actual length of each entry
-        # In the Sampler, we change the max length to that of its pre-prescribed batch
-        self.rst_len = self.np_rstlens
-        self.key_phrase_len = self.np_keyphrase_lens
-
-        self.data = self.data.to_dict('records')
+        self.data = pd.read_csv(self.fp, sep=',', header=0 )
 
     def __len__(self):
         #return (self.line_end - self.line_start)
@@ -2298,7 +2197,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
 
-        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu = self.getitem_extract_datum(
+        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, qprompt = self.getitem_extract_datum(
             index)
 
         if self.inference == True:
@@ -2311,9 +2210,12 @@ class SingleDataset(torch.utils.data.Dataset):
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu,
                                                   rst_len=self.rst_len[index],
-                                                  key_phrase_len=self.key_phrase_len[index]
+                                                  key_phrase_len=self.key_phrase_len[index],
+                qprompt = qprompt
+
                                                   )
 
+            encoded['orig_qprompt'] = qprompt
             encoded['orig_rst_rels'] = rst_rels
             encoded['orig_rst_ns'] = rst_ns
             encoded['orig_rst_pos'] = rst_pos
@@ -2324,6 +2226,7 @@ class SingleDataset(torch.utils.data.Dataset):
             encoded['orig_dict_pos_edu'] = dict_pos_edu
             encoded['orig_li_kprstpos'] = li_kprstpos
 
+
         elif self.inference==False:
 
             encoded = self.tokenizer.encode_input(
@@ -2333,7 +2236,8 @@ class SingleDataset(torch.utils.data.Dataset):
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
                 rst_len=self.rst_len[index],
-                key_phrase_len=self.key_phrase_len[index]
+                key_phrase_len=self.key_phrase_len[index],
+                qprompt = qprompt
             )
   
         return encoded
@@ -2373,249 +2277,12 @@ class SingleDataset(torch.utils.data.Dataset):
         utterance = ujson.loads(datum['txt_preproc'])
 
         #pos and edus
-        dict_pos_edu = json.loads(datum['dict_pos_edu'])   
+        dict_pos_edu = json.loads(datum.get( ['dict_pos_edu']) )   
 
+        #prompt
+        qprompt = ujson.loads( datum['prompt'].values[0] ) + "\n"
 
-        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu
-
-class SizedOrdered_Sampler(Sampler[int]):
-    r"""Samples elements sequentially, always in the same order.
-    #TODO; add this to pytorch. Sampler to sort nlp datasets by size
-    Args:
-        data_source (Dataset): dataset to sample from
-    """
-
-    def __init__(self, data_source, batch_size, shuffle, batching_style='effecient' ) -> None:
-        self.data_source = data_source
-        self.batch_size = batch_size
-
-                #v1
-        if batching_style=='standard':
-            self.li_chunked_ordered_lens = list(range(len(self.data_source)))
-            random.shuffle(self.li_chunked_ordered_lens)
-        
-        else:
-            np_txt_lens = np.concatenate(
-                [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-            np_rst_lens = np.concatenate(
-                [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-            np_key_phrase_lens = np.concatenate(
-                [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
-
-            # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
-            np_ordered_lens = np.lexsort(
-                (np_rst_lens, np_key_phrase_lens, np_txt_lens))
-            # We Randomly re-arrange them in batches of batch size
-        
-            li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
-
-
-            if shuffle:
-                random.shuffle(li_chunked_lens)
-
-            # Getting max sizes for rst in each chunk
-            self.li_chunk_rst_len = [
-                np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
-            
-            self.li_chunk_key_phrase_len = [
-                np.take(np_key_phrase_lens, idxs).max() for idxs in li_chunked_lens] 
-            
-            if self.batch_size != -1:
-                self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
-            else:
-                self.li_chunked_ordered_lens = li_chunked_lens  
-
-            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-            for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-                rst_len = self.li_chunk_rst_len[chunk_idx]
-                key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
-
-                for data_idx in data_idxs:
-                    dataset_idx = bisect.bisect_right(
-                        self.data_source.cumulative_sizes, data_idx)
-
-                    if dataset_idx == 0:
-                        sample_idx = data_idx
-                    else:
-                        sample_idx = data_idx - \
-                            self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
-                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
-
-    def __iter__(self):
-        return iter(self.li_chunked_ordered_lens)
-
-    def __len__(self) -> int:
-        if self.batch_size != -1:
-            return len(self.data_source)
-        else:
-            return len( self.li_chunked_ordered_lens )
-
-class SizedOrdered_DistributedSampler(Sampler[T_co]):
-    r"""
-        Adapted so that each process takes sequential indices as opposed to strides across indices
-    """
-    r"""Sampler that restricts data loading to a subset of the dataset.
-        It is especially useful in conjunction with
-        :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
-        process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
-        :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
-        original dataset that is exclusive to it.
-        .. note::
-            Dataset is assumed to be of constant size.
-        Args:
-            dataset: Dataset used for sampling.
-            num_replicas (int, optional): Number of processes participating in
-                distributed training. By default, :attr:`world_size` is retrieved from the
-                current distributed group.
-            rank (int, optional): Rank of the current process within :attr:`num_replicas`.
-                By default, :attr:`rank` is retrieved from the current distributed
-                group.
-            shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
-                indices.
-            seed (int, optional): random seed used to shuffle the sampler if
-                :attr:`shuffle=True`. This number should be identical across all
-                processes in the distributed group. Default: ``0``.
-            drop_last (bool, optional): if ``True``, then the sampler will drop the
-                tail of the data to make it evenly divisible across the number of
-                replicas. If ``False``, the sampler will add extra indices to make
-                the data evenly divisible across the replicas. Default: ``False``.
-        .. warning::
-            In distributed mode, calling the :meth:`set_epoch` method at
-            the beginning of each epoch **before** creating the :class:`DataLoader` iterator
-            is necessary to make shuffling work properly across multiple epochs. Otherwise,
-            the same ordering will be always used.
-        Example::
-            >>> sampler = DistributedSampler(dataset) if is_distributed else None
-            >>> loader = DataLoader(dataset, shuffle=(sampler is None),
-            ...                     sampler=sampler)
-            >>> for epoch in rDange(start_epoch, n_epochs):
-            ...     if is_distributed:
-            ...         sampler.set_epoch(epoch)
-            ...     train(loader)
-        """
-
-    def __init__(self, dataset: Dataset, batch_size: int,
-                 num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None,
-                 seed: int = 0,
-                 shuffle: bool = False,
-                 gpus: int = 2) -> None:
-
-        self.batch_size = batch_size
-
-        if num_replicas is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            #num_replicas = dist.get_world_size()
-            num_replicas = gpus
-        if rank is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            #rank = dist.get_rank()
-            rank = _get_rank()
-        if rank >= num_replicas or rank < 0:
-            raise ValueError(
-                "Invalid rank {}, rank should be in the interval"
-                " [0, {}]".format(rank, num_replicas - 1))
-
-        # normal code
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.epoch = 0
-
-        # self.num_samples
-        #self.total_size = self.num_samples * self.num_replicas
-        self.seed = seed
-
-        # new code
-        #self.dataset = dataset
-        self.data_source = dataset
-        np_txt_lens = np.concatenate(
-            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-        np_rst_lens = np.concatenate(
-            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-        np_key_phrase_lens = np.concatenate(
-            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
-
-        # Indices are sorted in order of the text lens of records in the datasets
-        np_ordered_lens = np.lexsort(
-            (np_rst_lens, np_key_phrase_lens, np_txt_lens))
-
-        # We Randomly re-arrange them in batches of batch size
-        li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                           for idx in range(0, np_ordered_lens.size-batch_size, batch_size)]
-
-        # Divide into n sublists,
-        # Each sublist at index i, contains the indices for process at rank i
-        # Each sublist at index i, is a list non flatten indices. Each index represents items in the dataset
-
-        li_li_chunked_lens = [
-            [li_chunked_lens[(self.num_replicas*idx)+_rank]
-             for idx in range(len(li_chunked_lens)//self.num_replicas)]
-                for _rank in range(self.num_replicas)]
-
-        # shuffle each processes subllist in the same order to optimize paralel training
-        _ = list(zip(*li_li_chunked_lens))
-
-        if shuffle:
-            random.shuffle(_)
-        
-        # unpacking into worker size length list 
-        li_li_chunked_lens = list(zip(*_))
-
-        # Getting max sizes for rst and key_phrase in each chunk
-        self.li_li_chunk_rst_len = [ [np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens ] 
-                                            for li_chunked_lens in li_li_chunked_lens ]
-        self.li_li_chunk_key_phrase_len = [ [
-                np.take(np_key_phrase_lens, idxs).max() 
-                for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens ]
-
-        self.li_li_chunked_ordered_lens = [ np.concatenate(li_chunked_lens).tolist() for li_chunked_lens in li_li_chunked_lens ]
-        
-        for (li_chunked_lens, li_chunk_rst_len) in zip( li_li_chunked_lens, self.li_li_chunk_rst_len ) :
-            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-            
-            for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-                rst_len = li_chunk_rst_len[chunk_idx]
-                key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
-
-                for data_idx in data_idxs:
-                    dataset_idx = bisect.bisect_right(
-                        self.data_source.cumulative_sizes, data_idx)
-
-                    if dataset_idx == 0:
-                        sample_idx = data_idx
-                    else:
-                        sample_idx = data_idx - \
-                            self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
-                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
-                
-    def __iter__(self) -> Iterator[T_co]:
-
-        return iter(self.li_li_chunked_ordered_lens[self.rank])
-
-    def __len__(self) -> int:
-        if self.batch_size != -1:
-            return len(self.data_source)
-        else:
-            return len( self.li_li_chunked_ordered_lens[0] )
-
-    def set_epoch(self, epoch: int) -> None:
-        r"""
-        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
-        use a different random ordering for each epoch. Otherwise, the next iteration of this
-        sampler will yield the same ordering.
-        Args:
-            epoch (int): Epoch number.
-        """
-        self.epoch = epoch
+        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, qprompt
 
 def main(tparams={}, mparams={}):
 

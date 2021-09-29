@@ -3,6 +3,9 @@ import os
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
 
+import faulthandler
+import signal
+faulthandler.register(signal.SIGUSR1.value)
 from collections import OrderedDict
 import argparse
 import bisect
@@ -1214,7 +1217,9 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 li_attn_vectors = []
 
                 # li_pos_edu_idslen_ids will be a list  containing the rst_pos, edu_ids and ids_len for each edu
-                li_pos_edu_idslen_ids = sorted( [[pos, edu, None, None] for pos, edu in dict_pos_edu.items()],
+                
+
+                li_pos_edu_idslen_ids = sorted( [[str(self.clamp_values(np.array(int(pos)),utils.MAX_LONG_VALUE).item(0)), edu, None, None] for pos, edu in dict_pos_edu.items()],
                                                 key=lambda x: RSTTokenizer.edukp_pos_sort_function(
                                                     int(x[0]) ) )
                 
@@ -1669,7 +1674,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         save_model_callback = SaveModelCallBack()
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
-        callbacks.append(save_model_callback)
+        # callbacks.append(save_model_callback)         
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -1908,7 +1913,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
         
-        if step_name == "val" and _get_rank() == 0:
+        if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
             
@@ -1972,7 +1977,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
                 generation_params = copy.deepcopy(self.model.generation_params)
                 # generation_params['max_length'] = 60
-                generation_params['max_time'] = 10
+                generation_params['max_time'] = 30
                 decoded_text = self.model.generate_plus( encoded_input, generation_params )
 
                 datum = {

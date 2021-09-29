@@ -18,17 +18,52 @@ from transformers.generation_logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from functools import lru_cache, reduce
-
+from functools import lru_cache
+import nltk
 import math
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_convert
 from torch._six import string_classes
 import collections
+from itertools import groupby
 
 import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate_err_msg_format
 from transformers.generation_beam_search import BeamHypotheses
+
+import regex as re
+
+pattern_punctuation_space = re.compile(r'\s([?.!";:#_](?:\s|$))')
+pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
+             "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
+                                          # but not after an acronym
+             "\w(?:\.\w)|"+               # start/middle of acronym
+             "(?<=\w\.)\w",               # end of acronym
+             )
+pattern_apostrophe = re.compile(r"\b\s+'\b")
+pattern_brackets_rm_space = re.compile('\(\s*(.*?)\s*\)')
+
+import pytextrank
+import en_core_web_sm
+sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
+    #install using python -m spacy download en_core_web_sm
+nlp = en_core_web_sm.load()
+
+from spacy.language import Language
+
+try:
+    nlp.add_pipe("textrank", last=True)
+    
+except Exception as e:
+
+    @Language.component("textrank")
+    def textrank(doc):
+        tr = pytextrank.TextRank()
+        doc = tr.PipelineComponent(doc)
+        return doc
+
+    nlp.add_pipe("textrank", last=True)
+
 
 #region loading and saving
 def get_path(_path,_dir=False):
@@ -153,7 +188,7 @@ tree_order = {
 # function which returns position in tree based on the binary tuple indicating left,rights down a tree
 def tree_order_func(tuple_pos):
     
-    pos = 0
+    pos = 0 
     for binary_left_right in tuple_pos:
         pos = 2*pos + 2**binary_left_right
     
@@ -602,6 +637,242 @@ class EffeciencyMixin():
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 
 #endregion
+
+#region data making
+
+def edu_fixer(li_textwedutoken, li_text):
+        
+    li_li_edus = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]
+    
+    for li_edutext in li_li_edus:
+        for idx2,elem in enumerate(li_edutext):
+            elem.reverse() #reversing list of words in an edu
+            it = enumerate(elem)
+            edu_len = len(elem) 
+            elem_new =  [next(it)[1]+str_ if ( idx!=edu_len-1 and (str_[0] == "'" or str_ in ["n't", ".", "?", "!", ",", "[", "]" ]) ) else str_ for idx,str_ in it]
+            elem_new.reverse()
+
+            li_edutext[idx2] = elem_new
+
+    # for each utterance, merge list of words into one text
+    li_li_edus = [ [ ' '.join( edus ) for edus in li_edus ] for li_edus in li_li_edus ]
+    
+    # Fixing:
+        # random spaces in words due to splitting at apostrophes such as isn 't
+        # random spaces due to splitting at forward slash
+        # random spaces due to converting brakcests to - LRB - and - RRB - codes
+    li_li_edus = [ [edutxt.replace(" n't", "n't").replace(" / ", "/").replace(" '", "'").replace("- LRB -", "(").replace("- RRB -", ")").replace("-LRB-", "(").replace("-RRB-", ")")
+                     if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_text) ]
+    
+    #outer re.sub does that space inbetween brakcets/
+    li_li_edus = [ [ re.sub('\[\s*(.*?)\s*\]', r'[\1]', re.sub( pattern_punctuation_space, r"'", edutxt)) for edutxt in li_edutext] for li_edutext in  li_li_edus ]
+    for idx in range(len(li_li_edus)):
+        li_edus = li_li_edus[idx]
+        li_edus =  [ re.sub(pattern_brackets_rm_space, r'(\1)', edu_text) for edu_text in li_edus ]
+        li_edus =  [ re.sub(pattern_punctuation_space, r'\1', edu_text) for edu_text in li_edus ]
+
+    return li_li_edus
+
+def split(sequence, sep):
+    chunk = []
+    for val in sequence:
+        if val == sep:
+            yield chunk
+            chunk = []
+        else:
+            chunk.append(val)
+    yield chunk
+
+def non_parseable_remover(li_dict_rsttext):
+    if len(li_dict_rsttext) == 0:
+        return li_dict_rsttext
+
+    # check if the edus in dict_pos_edu and the normal utterance have a specific level of coverage
+    # if they do then continue
+    # if they don't then pop li_edus
+    for idx in reversed(list( range(len(li_dict_rsttext)))):
+
+        edu_text = re.sub(pattern_brackets_rm_space, r'(\1)', " ".join( li_dict_rsttext[idx]['li_edus'] ) )
+        edu_text = re.sub( pattern_punctuation_space, r'\1', edu_text )
+        len_edu_text = len(  edu_text.split(' ') )
+
+        len_text = len( li_dict_rsttext[idx]['txt_preproc'].split(' ') )
+
+        if len_edu_text<min( len_text*0.85, len_text-1) or len_edu_text>max( 1.15*len_text, 1+len_text):
+            
+            li_dict_rsttext.pop(idx)
+
+            # #pop dict_pos_edu and li_edus
+            # li_dict_rsttext[idx].pop('dict_pos_edu')
+            # li_dict_rsttext[idx].pop('li_edus')
+            # li_dict_rsttext[idx].pop('rst')
+            # # raise NotImplementedError("need to replace the rst tree for these cases since the text was truncated") 
+
+
+            #making dict_pos_edu and li_edus again
+
+    return li_dict_rsttext
+
+def position_edus(li_dict_rsttext):
+    #Creates dict_pos_edu
+    if len(li_dict_rsttext) == 0:
+        return li_dict_rsttext
+         
+    for idx in range(len(li_dict_rsttext)):
+        
+        if 'dict_pos_edu' in li_dict_rsttext[idx]:
+            continue            
+
+        li_rst_pos = [ rst_node['pos'] for rst_node in li_dict_rsttext[idx]['rst'] ]
+        
+        li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
+
+        # sorting the child_pos by their rst order
+        li_child_pos = sorted( li_child_pos, key= lambda pos: RstTokenizerMixin.edukp_pos_sort_function(pos) )
+
+        li_edus = li_dict_rsttext[idx].pop('li_edus')
+
+        dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edus ) }
+        
+        li_dict_rsttext[idx]['dict_pos_edu'] = dict_pos_edu
+    
+    return li_dict_rsttext
+
+
+def _parse_trees(li_strtree):
+    
+    #parses tree into an nltk object
+    li_subtrees = []
+
+    # Parsing a list of subtrees in the utterance tree li_strtree
+    for idx, pt_str in enumerate(li_strtree):
+        try:
+            if pt_str in ['',None]: raise ValueError
+            _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
+        except ValueError:
+            _ = None
+            pass
+        li_subtrees.append(_)
+    
+    return li_subtrees
+
+
+def _tree_to_rst_code(_tree):
+    """Converst RST Tree to rst code used in NLG model
+
+        Args:
+            method (int, optional): [description]. Defaults to 1.
+        
+        Return:
+            if method==0:
+                Three lists zipped together
+                List 1 Represents A Flattened version of the rst relations in the RST tree
+                List 2 the nuclearity/satellite couple type e.g. N-N or NS
+                List 3 The position in a binary tree of max depth 5
+
+                #TODO: possibly figure out some way to normalize this vector
+    """
+
+    # Getting List 1 and 2
+    li_rels_ns = []
+    
+    for depth in range( _tree.height(),1,-1 ):
+        
+        # sublist of rst relation and nuclearity tag
+        subli_rels_ns = [  re.findall(r'[a-zA-Z\-]+' ,sub_tree._label)  for sub_tree in _tree.subtrees() if sub_tree.height()==depth  ]
+        subli_rels_ns = [ [ _li[0], ''.join(_li[1:]).lstrip('unit') ] for _li in subli_rels_ns ]
+
+        li_rels_ns.extend(subli_rels_ns)
+
+    # Getting List 3
+        #getting position of all non leave
+    tree_pos = _tree.treepositions()
+    leaves_pos = _tree.treepositions('leaves')
+    pos_xleaves = list(set(tree_pos) - set(leaves_pos)) #unordered
+    pos_xleaves = [  tuple(x if x<2 else 1 for x in _tuple ) for _tuple in pos_xleaves]        #binarizing ( correcting any number above 1 to 1)
+        # reording pos_xleaves to breadfirst ordering
+    #li_bintreepos = sorted([ utils_nlg.tree_order.get(x,-1) for x in pos_xleaves])
+    li_bintreepos = sorted( [tree_order_func(x) for x in pos_xleaves] )
+
+    # Zipping List 1 2 and 3
+    li_dict_rels_ns_bintreepos = [  {'rel':rels_ns[0], 'ns':rels_ns[1], 'pos': bintreepos } for rels_ns,bintreepos in zip(li_rels_ns,li_bintreepos) if bintreepos!=-1 ]
+
+    return li_dict_rels_ns_bintreepos
+
+def _tree_to_li_du(_tree, li_results=None):
+    ### Takes an RST encoded tree and extracts mutually exclusive discourse units
+        # that cover the whole span of the tree. This method uses recursive operations 
+        # and updates an th li_results object inplace
+
+    direct_childs = len(_tree)
+    li_child = [ _tree[idx] for idx in range(direct_childs) ]
+
+    # Formatting children that arent trees, but are one word, by Combining consecutive one word children into an utterance
+    groups = []
+    keys = []
+    for k, g in groupby(li_child, type):  #grouping by type= str and nltk.tree.Tree
+        groups.append(list(g))      # Store group iterator as a list
+        keys.append(k)
+
+    _ = [ [' '.join(group)] if key==str else group for group,key in zip(groups,keys) ] #concatenating the string groups
+    li_child = sum( _, [] )
+    direct_childs = len(li_child)
+    
+    # Parsing children to strings
+    li_du_str = [ __parse_leaves(child.leaves()) if type(child)==nltk.tree.Tree else __parse_leaves(child) for child in li_child ]
+    
+    if(li_results == None):
+        li_results = []
+    
+    #if tree has two subnodes
+    for idx in range(direct_childs):
+        
+        # If child was a string always add to list since it cant be broken down furhter
+        if type(li_child[idx]) == str:
+            li_results.append(li_du_str[idx])
+            continue
+
+        # otherwise segment to sentence
+        li_segmented_utt = sent_detector.tokenize(li_du_str[idx])
+
+        #If over two sentences long then perform the method again
+        if len(li_segmented_utt) <= 2:            
+            li_results.append(li_du_str[idx])
+            
+        elif len(li_segmented_utt) > 2 :
+            #try:
+            _tree_to_li_du(li_child[idx], li_results ) 
+    
+    return li_results
+
+def __parse_leaves(tree_leaves ):
+   #     """tree_leaves is list of subsections of an annotated discourse unit
+   #     ['_!Three','new', 'issues', 'begin', 'trading', 'on', 'the',
+   #  'New', 'York', 'Stock', 'Exchange', 'today', ',!_', '_!and', 'one',
+   #  'began', 'trading', 'on', 'the', 'Nasdaq/National', 'Market', 'System',
+   #  'last', 'week', '.', '<P>!_'
+    
+   if type(tree_leaves) == list:
+      tree_leaves = ' '.join(tree_leaves)
+
+   #removing tree labels
+   _str = re.sub('(_\!|<P>|\!_|<s>)',"", tree_leaves )
+   # removing whitespace preceeding a punctuation
+   _str2 = re.sub('(\s){1,2}([,.!?\\-\'])',r'\2',_str )
+
+   _str3 = re.sub('  ',' ',_str2).strip()
+
+   return _str3
+
+
+def find_child_edus(pos_parentnode, li_rst_pos):
+        #returns the pos of any child elements of a parent node(rst) that are edus
+               
+        li_child_pos = [2*pos_parentnode+1, 2*pos_parentnode+2 ]
+
+        li_child_edu_pos = [ pos for pos in li_child_pos if pos not in li_rst_pos]
+
+        return li_child_edu_pos 
 
 #region Generation Mixins
 

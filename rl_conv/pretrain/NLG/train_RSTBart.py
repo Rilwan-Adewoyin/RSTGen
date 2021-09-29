@@ -1496,12 +1496,12 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     # val_check_interval=0.05,
                                                     limit_train_batches = 0.05,
-                                                    limit_val_batches = 0.05,
+                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     # track_grad_norm=2,
-                                                    gradient_clip_val=0.5,
+                                                    # gradient_clip_val=0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -1515,7 +1515,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
                                                     limit_train_batches = 0.05,
-                                                    limit_val_batches = 0.05,
+                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
