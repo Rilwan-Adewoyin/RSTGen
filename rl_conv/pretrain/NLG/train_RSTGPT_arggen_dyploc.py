@@ -1,7 +1,6 @@
 import os
 
-# from torch.optim import lr_scheduler
-
+from numpy.core.fromnumeric import diagonal
 
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
@@ -31,7 +30,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformers
-from transformers import BartForConditionalGeneration
 import ujson
 import yaml
 from pytorch_lightning import loggers as pl_loggers
@@ -45,20 +43,22 @@ from torch.utils.data import Sampler
 from torch.utils.data._utils.collate import default_convert
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import Sampler
-from transformers import (BartConfig, BartTokenizer,
-                          BartTokenizerFast, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup)
+
+from transformers import GPT2Config, GPT2Tokenizer, GPT2TokenizerFast, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from transformers.modeling_outputs import (BaseModelOutput, ModelOutput,
-                                           Seq2SeqLMOutput, Seq2SeqModelOutput)
-from transformers.models.bart.modeling_bart import (
-    BartForConditionalGeneration, _expand_mask, shift_tokens_right)
+                                           Seq2SeqLMOutput, Seq2SeqModelOutput, 
+                                            BaseModelOutputWithPastAndCrossAttentions,
+                                            CausalLMOutputWithCrossAttentions
+                                           )
+from transformers import GPT2LMHeadModel
+
 from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
 
 import utils_nlg_v3 as utils
-from utils_nlg_v3 import EmbeddingRstPos, EmbeddingRstPos_v2 ,mpatch_save_model
+from utils_nlg_v3 import EmbeddingRstPos, EmbeddingRstPos_v2, mpatch_save_model
 
 import torch_optimizer as optim
-
 
 T_co = TypeVar('T_co', covariant=True)
 
@@ -67,6 +67,7 @@ mp2 = "../DockerImages/feng_hirst_rst_parser"
 mp3 = "../DockerImages/feng_hirst_rst_parser/src"
 mp4 = "../DockerImages/feng_hirst_rst_parser/model"
 modules_paths = [mp1, mp2, mp3, mp4]
+
 import sys
 
 for path_ in modules_paths:
@@ -74,44 +75,255 @@ for path_ in modules_paths:
         sys.path.append(path_)
 from torch.nn.utils.rnn import pad_sequence
 
+from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
-# patched method
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+from pytorch_lightning.callbacks import Callback
+
+class SaveModelCallBack(Callback):
+
+    def on_train_end(self, trainer, pl_module):
+
+        # Saving Model using the pytorch method.
+        # This allows relaoding using from_pretrained
+        os.makedirs(f"./models_pt/{pl_module.model_name}/version_{trainer.logger.version}/", exist_ok=True)
+        
+        pl_module.model.save_pretrained(
+            f"./models_pt/{pl_module.model_name}/version_{trainer.logger.version}/")
+        
+        if pl_module.model.rst_tree_aligned_attention:
+            pl_module.model.self.rst_parser.unload()    
+
+
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype ):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
     ndim = mask.ndim
     if ndim == 2:
-        bsz, src_len = mask.size()
+        bsz, src_len = mask.shape
 
-        tgt_len = tgt_len if tgt_len is not None else src_len
 
-        expanded_mask = mask[:, None, None, :].expand(
-            bsz, 1, tgt_len, src_len).to(dtype)
+        attention_mask = mask[:, None, None, :].to(dtype)
 
     elif ndim == 3:
-        bsz, tgt_len_, src_len = mask.size()
         
-        expanded_mask = mask[:, None, :, :].expand(
-            bsz, 1, tgt_len_, src_len).to(dtype)
+        attention_mask = mask[:, None, :, :].to(dtype)
 
     else:
         raise ValueError("Encoder Attention mask should have three dimensions Decoder Attention mask should have two dimensions")
         
-    inverted_mask = 1.0 - expanded_mask
+    attention_mask = (1.0 - attention_mask) * -10000.0
 
-    return inverted_mask.masked_fill(inverted_mask.bool(), torch.finfo(dtype).min)
+    return attention_mask
 
-transformers.models.bart.modeling_bart._expand_mask = _expand_mask
 
-class RSTBart_Config(BartConfig):
+# Monkey patched forward method for GPT2
+def GPT2_forward(
+    self,
+    input_ids=None,
+    past_key_values=None,
+    attention_mask=None,
+    token_type_ids=None,
+    position_ids=None,
+    position_embeds=None,
+    head_mask=None,
+    inputs_embeds=None,
+    encoder_hidden_states=None,
+    encoder_attention_mask=None,
+    use_cache=None,
+    output_attentions=None,
+    output_hidden_states=None,
+    return_dict=None,
+    ):
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if input_ids is not None and inputs_embeds is not None:
+        raise ValueError(
+            "You cannot specify both input_ids and inputs_embeds at the same time")
+    elif input_ids is not None:
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+        batch_size = input_ids.shape[0]
+    elif inputs_embeds is not None:
+        input_shape = inputs_embeds.size()[:-1]
+        batch_size = inputs_embeds.shape[0]
+    else:
+        raise ValueError(
+            "You have to specify either input_ids or inputs_embeds")
+
+    device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+    if token_type_ids is not None:
+        token_type_ids = token_type_ids.view(-1, input_shape[-1])
+    if position_embeds is None and position_ids is not None:
+        position_ids = position_ids.view(-1, input_shape[-1])
+
+    if past_key_values is None:
+        past_length = 0
+        past_key_values = tuple([None] * len(self.h))
+    else:
+        past_length = past_key_values[0][0].size(-2)
+
+    if position_embeds is None and position_ids is None:
+        position_ids = torch.arange(
+            past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+
+    # GPT2Attention mask.
+    if attention_mask is not None:
+        if batch_size <= 0:
+            raise ValueError("batch_size has to be defined and > 0")
+            
+        attention_mask = _expand_mask( attention_mask, self.dtype)
+
+    # If a 2D ou 3D attention mask is provided for the cross-attention
+    # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+    if self.config.add_cross_attention and encoder_hidden_states is not None:
+        encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+        encoder_hidden_shape = (
+            encoder_batch_size, encoder_sequence_length)
+        if encoder_attention_mask is None:
+            encoder_attention_mask = torch.ones(
+                encoder_hidden_shape, device=device)
+        encoder_attention_mask = self.invert_attention_mask(
+            encoder_attention_mask)
+    else:
+        encoder_attention_mask = None
+
+    # Prepare head mask if needed
+    # 1.0 in head_mask indicate we keep the head
+    # attention_probs has shape bsz x n_heads x N x N
+    # head_mask has shape n_layer x batch x n_heads x N x N
+    head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.wte(input_ids)
+    
+    if position_embeds is None:
+        position_embeds = self.wpe(position_ids)
+    
+    hidden_states = inputs_embeds + position_embeds
+
+    if token_type_ids is not None:
+        token_type_embeds = self.wte(token_type_ids)
+        hidden_states = hidden_states + token_type_embeds
+
+    hidden_states = self.drop(hidden_states)
+
+    output_shape = input_shape + (hidden_states.size(-1),)
+
+    presents = () if use_cache else None
+    all_self_attentions = () if output_attentions else None
+    all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+    all_hidden_states = () if output_hidden_states else None
+    for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+
+        # Model parallel
+        if self.model_parallel:
+            torch.cuda.set_device(hidden_states.device)
+            # Ensure layer_past is on same device as hidden_states (might not be correct)
+            if layer_past is not None:
+                layer_past = tuple(past_state.to(hidden_states.device)
+                                    for past_state in layer_past)
+            # Ensure that attention_mask is always on the same device as hidden_states
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(hidden_states.device)
+            if isinstance(head_mask, torch.Tensor):
+                head_mask = head_mask.to(hidden_states.device)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if getattr(self.config, "gradient_checkpointing", False) and self.training:
+
+            if use_cache:
+                logger.warning(
+                    "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
+                    "`use_cache=False`..."
+                )
+                use_cache = False
+
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    # None for past_key_value
+                    return module(*inputs, use_cache, output_attentions)
+
+                return custom_forward
+
+            outputs = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block),
+                hidden_states,
+                None,
+                attention_mask,
+                head_mask[i],
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+        else:
+            outputs = block(
+                hidden_states,
+                layer_past=layer_past,
+                attention_mask=attention_mask,
+                head_mask=head_mask[i],
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+
+        hidden_states = outputs[0]
+        if use_cache is True:
+            presents = presents + (outputs[1],)
+
+        if output_attentions:
+            all_self_attentions = all_self_attentions + \
+                (outputs[2 if use_cache else 1],)
+            if self.config.add_cross_attention:
+                all_cross_attentions = all_cross_attentions + \
+                    (outputs[3 if use_cache else 2],)
+
+        # Model Parallel: If it's the last layer for that device, put things on the next device
+        if self.model_parallel:
+            for k, v in self.device_map.items():
+                if i == v[-1] and "cuda:" + str(k) != self.last_device:
+                    hidden_states = hidden_states.to("cuda:" + str(k + 1))
+
+    hidden_states = self.ln_f(hidden_states)
+
+    hidden_states = hidden_states.view(*output_shape)
+    # Add last hidden state
+    if output_hidden_states:
+        all_hidden_states = all_hidden_states + (hidden_states,)
+
+    if not return_dict:
+        return tuple(
+            v
+            for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+            if v is not None
+        )
+
+    return BaseModelOutputWithPastAndCrossAttentions(
+        last_hidden_state=hidden_states,
+        past_key_values=presents,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attentions,
+        cross_attentions=all_cross_attentions,
+    )
+
+class RSTGPT2_Config(GPT2Config):
 
     def __init__(self,
-                 base_model_name='facebook/bart-base',
-                 model_name="RSTBart",
+                 base_model_name='gpt2',
+                 model_name="RSTGPT2",
                  scale_grad_by_freq=True,
                  max_len_rst=28,
                  max_len_key_phrase=30,
@@ -121,7 +333,6 @@ class RSTBart_Config(BartConfig):
                  **kwargs):
 
         super().__init__(**kwargs)
-        # self = super().from_pretrained(base_model_name)
 
         self.base_model_name = base_model_name
         self.model_name = model_name
@@ -138,15 +349,23 @@ class RSTBart_Config(BartConfig):
         self.rst_ns_li = ['NN', 'NS', 'SN']
         self.max_rst_pos = max_rst_pos
         self.rst_added_tokens = 2
-        #self.force_bos_token_to_be_generated = True
-        self.forced_bos_token_id=self.bos_token_id
-
         self.vocab_size = self.vocab_size + self.rst_added_tokens
+    
+    def to_dict_log(self):
         
-class RSTBart(BartForConditionalGeneration):
+        return {
+            'base_model':self.base_model_name,
+            'scale_grad_by_freq':self.scale_grad_by_freq,
+            'max_len_utt':self.max_len_utt,
+            'max_len_rst':self.max_len_rst,
+            'max_len_key_phrase':self.max_len_key_phrase,
+            'rst_tree_aligned_attention':self.rst_tree_aligned_attention       
+                    }
+
+class RSTGPT2(GPT2LMHeadModel):
 
     def __init__(self,
-                 config: RSTBart_Config):
+                 config: RSTGPT2_Config):
 
         super().__init__(config)
 
@@ -157,39 +376,47 @@ class RSTBart(BartForConditionalGeneration):
         self.max_len_key_phrase = config.max_len_key_phrase
         self.max_len_utt = config.max_len_utt
         self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
-        self.model.forward = types.MethodType(bart_forward, self.model)
-        self.model.encoder.forward = types.MethodType(
-            bart_encoder_forward, self.model.encoder)
+
+        if self.rst_tree_aligned_attention:
+            self.rst_parser = DiscourseParser(verbose=False, skip_parsing=True,
+                        global_features=False)
+        
+
+        self.transformer.forward = types.MethodType(GPT2_forward, self.transformer)
                 
         self.embed_rst_rels = torch.nn.Embedding( len(self.config.rst_rel_li)+1,
-                                                 self.config.d_model, padding_idx=len(
+                                                 self.config.n_embd, padding_idx=len(
                                                      self.config.rst_rel_li),
                                                  scale_grad_by_freq=self.scale_grad_by_freq)
+        
         self.embed_rst_rels.weight.data.normal_(
-            mean=0.0, std=self.config.init_std)
+            mean=0.0, std=self.config.initializer_range)
 
         self.embed_rst_ns = torch.nn.Embedding(len(self.config.rst_ns_li)+1,
-                                               self.config.d_model, padding_idx=len(
+                                               self.config.n_embd, padding_idx=len(
                                                    self.config.rst_ns_li),
                                                scale_grad_by_freq=self.scale_grad_by_freq)
         self.embed_rst_ns.weight.data.normal_(
-            mean=0.0, std=self.config.init_std)
+            mean=0.0, std=self.config.initializer_range)
 
         self.embed_rst_pos = EmbeddingRstPos(max_rst_index=self.config.max_rst_pos,
                                              max_rst_level=RSTTokenizer.node_level(
                                                  self.config.max_rst_pos),
-                                             rst_encoding_ndim=self.config.d_model,
+                                             rst_encoding_ndim=self.config.n_embd,
                                              init_val=0.05 )
 
-        # self.embed_rst_pos = EmbeddingRstPos_v2(max_rst_index=self.config.max_rst_pos,
-        #                                      max_rst_level=RSTTokenizer.node_level(
-        #                                          self.config.max_rst_pos),
-        #                                      rst_encoding_ndim=self.config.d_model,
-        #                                      init_val=0.05 )
-
         self.loss_fct = CrossEntropyLoss()
- 
-    
+
+        #generation params
+        self.generation_params = { #'num_beams': 1, 
+                                            'bad_words_ids': [ [50257], [50258] ],
+                                            'early_stopping': True,
+                                            'do_sample':False, 
+                                            'top_k':50, 
+                                            'top_p':0.95, 
+                                            'no_repeat_ngram_size': 2,
+                                            'min_length': 5, 'max_length': 190 }
+
     def forward(self,
                 rst_start_token_id=None,
                 rst_rel=None,
@@ -197,26 +424,22 @@ class RSTBart(BartForConditionalGeneration):
                 rst_pos=None,
                 key_phrase_ids=None,
                 li_kprstpos=None,
-                position_ids=None,
+                position_ids_kp_utt=None,
                 attention_mask=None,
+                token_type_ids=None,
 
-                decoder_input_ids=None,
                 labels=None,
 
-                input_ids=None,
-                decoder_attention_mask=None,
-                decoder_cross_attention_mask=None,
+                input_ids_utt=None,
                 
-                decoder_context_rst_pos=None,
-                decoder_edu_rstpos=None,
+                context_rstpos=None,
+                edu_rstpos=None,
+                curr_edu_pos=None,
 
                 head_mask=None,
-                decoder_head_mask=None,
-                cross_attn_head_mask=None,
-                encoder_outputs=None,
                 past_key_values=None,
                 inputs_embeds=None,
-                decoder_inputs_embeds=None,
+                position_embeds=None,
                 use_cache=None,
                 output_attentions=None,
                 output_hidden_states=None,
@@ -230,73 +453,76 @@ class RSTBart(BartForConditionalGeneration):
         Returns:
         """
 
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if labels is not None:
-            if decoder_input_ids is None:
-                decoder_input_ids = shift_tokens_right(
-                    labels, self.config.pad_token_id, self.config.decoder_start_token_id
-                )
-
-        if encoder_outputs == None and inputs_embeds == None:
-            inputs_embeds = self.input_embed(
+        if inputs_embeds == None and position_embeds==None:
+            inputs_embeds, position_embeds = self.embed(
                 rst_start_token_id,
                 rst_rel,
                 rst_ns,
                 rst_pos,
                 key_phrase_ids,
                 li_kprstpos,
-                position_ids)
+                input_ids_utt,
+                position_ids_kp_utt)
 
-        outputs = self.model(input_ids,
-                             attention_mask=attention_mask,
-                             decoder_input_ids=decoder_input_ids,
-                             encoder_outputs=encoder_outputs,
-                             decoder_attention_mask=decoder_attention_mask,
-                             decoder_cross_attention_mask=decoder_cross_attention_mask,
-                             head_mask=head_mask,
-                             decoder_head_mask=decoder_head_mask,
-                             cross_attn_head_mask=cross_attn_head_mask,
-                             past_key_values=past_key_values,
-                             inputs_embeds=inputs_embeds,
-                             decoder_inputs_embeds=decoder_inputs_embeds,
-                            decoder_context_rst_pos=decoder_context_rst_pos,
-                            decoder_edu_rstpos=decoder_edu_rstpos,
-                             use_cache=use_cache,
-                             output_attentions=output_attentions,
-                             output_hidden_states=output_hidden_states,
-                             return_dict=return_dict
-                             )
+        transformer_outputs = self.transformer(
+            input_ids=None,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=None,
 
-        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+            inputs_embeds=inputs_embeds,
+            position_embeds=position_embeds,
 
-        masked_lm_loss = None
+            head_mask=head_mask,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = transformer_outputs[0]
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.transformer.first_device)
+            hidden_states = hidden_states.to(self.lm_head.weight.device)
+
+        lm_logits = self.lm_head(hidden_states)
+
+        loss = None
         if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
             # loss_fct = CrossEntropyLoss()
-            # masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
-            
-            
-            lm_logits = lm_logits.contiguous()
-            labels = labels.contiguous()
-            masked_lm_loss = self.loss_fct( lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+            loss = self.loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (lm_logits,) + outputs[1:]
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            output = (lm_logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
 
-        return Seq2SeqLMOutput(
-            loss=masked_lm_loss,
+        output = CausalLMOutputWithCrossAttentions(
+            loss=loss,
             logits=lm_logits,
-            past_key_values=outputs.past_key_values,
-            decoder_hidden_states=outputs.decoder_hidden_states,
-            decoder_attentions=outputs.decoder_attentions,
-            cross_attentions=outputs.cross_attentions,
-            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
-            encoder_hidden_states=outputs.encoder_hidden_states,
-            encoder_attentions=outputs.encoder_attentions,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
         )
 
-    def input_embed(
+        output['curr_edu_pos'] = curr_edu_pos
+        output['context_rstpos'] = context_rstpos
+        output['edu_rstpos'] = edu_rstpos
+        
+        return output
+
+    def embed(
         self,
         rst_start_token_id,
         rst_rel,
@@ -304,125 +530,152 @@ class RSTBart(BartForConditionalGeneration):
         rst_pos,
         key_phrase_ids,
         li_kprstpos,
-        position_ids
+        input_ids_utt,
+        position_ids_kp_utt
      ):
         # RST context embedding
-        rst_start_token_embed = self.model.encoder.embed_tokens(rst_start_token_id) * self.model.encoder.embed_scale
+        rst_start_token_embed = self.transformer.wte(rst_start_token_id)
         rst_rel_embed = self.embed_rst_rels(rst_rel) 
         rst_ns_embed = self.embed_rst_ns(rst_ns)
         rst_pos_embed = self.embed_rst_pos(rst_pos) 
 
-        # if rst_pos_embed.numel() == 0:
-        #     rst_pos_embed = torch.zeros_like(rst_rel_embed) 
-        #     raise ValueError
-        rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) * self.model.encoder.embed_scale
+        rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) 
 
         # Key Phrase context embedding
-        topics_phrase_embed = self.model.encoder.embed_tokens(
-            key_phrase_ids) * self.model.encoder.embed_scale
-        topics_rst_pos_embed = self.embed_rst_pos(li_kprstpos) * self.model.encoder.embed_scale
-        topics_embed = topics_rst_pos_embed + topics_phrase_embed
+        keyphrase_phrase_embed = self.transformer.wte(
+            key_phrase_ids) 
+        keyphrase_rst_pos_embed = self.embed_rst_pos(li_kprstpos)
+        keyphrase_embed = keyphrase_rst_pos_embed + keyphrase_phrase_embed
 
+        #input_id embedding
+        utt_inputs_embeds = self.transformer.wte(input_ids_utt)
+        
         inputs_embeds = torch.cat([
             rst_start_token_embed,
             rst_embed,
-            topics_embed,
+            keyphrase_embed,
+            utt_inputs_embeds,
         ], axis=-2)
 
-        # Position Embedding
-        position_embed = super(type(self.model.encoder.embed_positions), 
-                            self.model.encoder.embed_positions).forward(
-                                position_ids + self.model.encoder.embed_positions.offset)
+        # Position Embedding       
+        position_embed_kp_utt =  self.transformer.wpe(position_ids_kp_utt)
+        _  = position_embed_kp_utt.shape
+        position_embed_rst = position_embed_kp_utt.new_zeros( [ _[0], 1+rst_rel_embed.shape[1] ,_[2] ] ) 
+        position_embed = torch.cat( [position_embed_rst, position_embed_kp_utt], axis=1)
+
+
+        return inputs_embeds, position_embed
+
+    def generate_plus(self, encoded_input, generation_params=None):
+
+        if generation_params == None:
+            generation_params = self.generation_params
+
+        # moving to gpu
+        for k in list(encoded_input.keys()):
+            encoded_input[k] = encoded_input[k].to(self.device )
+
+        # generating
+        with torch.no_grad():
+            input_ids = encoded_input.get('input_ids_utt')
+
+            inputs_embeds, position_embeds = self.embed( encoded_input['rst_start_token_id'],
+                                                         encoded_input['rst_rel'],
+                                                         encoded_input['rst_ns'],
+                                                         encoded_input['rst_pos'],
+                                                         encoded_input['key_phrase_ids'],
+                                                         encoded_input['li_kprstpos'],
+                                                         encoded_input['input_ids_utt'],
+                                                         encoded_input['position_ids_kp_utt'] )
+
+            encoded_input['inputs_embeds'], encoded_input['position_embeds'] = inputs_embeds, position_embeds
+            output = self.generate( 
+                input_ids, use_cache=True, **encoded_input, **generation_params)    
+            output = output[0]
         
-        inputs_embeds += position_embed
+        decoded_text = self.RSTTokenizer.decode(output,
+                                            skip_special_tokens=False)
 
-        return inputs_embeds
+        return decoded_text
 
-    def prepare_inputs_for_generation(
-        self,
-        decoder_input_ids,
-        past=None,
-        attention_mask=None,
-        head_mask=None,
-        decoder_head_mask=None,
-        cross_attn_head_mask=None,
-        decoder_cross_attention_mask=None,
-        use_cache=None,
-        encoder_outputs=None,
-        decoder_context_rst_pos = None,
-        decoder_edu_rstpos = None,
-        **kwargs
-        ):
-        # cut decoder_input_ids if past is used
+    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
+        
+        #input_ids is essentially input_ids_utt. It does not include the context information
+
         if self.rst_tree_aligned_attention:
-
-            if past is not None:
-                # calculating the new cross attention mask
-                curr_edu_pos = self.get_curr_edu_pos(decoder_input_ids, decoder_edu_rstpos)
-
-
-                decoder_input_ids = decoder_input_ids[:, -1:]
-                
-                
-                decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rst_pos,
-                                                                                                past = None,
-                                                                                                curr_edu_pos = curr_edu_pos )
+            # update in prepare_inputs_for_generation
+            # use curr_edu_pos in _update model kwargs in order to create new attn matrix
+            #TODO ensure curr_edu_pos works as a batch for batch generation
+            curr_edu_pos = self.get_curr_edu_pos(input_ids, kwargs.get('edu_rstpos'))
             
+            if past is not None:
+                _ = input_ids.shape
+                position_embeds = self.transformer.wpe( input_ids.new_full( (_[0], 1), _[1]  ) )
+                
+                # only last token for inputs_ids if past is defined in kwargs
+                input_ids = input_ids[:, -1].unsqueeze(-1)
+                inputs_embeds = self.transformer.wte(input_ids)
+                attention_mask = kwargs.get('attention_mask')[..., -1: , : ]
+
             else:
-                # calculating the new cross attention mask
-                curr_edu_pos = self.get_curr_edu_pos(decoder_input_ids, decoder_edu_rstpos)
+                #getting length of generated utterance ids that were not provided as context
+                utt_ctx_len = kwargs.get('input_ids_utt').shape[1] #this is the length of the context
+                utt_len = input_ids.shape[1]
+                new_utt_len = utt_len - utt_ctx_len
+                _ = new_utt_len
                 
-                if decoder_input_ids.shape[1]!= decoder_cross_attention_mask.shape[-2]:
-                    decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rst_pos,
-                                                                                                past = decoder_cross_attention_mask,
-                                                                                                curr_edu_pos = curr_edu_pos )
+                if _ != 0:
+                    inputs_embeds_utt = self.transformer.wte(input_ids[..., -_: ])
+                    inputs_embeds = torch.cat( [kwargs.get('inputs_embeds'),inputs_embeds_utt], axis=1 ) 
+                    
+                    position_ids_utt = torch.arange(utt_ctx_len, utt_len, device=input_ids.device)
+                    position_embeds_utt = self.transformer.wpe( position_ids_utt )
+                    position_embeds = torch.cat( [kwargs.get('position_embeds'), position_embeds_utt])
+                else:
+                    inputs_embeds = kwargs.get('inputs_embeds')
+                    position_embeds = kwargs.get('position_embeds')
 
-        else:        
+                attention_mask = kwargs.get('attention_mask')
+        else:
+            curr_edu_pos = None
             if past is not None:
-                decoder_input_ids = decoder_input_ids[:, -1:]
-                decoder_cross_attention_mask=decoder_cross_attention_mask[:, -1:, : ]
+                _ = input_ids.shape
+                position_embeds = self.transformer.wpe( input_ids.new_full( (_[0], 1), _[1]  ) )
+                
+                input_ids = input_ids[:, -1].unsqueeze(-1)
+                inputs_embeds = self.transformer.wte(input_ids)
+                
+                attention_mask = kwargs.get('attention_mask')[..., -1: , : ]
 
-        
+            else:
+                utt_ctx_len = kwargs.get('input_ids_utt').shape[1] #this is the length of the context
+                utt_len = input_ids.shape[1]
+                new_utt_len = utt_len - utt_ctx_len
+                _ = new_utt_len
+
+                if _ != 0:
+                    inputs_embeds_utt = self.transformer.wte(input_ids[..., -_: ])
+                    inputs_embeds = torch.cat( [kwargs.get('inputs_embeds'),inputs_embeds_utt], axis=1 ) 
+                    
+                    position_ids_utt = torch.arange(utt_ctx_len, utt_len, device=input_ids.device)
+                    position_embeds_utt = self.transformer.wpe( position_ids_utt )
+                    position_embeds = torch.cat( [kwargs.get('position_embeds'), position_embeds_utt])
+                else:
+                    inputs_embeds = kwargs.get('inputs_embeds')
+                    position_embeds = kwargs.get('position_embeds')
+                
+                attention_mask = kwargs.get('attention_mask')
+
+
         return {
-            "input_ids": None,  # encoder_outputs is defined. input_ids not needed
-            "encoder_outputs": encoder_outputs,
+            # "input_ids": None,
+            'inputs_embeds':inputs_embeds,
+            'position_embeds':position_embeds,
             "past_key_values": past,
-            "decoder_input_ids": decoder_input_ids,
+            "use_cache": kwargs.get("use_cache"),
             "attention_mask": attention_mask,
-            "decoder_cross_attention_mask":decoder_cross_attention_mask,
-            "head_mask": head_mask,
-            "decoder_head_mask": decoder_head_mask,
-            "cross_attn_head_mask": cross_attn_head_mask,
-            # change this to avoid caching (presumably for debugging)
-            "use_cache": use_cache,
+            'curr_edu_pos':curr_edu_pos
         }
-
-    def _prepare_encoder_decoder_kwargs_for_generation(
-        self, input_ids: torch.LongTensor, model_kwargs
-     ) -> Dict[str, Any]:
-        if "encoder_outputs" not in model_kwargs:
-            # retrieve encoder hidden states
-            encoder = self.get_encoder()
-            input_embed_kwargs = {
-                k:model_kwargs.pop(k) for k in list(model_kwargs.keys())
-                    if k in ['rst_start_token_id',
-                                'rst_rel',
-                                'rst_ns',
-                                'rst_pos',
-                                'key_phrase_ids',
-                                'li_kprstpos',
-                                'position_ids']
-            }
-            encoder_kwargs = {
-                argument: value
-                for argument, value in model_kwargs.items()
-                if not (argument.startswith("decoder_") or argument.startswith("cross_attn"))
-            }
-            encoder_kwargs['inputs_embeds'] = self.input_embed(**input_embed_kwargs)
-            
-            model_kwargs["encoder_outputs"] = encoder(
-                input_ids, return_dict=True, **encoder_kwargs)
-        return model_kwargs
 
     def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos ):
         """
@@ -434,24 +687,78 @@ class RSTBart(BartForConditionalGeneration):
         li_gen_text = [ self.RSTTokenizer.decode(ids, skip_special_tokens=True) for ids in decoder_input_ids ]  
         
                             # run edu splitter on text generated so far
-        li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= ujson.dumps([li_gen_text]), 
-                                            skip_parsing=True, redirect_output=True)
+        # li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= ujson.dumps([li_gen_text]), 
+        #                                     skip_parsing=True, redirect_output=True)
+        
+        li_textwedutoken = self.rst_parser.parse_li_utterances(  li_gen_text, 
+                                                                 )
+
         # calculating edu of current text
         li_edu_count = [ ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
         
-        li_edu_rstpos =  [ tens if not ( -1 in tens) else tens[: (tens==-1).nonzero(as_tuple=True)[0] ] for tens in edu_rstpos.unbind(dim=0) ]
+        # removing any padding
+        li_edu_rstpos =  [ tens if not (-1 in tens) else tens[: (tens==-1).nonzero(as_tuple=True)[0] ] for tens in edu_rstpos.unbind(dim=0) ]
         
+        # selecting approapriate edu value. 
         curr_edu_pos = [ edu_rstpos[ min( edu_rstpos.numel()-1 , max(0 ,edu_count-1) ) ] for edu_count, edu_rstpos in zip(li_edu_count, li_edu_rstpos) ]
-        
-            
+                    
         return curr_edu_pos
-    
+
+    # @staticmethod
+    def _update_model_kwargs_for_generation( self,
+        outputs: ModelOutput, model_kwargs: Dict[str, Any], is_encoder_decoder: bool = False
+        ) -> Dict[str, Any]:
+        # update past
+        if "past_key_values" in outputs:
+            model_kwargs["past"] = outputs.past_key_values
+        elif "mems" in outputs:
+            model_kwargs["past"] = outputs.mems
+        elif "past_buckets_states" in outputs:
+            model_kwargs["past"] = outputs.past_buckets_states
+        else:
+            model_kwargs["past"] = None
+
+        # update token_type_ids with last value
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = torch.cat([token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1)
+
+        # update attention mask
+        if not is_encoder_decoder and not self.rst_tree_aligned_attention:
+            
+            # attention mask
+            attention_mask = model_kwargs["attention_mask"]
+            
+            #TODO: convert this to a 3d expansion            
+            attention_mask = torch.nn.functional.pad(
+                attention_mask, ( 0,1,0,0 ), value=0 ) #new token attention to context and utterance attention
+            
+            attention_mask = torch.nn.functional.pad(
+                attention_mask, ( 0,0,0,1 ), value=1 ) #context and utterance attention to new token
+
+
+        elif not is_encoder_decoder and self.rst_tree_aligned_attention:
+            
+            # attention mask
+            curr_utt_len = model_kwargs.get('attention_mask').shape[1]+1 -  model_kwargs['context_rstpos'].shape[1]
+            attention_mask = self.RSTTokenizer.prepare_attention_mask( 
+                                                                        # context_rstpos=model_kwargs.get( 'context_rstpos'),
+                                                                        curr_edu_pos = outputs['curr_edu_pos'],
+                                                                        context_rstpos = model_kwargs['context_rstpos'],
+                                                                        prev_mask = model_kwargs.get('attention_mask'),
+                                                                        curr_utt_len = curr_utt_len,
+                                                                        training=False )
+
+        model_kwargs["attention_mask"] = attention_mask
+            
+        return model_kwargs
+
     @classmethod
-    def load_model(cls, model_name="RSTBart", model_version=None, mparams_new={}, device="cuda:0"):
+    def loan_embd(cls, model_name="RSTGPT2", model_version=None, mparams_new={}, device="cuda:0"):
 
         if model_version != None:
-            #load from a pretrained RSTBart
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            #load from a pretrained RSTGPT2
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 f'./models/{model_name}/version_{model_version}/checkpoints')
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
@@ -463,10 +770,10 @@ class RSTBart(BartForConditionalGeneration):
             for key, value in mparams_new.items():
                 mparams[key] = value
 
-            mconfig = RSTBart_Config.from_pretrained(mparams['base_model_name'], **mparams)
+            mconfig = RSTGPT2_Config.from_pretrained(mparams['base_model_name'], **mparams)
 
             # Loading Training Module
-            training_module = RSTBart_TrainingModule(
+            training_module = RSTGPT2_TrainingModule(
                 mconfig, mode='inference')
             training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -486,20 +793,15 @@ class RSTBart(BartForConditionalGeneration):
         else:
             raise ValueError("At least one of model_version or mconfig must not be None ")
     
-    def on_train_end(self):
 
-        # Saving Model using the pytorch method.
-        # This allows relaoding using from_pretrained
-        self.save_pretrained(
-            f"./models_pt/{self.config.model_name}/version_{self.config.version}/")
 
     @staticmethod
     def parse_model_specific_args(parent_parser):
         parser = argparse.ArgumentParser(
             parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--base_model_name',
-                            default='facebook/bart-base', required=False)
-        parser.add_argument('--model_name', default='RSTBart', required=False)
+                            default='gpt2', required=False)
+        parser.add_argument('--model_name', default='RSTGPT2', required=False)
         parser.add_argument('--max_len_utt', type=int, default=250)
         parser.add_argument('--max_len_rst', type=int, default=30)
         parser.add_argument('--max_len_key_phrase', type=int, default=40)
@@ -509,224 +811,7 @@ class RSTBart(BartForConditionalGeneration):
         mparams = parser.parse_known_args()[0]
         return mparams
 
-# Monkey Patch for the BartModel Encoder forward - to prevent the automatic addition of positional encoding
-def bart_encoder_forward(
-    self,
-    input_ids=None,
-    attention_mask=None,
-    head_mask=None,
-    inputs_embeds=None,
-    output_attentions=None,
-    output_hidden_states=None,
-    return_dict=None,
-    ):
-    r"""
-    Args:
-        input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-            provide it.
-            Indices can be obtained using :class:`~transformers.BartTokenizer`. See
-            :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__`
-            for details.
-            `What are input IDs? <../glossary.html#input-ids>`__
-        attention_mask (:obj:`torch.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-            `What are attention masks? <../glossary.html#attention-mask>`__
-        head_mask (:obj:`torch.Tensor` of shape :obj:`(encoder_layers, encoder_attention_heads)`, `optional`):
-            Mask to nullify selected heads of the attention modules. Mask values selected in ``[0, 1]``:
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-        inputs_embeds (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
-            Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded
-            representation. This is useful if you want more control over how to convert :obj:`input_ids` indices
-            into associated vectors than the model's internal embedding lookup matrix.
-        output_attentions (:obj:`bool`, `optional`):
-            Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
-            returned tensors for more detail.
-        output_hidden_states (:obj:`bool`, `optional`):
-            Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors
-            for more detail.
-        return_dict (:obj:`bool`, `optional`):
-            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
-    """
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    # retrieve input_ids and inputs_embeds
-    if inputs_embeds is not None:
-        input_shape = inputs_embeds.size()[:-1]
-    elif inputs_embeds is None:
-        raise ValueError("Inputs embeds must be defined")
-    # elif input_ids is not None:
-    #     input_shape = input_ids.size()
-    #     input_ids = input_ids.view(-1, input_shape[-1])
-
-    # else:
-    #     raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-    # if inputs_embeds is None:
-    #     raise ValueError("Inputs embeds must be defined")
-        # inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
-        # embed_pos = self.embed_positions(input_shape)
-
-    hidden_states = inputs_embeds  
-    hidden_states = self.layernorm_embedding(hidden_states)
-    hidden_states = nn.functional.dropout(
-        hidden_states, p=self.dropout, training=self.training)
-
-    # expand attention_mask
-    if attention_mask is None:
-        raise ValueError("Attention mask must be defined")
-
-    # [bsz,tgt_seq_len, src_seq_len ] -> [bsz, 1, tgt_seq_len, src_seq_len]
-    attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
-
-    encoder_states = () if output_hidden_states else None
-    all_attentions = () if output_attentions else None
-
-    # check if head_mask has a correct number of layers specified if desired
-    if head_mask is not None:
-        assert head_mask.size()[0] == (
-            len(self.layers)
-        ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
-    for idx, encoder_layer in enumerate(self.layers):
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
-        # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-        dropout_probability = random.uniform(0, 1)
-        if self.training and (dropout_probability < self.layerdrop):  # skip the layer
-            layer_outputs = (None, None)
-        else:
-            if getattr(self.config, "gradient_checkpointing", False) and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(encoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    (head_mask[idx] if head_mask is not None else None),
-                )
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask=(
-                        head_mask[idx] if head_mask is not None else None),
-                    output_attentions=output_attentions,
-                )
-
-            hidden_states = layer_outputs[0]
-
-        if output_attentions:
-            all_attentions = all_attentions + (layer_outputs[1],)
-
-    if output_hidden_states:
-        encoder_states = encoder_states + (hidden_states,)
-
-    if not return_dict:
-        return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
-    return BaseModelOutput(
-        last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
-    )
-
-# Monkey Patch for BartModel forward - to allow a seperate cross-attention mask to be passed in as a argument
-def bart_forward(self,
-                 input_ids=None, attention_mask=None,
-                 decoder_input_ids=None,
-                 decoder_attention_mask=None,
-                 decoder_cross_attention_mask=None,
-                 head_mask=None,
-                 decoder_head_mask=None,
-                 cross_attn_head_mask=None,
-                 encoder_outputs=None,
-                 past_key_values=None,
-                 inputs_embeds=None,
-                 decoder_inputs_embeds=None,
-
-                            decoder_context_rst_pos=None,
-                            decoder_edu_rstpos=None,
-                 use_cache=None,
-                 output_attentions=None,
-                 output_hidden_states=None,
-                 return_dict=None,
-                 ):
-
-    # different to other models, Bart automatically creates decoder_input_ids from
-    # input_ids if no decoder_input_ids are provided
-    if decoder_input_ids is None and decoder_inputs_embeds is None:
-        decoder_input_ids = shift_tokens_right(
-            input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
-        )
-
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    use_cache = use_cache if use_cache is not None else self.config.use_cache
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    if encoder_outputs is None:
-        encoder_outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-    # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
-    elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
-        encoder_outputs = BaseModelOutput(
-            last_hidden_state=encoder_outputs[0],
-            hidden_states=encoder_outputs[1] if len(
-                encoder_outputs) > 1 else None,
-            attentions=encoder_outputs[2] if len(
-                encoder_outputs) > 2 else None,
-        )
-
-    # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-    decoder_outputs = self.decoder(
-        input_ids=decoder_input_ids,
-        attention_mask=decoder_attention_mask,
-        # encoder_hidden_states=None, #encoder_outputs.last_hidden_state,
-        encoder_hidden_states=encoder_outputs.last_hidden_state,
-        encoder_attention_mask=decoder_cross_attention_mask,
-        head_mask=decoder_head_mask,
-        cross_attn_head_mask=cross_attn_head_mask,
-        past_key_values=past_key_values,
-        inputs_embeds=decoder_inputs_embeds,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-    )
-
-    if not return_dict:
-        return decoder_outputs + encoder_outputs
-
-    return Seq2SeqModelOutput(
-        last_hidden_state=decoder_outputs.last_hidden_state,
-        past_key_values=decoder_outputs.past_key_values,
-        decoder_hidden_states=decoder_outputs.hidden_states,
-        decoder_attentions=decoder_outputs.attentions,
-        cross_attentions=decoder_outputs.cross_attentions,
-        encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-        encoder_hidden_states=encoder_outputs.hidden_states,
-        encoder_attentions=encoder_outputs.attentions,
-    )
-
-class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
+class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
     rst_tree_aligned_attention = False  
 
     # Setting up RST2
@@ -754,11 +839,12 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     special_token_count = 2
 
-    rst_start_token = "<rst>"
-    keyphrase_start_token = "<kp>"
+    rst_start_token = "<|rst|>"
+    keyphrase_start_token = "<|kp|>"
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
-                     utterance=None, utterance_prompt=None, dict_pos_edu=None, rst_len=None,
+                     utterance=None, utterance_prompt=None, dict_pos_edu=None, 
+                     rst_len=None, key_phrase_len=None,
                      exclude_from_output=[], device=None):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -770,127 +856,83 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
             and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
         """
-
+        # Encoding rst, keyphrase and utterance info
         rst_rel, rst_ns, rst_pos, rst_pad_len = self.encode_rst(
             rst_rel, rst_ns, rst_pos, rst_len)
-        key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens = self.encode_keyphrase(
-            li_kp, li_kprstpos)
 
+        key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens,kp_pad_len = self.encode_keyphrase(
+            li_kp, li_kprstpos, key_phrase_len)
+
+
+        input_ids_utt, labels, utt_len = self.encode_utterance( utterance, utterance_prompt, 
+                    context_len = 1 + rst_rel.shape[-1] + key_phrase_ids.shape[-1]  )
+
+        # Lengths of each input
         r_len = 1 + rst_rel.shape[-1]
         rt_len = r_len + key_phrase_ids.shape[-1]
+        rtu_len = rt_len + utt_len
 
-        # Building position ids for key phrase
-        position_ids_rst = torch.full((r_len,), -1, dtype=torch.long)
-        position_ids_keyphrase = torch.cat(
-            [torch.arange(tpl, dtype=torch.long) for tpl in kp_phrase_lens])
-        position_ids = torch.cat((position_ids_rst, position_ids_keyphrase))
 
-        # Building Encoder Attention Mask
+        # Building position ids
+        position_ids_keyphrase = torch.cat( [torch.arange(tpl, dtype=torch.long) for tpl in kp_phrase_lens])
+        position_ids_keyphrase = torch.cat( [position_ids_keyphrase, torch.full( [kp_pad_len],self.pad_values['position_ids_kp_utt'] ) ])
+        position_ids_utt =  torch.arange( 0, utt_len, dtype=torch.long)
+        position_ids_kp_utt = torch.cat( (position_ids_keyphrase, position_ids_utt) )
+
+        # Building Attention Mask
             # prepending 0 to rst_pos in order to factor in 
-        attention_mask = self.prepare_encoder_attention_mask(
-            r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]),
-            li_kprstpos=li_kprstpos)
+            # here
+        attention_mask = self.prepare_attention_mask(
+            r_len, rt_len, rtu_len,
+            ta_tokens_pos, kp_phrase_lens, 
+            rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]),
+            li_kprstpos=li_kprstpos,
+            dict_pos_edu = dict_pos_edu,
+            training = (utterance!=None and utterance_prompt==None),
+            utterance_ids=input_ids_utt 
+            )
 
-        # Creating labels/targets
-        # Creating labels/targets
-        if utterance_prompt != None:
-            # utterance_prompt = self.bos_token + utterance_prompt
-            utterance_prompt = self.eos_token + self.bos_token + utterance_prompt
+        attention_mask = self.prepare_attention_mask_handle_padding(
+                                attention_mask,     
+                                 r_len, rst_pad_len, rst_len,
+                                rt_len, kp_pad_len, key_phrase_len )
 
-            utt_prompt_tok_ids = self.encode(
-                utterance_prompt, 
-                add_special_tokens=False,
-                # add_special_tokens=True,
-
-                return_attention_mask=False,
-                padding='do_not_pad',
-                        truncation=False,
-                max_length=self.max_len_utt,
-                return_tensors='pt',
-                return_length=False,
-            )[0]
-
-            decoder_input_ids = utt_prompt_tok_ids.contiguous()
-            # utt_len = utt_prompt_tok_ids.shape[-1]
-            # labels = None
-
-            #labels = utt_tok_ids
-            labels = None
-            # decoder_input_ids = shift_tokens_right(utt_prompt_tok_ids[:-1].unsqueeze(0), 
-            #     self.pad_token_id ,
-            #     decoder_start_token_id=self.eos_token_id)[0]
-            utt_len = decoder_input_ids.shape[-1]
-                
-
-        if utterance != None:
-            #utterance = self.eos_token + self.bos_token + " " + utterance + self.eos_token
-            utterance = self.bos_token + utterance + self.eos_token + self.pad_token
-            utt_tok_ids = self.encode(
-                utterance, 
-               add_special_tokens=False,
-                # add_special_tokens=True,
-
-                return_attention_mask=False,
-                padding='do_not_pad',
-                        truncation=True,
-            #                max_length=self.max_len_utt+1,
-                max_length=self.max_len_utt,
-
-                return_tensors='pt',
-                return_length=False,
-            )[0]
-
-            labels = utt_tok_ids
-            decoder_input_ids = shift_tokens_right(labels.unsqueeze(0), 
-                self.pad_token_id ,
-                decoder_start_token_id=self.eos_token_id)[0]
-            utt_len = decoder_input_ids.shape[-1]
-                
-
-        decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat( [ rst_pos[0:1], rst_pos]),
-                                                                         li_kprstpos, utt_len,
-                                                                         rt_len)
-
-        # Changing attention masks to compensate for the Variable RST batching
-        if rst_len != None and rst_pad_len != 0:
-
-            attention_mask[:, r_len-rst_pad_len:r_len] = 0
-            attention_mask[r_len-rst_pad_len:r_len, :] = 0
-
-            decoder_cross_attention_mask[:, r_len-rst_pad_len:r_len] = 0
-            decoder_cross_attention_mask[r_len-rst_pad_len:r_len, :] = 0
 
         output =  {'rst_start_token_id': self.rst_start_token_id,
                 
-                'rst_rel': rst_rel, 'rst_ns': rst_ns, 'rst_pos': rst_pos,
+                    'rst_rel': rst_rel, 'rst_ns': rst_ns, 'rst_pos': rst_pos,
 
-                'key_phrase_ids': key_phrase_ids.contiguous(),
-                'li_kprstpos': li_kprstpos.contiguous(),
+                    'key_phrase_ids': key_phrase_ids.contiguous(),
+                    'li_kprstpos': li_kprstpos.contiguous(),
 
-                'position_ids': position_ids.contiguous(),
+                    'position_ids_kp_utt': position_ids_kp_utt.contiguous(),
 
-                'attention_mask': attention_mask,
-                'labels': labels,
-
-                'decoder_input_ids': decoder_input_ids,
-                'decoder_cross_attention_mask': decoder_cross_attention_mask,
-                
+                    'attention_mask': attention_mask,
+                    
+                    'input_ids_utt':input_ids_utt.contiguous(),
+                    'labels': labels,                
                 }
         
+        # #ensuring interoparability with huggingface generate code
+        # if utterance_prompt != None:
+        #     output['input_ids'] = input_ids_utt.contiguous()
+        
         if self.rst_tree_aligned_attention:
-            output['decoder_context_rst_pos']= torch.cat( [ rst_pos[0:1], rst_pos, li_kprstpos ] )
+            output['context_rstpos']= torch.cat( [ rst_pos[0:1], rst_pos, li_kprstpos ] )
             
             dec_rst_pos = [ self.clamp_values(np.array(int(key)),utils.MAX_LONG_VALUE).item(0)  for key in dict_pos_edu.keys()]
             
-            output['decoder_edu_rstpos'] = torch.tensor( sorted( dec_rst_pos
-                                                                , key=RSTTokenizer.edukp_pos_sort_function ) , 
+            output['edu_rstpos'] = torch.tensor( sorted( dec_rst_pos
+                                                                , key=RSTTokenizer.edukp_pos_sort_function, 
+                                                                 ) , 
                                                 dtype=torch.long )
-        
+        # moving to devie 
         if device != None:
             for key in output:
                 if output[key] != None:
                     output[key] = output[key].to(device).unsqueeze(0)
         
+        # excluding items from output
         for key in exclude_from_output:
             output.pop(key,None)
                 
@@ -966,12 +1008,12 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         
         return tnsr_rels, tnsr_ns, tnsr_pos, diff
 
-    def encode_keyphrase(self, topics, kp_rst_pos):
+    def encode_keyphrase(self, key_phrases, kp_rst_pos, variable_padding_size=None):
         """[summary]
 
             Args:
-                topics ([type]): [list of topics (phrases or words)]
-                topics_score ([type]): [list of float scores for each topic relevancy]
+                keyphrase ([type]): [list of keyphrase (phrases or words)]
+                keyphrase_score ([type]): [list of float scores for each topic relevancy]
 
             Raises:
                 Exception: [description]
@@ -979,34 +1021,32 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             Returns:
                 [type]: [description]
         """
-        if len(topics)!=0:
-            max_len = self.max_len_key_phrase
+        if len(key_phrases)!=0:
+            max_len = min( variable_padding_size, self.max_len_key_phrase) if variable_padding_size else self.max_len_key_phrase
 
-            str_topics = ''.join(['<kp> '+topic for topic in topics])
-            dict_encoding = self(str_topics, add_special_tokens=False,
-                                return_attention_mask=False,
+            str_keyphrases = ''.join(['<|kp|> '+ kp for kp in key_phrases])
+            key_phrase_ids = self.encode(str_keyphrases, add_special_tokens=False,
                                 truncation=True,
                                 padding='do_not_pad',
                                 return_tensors='np',
                                 max_length=max_len,
-                                return_special_tokens_mask=False,
-                                return_length=True)
-            topic_phrases = dict_encoding['input_ids'][0]
+                                return_special_tokens_mask=False)
+            key_phrase_ids = key_phrase_ids[0]
 
             # Repeating each score in the case where the score is allocated to a phrase topic which is broken down into constituent words
-            # e.g. topics - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
+            # e.g. keyphrase - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
             # have to do it after tokenization due to bytepair encoding
-            # get index of where <kp> tokens occur
+            # get index of where <|kp|> tokens occur
             kp_idxs = np.where(
-                topic_phrases == self.keyphrase_start_token_id_np )[0]
+                key_phrase_ids == self.keyphrase_start_token_id_np )[0]
 
-            topic_phrases = torch.LongTensor(topic_phrases)
+            key_phrase_ids = torch.LongTensor(key_phrase_ids)
 
             # filtering out idxs if index is larger than padding value
             kp_idxs = kp_idxs[kp_idxs < max_len]
 
-            # get difference in index position between <kp> tag n and <kp> tag n+1 ( for final tag use difference between tag and end of list)
-            kp_phrase_lens = np.diff(kp_idxs, append=topic_phrases.numel())
+            # get difference in index position between <|kp|> tag n and <|kp|> tag n+1 ( for final tag use difference between tag and end of list)
+            kp_phrase_lens = np.diff(kp_idxs, append=key_phrase_ids.numel())
 
             # copies each score phrase_len times to cover that phrase and handles case where there is no phrase
             kp_rst_pos = [[score]*phrase_len for score,
@@ -1014,164 +1054,342 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             kp_rst_pos = sum(kp_rst_pos, [])  # flattening list
             tnsr_rst_pos = torch.LongTensor(self.clamp_values(
                 np.array(kp_rst_pos), utils.MAX_LONG_VALUE))
+
+
+            # Adding padding to key_phrase
+            diff = max_len - key_phrase_ids.shape[-1]
+
+            key_phrase_ids = torch.nn.functional.pad(
+                    key_phrase_ids, (0, diff), value=self.pad_values['key_phrase_ids'])
+            tnsr_rst_pos = torch.nn.functional.pad(
+                    tnsr_rst_pos, (0, diff), value=self.pad_values['li_kprstpos'])
         else:
-            topic_phrases = torch.LongTensor([])
-            tnsr_rst_pos = torch.LongTensor([])
+            max_len = min( variable_padding_size, self.max_len_key_phrase) if variable_padding_size else self.max_len_key_phrase
+
+            # if variable_padding_size==None:
+            #     key_phrase_ids = torch.LongTensor([])
+            #     tnsr_rst_pos = torch.LongTensor([])
+            #     kp_idxs = np.array([])
+            #     kp_phrase_lens = np.array([])
+            #     diff = 0
+
+            # else:
+            key_phrase_ids = torch.full( size=(variable_padding_size,), fill_value=self.pad_values['key_phrase_ids'] )
+            tnsr_rst_pos = torch.full( size=(variable_padding_size,), fill_value=self.pad_values['li_kprstpos'] )
             kp_idxs = np.array([])
             kp_phrase_lens = np.array([])
+            diff = variable_padding_size
 
-        return topic_phrases, tnsr_rst_pos, kp_idxs, kp_phrase_lens
+        return key_phrase_ids, tnsr_rst_pos, kp_idxs, kp_phrase_lens, diff
 
-    def prepare_encoder_attention_mask(self, r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos=None, li_kprstpos=None):
+    def encode_utterance(self, utterance=None, utterance_prompt=None, context_len=None ):
+
+        # Creating labels/targets
+        if utterance_prompt != None:
+            utterance_prompt = self.eos_token + utterance_prompt
+
+            utt_prompt_tok_ids = self.encode(
+                utterance_prompt, 
+                add_special_tokens=False,
+                return_attention_mask=False,
+                padding='do_not_pad',
+                truncation=False,
+                max_length=self.max_len_utt,
+                return_tensors='pt')[0]
+
+            utt_ids = utt_prompt_tok_ids.contiguous()
+            labels = None
+            utt_len = utt_ids.shape[-1]
+                
+
+        if utterance != None:
+            utterance = self.eos_token + utterance + self.eos_token 
+            utt_tok_ids = self.encode(
+                utterance, 
+                add_special_tokens=False,
+                padding='do_not_pad',
+                truncation=True,
+                max_length=self.max_len_utt,
+                return_tensors='pt',
+            )[0]
+
+            utt_ids = utt_tok_ids.contiguous()
+            labels = torch.cat( [ torch.full( size=(context_len,), fill_value=-100, dtype=torch.long) , utt_ids] )
+            utt_len = utt_ids.shape[-1]
+        
+        
+        return utt_ids, labels, utt_len 
+
+    def prepare_attention_mask(self, r_len=None, rt_len=None, rtu_len=None, 
+                                ta_tokens_pos=None, kp_phrase_lens=None, 
+                                rst_pos=None, li_kprstpos=None,
+                                dict_pos_edu=None,
+                                
+                                #generation
+                                curr_edu_pos=None,
+                                 curr_utt_len=None, 
+                                context_rstpos=None, 
+                                prev_mask=None,
+                                training=True,
+                                
+                                #correcting generation,
+                                utterance_ids=None
+                                 ):
 
         if self.rst_tree_aligned_attention == False:
-            attention_mask = torch.zeros([rt_len, rt_len])
 
-            # Change so key_phrases only attend to themselves and the rst start token
-            # RST Tree only attends to itself  as well
-            
-            #attention_mask[r_len:, r_len:] = 0
-            attention_mask[r_len:, r_len: ] = 0
-            attention_mask[ 1:r_len, r_len: ] = 0
-
-            #rst section attend to itself
-            attention_mask[ :r_len, :r_len ] = 1
-            
-            #kp section attend to rst section
-            attention_mask[ r_len:rt_len, :rt_len ] = 1
-
-            # Second each topic phrase has causal masking on the tokens within the topic phrase
-            # use ta_tokens_pos
-            # essentially for idx i, i+1
-            for ta_idx, phrase_len in zip(ta_tokens_pos, kp_phrase_lens):
-                s_idx = r_len+ta_idx
-                e_idx = s_idx+phrase_len
-                attention_mask[s_idx:e_idx, s_idx:e_idx] = \
-                    attention_mask.new_ones([phrase_len, phrase_len])
-                            
-        else:
-            # Detecting which node each context should attend to in  O(n)
-            # pos should be ordered based on left to right along an imaginary tree
-            # so first re-order in terms of depth (which is just re-ordering by value )
-            # Then starting from the end of the list find the direct tree of nodes to the parent
-            # Store each pos and parent in a dictionary of keys=child, value=parent
-            dict_rstpos_parents = torch.nn.ParameterDict()
-
-            for pos in torch.cat((rst_pos, li_kprstpos)):
+            if prev_mask==None:
+                attention_mask = torch.zeros([rtu_len, rtu_len]) #template #[batch_size, num_heads, from_seq_length, to_seq_length]                    
                 
-                if pos not in dict_rstpos_parents:
-                    dict_rstpos_parents[str(pos)] = torch.nn.parameter.Parameter( torch.tensor(
-                        RSTTokenizer.seq_from_root_to_edu_pos(pos) + [int(pos)] , dtype=torch.long), requires_grad=False )
 
-            # Creating vector indicating which positions attend to which other positions
-            all_pos = torch.cat((rst_pos, li_kprstpos))
-            li_tens_pos = []
-            for pos in all_pos:
+                #RST section fully attends to itself
+                attention_mask[:r_len, :r_len] = 1 
 
-                li_parent_tree = dict_rstpos_parents[str(pos)]
+                # Implementing causal masking for each kp
+                    # First each kp only attends to other words within that kp (including ta token) and the RST info
+                    # So set the template attn to 0 in this range within kp range
+                attention_mask[ r_len:rt_len, r_len:rt_len ] = 0
+                attention_mask[ r_len:rt_len, :r_len ] = 1
 
-                pos_tree_aligned_attn = (
-                    all_pos[..., None] == li_parent_tree).any(-1).squeeze()  # Creates a boolean vector indicating where model can attend
-
-                li_tens_pos.append(pos_tree_aligned_attn)
-
-            attention_mask = torch.stack(li_tens_pos, dim=0).to(torch.float)
-
-        return attention_mask
-
-    def prepare_cross_attention_mask(self, dict_pos_edu=None, rst_pos=None, li_kprstpos=None,
-                                     utt_len=None, rt_len=None, past=None, curr_edu_pos=None, context_rst_pos=None):
-
-        if self.rst_tree_aligned_attention:
-            #training
-            if past == None and curr_edu_pos==None:
-                li_attn_vectors = []
-                # dict_rstpos_parents = {}
-                dict_rstpos_parents = torch.nn.ParameterDict()
-                
-                all_pos = torch.cat((rst_pos, li_kprstpos))
-
-                li_pos_edu_idslen = sorted( [[pos, edu, None] for pos, edu in dict_pos_edu.items()],
-                                        key=lambda x: RSTTokenizer.edukp_pos_sort_function(
-                                            int(x[0]) )
-                                        )
-                # Adding special tokens to edu to mirror the encoded utterance
-                li_pos_edu_idslen[0][1] =  self.eos_token + self.bos_token + li_pos_edu_idslen[0][1]
-                
-                li_pos_edu_idslen[-1][1] =  li_pos_edu_idslen[-1][1] + self.eos_token
-                
-                
-                # Find the tokenized length of each edu
-                # And get the seqeunce of parents for each edu position
-                # Note this ignores the length of the start and end token
-                for idx in range(len(li_pos_edu_idslen)):
-                                    
-                    li_pos_edu_idslen[idx][2] = len( self.encode(
-                        li_pos_edu_idslen[idx][1], add_special_tokens=False) )
-
+                    #Second each kp has causal masking on the tokens within the topic phrase
+                for ta_idx, phrase_len in zip(ta_tokens_pos, kp_phrase_lens):
+                    s_idx = r_len+ta_idx
+                    e_idx = s_idx+phrase_len
+                    attention_mask[s_idx:e_idx, s_idx:e_idx] = \
+                        torch.tril(attention_mask.new_ones([phrase_len, phrase_len]) )
                     
-                    pos = li_pos_edu_idslen[idx][0]
+                # Implementing causal attention mask for text
+                attention_mask[ rt_len: , : ] = torch.tril( torch.ones( [ rtu_len-rt_len, rtu_len ] ), diagonal=rt_len  )
+
+                #debugging - remove rst input only
+                # attention_mask[ rt_len:, :rt_len ] = 0
+
+            #TODO: make sure padding is handled in prev_mask
+            else:
+                dims = prev_mask.shape()
+                attention_mask = torch.cat( [ prev_mask[:, -1:, : ], prev_mask.new_ones( [dims[0], 1, 1 ] ) ], axis=-1 )
+                
+        else: 
+            if prev_mask==None and curr_edu_pos==None: #training
+                
+                # attention_mask = torch.tril( torch.zeros([rtu_len, rtu_len]), diagonal=rt_len ) #template
+                attention_mask = torch.zeros([rtu_len, rtu_len])  #template
+
+                # Detecting which node each context should attend to in  O(n)
+                # pos should be ordered based on left to right along an imaginary tree
+                # so first re-order in terms of node depth (which is just re-ordering by value )
+                # Then starting from the end of the list find the direct tree of nodes to the parent
+                # Store each pos and parent in a dictionary of keys=child, value=parent
+                dict_rstpos_parents = torch.nn.ParameterDict()
+
+                # region Creating attention matrix for the rst/kp context over the rst/kp context
+                all_pos_context = torch.cat((rst_pos, li_kprstpos))
+                
+                # creating dictionary indicating the parents of each rst node pos in the context
+                for pos in all_pos_context:    
+                    if pos not in dict_rstpos_parents:
+                        dict_rstpos_parents[str(pos)] = torch.nn.parameter.Parameter( torch.tensor(
+                            RSTTokenizer.seq_from_root_to_edu_pos(pos) + [int(pos)] , dtype=torch.long), requires_grad=False )
+
+                # Creating vector indicating which rst node pos attend to which other positions
+                li_tens_pos = []
+                for pos in all_pos_context:
+
+                    li_parent_tree = dict_rstpos_parents[str(pos)] #parent tree for current position
+
+                    pos_tree_aligned_attn = (
+                        all_pos_context[..., None] == li_parent_tree).any(-1).squeeze()  # Creates a boolean vector indicating where model can attend
+
+                    # concatenating an extra section to account for no attendance 
+                    
+                    li_tens_pos.append(pos_tree_aligned_attn)
+
+                attention_mask_context = torch.stack(li_tens_pos, dim=0).to(torch.float) #shape( rt_len, rt_len )
+                #endregion
+
+                # region Creating the attention matrix for the utterance section over the rst/kp context
+                li_attn_vectors = []
+
+                # li_pos_edu_idslen_ids will be a list  containing the rst_pos, edu_ids and ids_len for each edu
+                li_pos_edu_idslen_ids = sorted( [[pos, edu, None, None] for pos, edu in dict_pos_edu.items()],
+                                                key=lambda x: RSTTokenizer.edukp_pos_sort_function(
+                                                    int(x[0]) ) )
+                
+                # Adding special tokens to edu to mirror the ecnoded utterance with special tokens
+                li_pos_edu_idslen_ids[0][1] =  self.eos_token + li_pos_edu_idslen_ids[0][1]
+                if training: #eos_token only at end for training
+                    li_pos_edu_idslen_ids[-1][1] =  li_pos_edu_idslen_ids[-1][1] + self.eos_token
+
+                # dictionary containing the list of rst trees from nodes to root
+                for idx in range(len(li_pos_edu_idslen_ids)):
+                    # Find the tokenized length of each edu
+
+                    if idx!=0:
+                        li_pos_edu_idslen_ids[idx][1] = " "+li_pos_edu_idslen_ids[idx][1]
+
+                    li_pos_edu_idslen_ids[idx][3] = self.encode( li_pos_edu_idslen_ids[idx][1], add_special_tokens=False)
+
+                    li_pos_edu_idslen_ids[idx][2] = len( li_pos_edu_idslen_ids[idx][3] )
+
+                    pos = li_pos_edu_idslen_ids[idx][0]
                     
                     if pos not in dict_rstpos_parents:
                         dict_rstpos_parents[pos] = torch.nn.parameter.Parameter( torch.tensor(
                             RSTTokenizer.seq_from_root_to_edu_pos(int(pos)) + [int(pos)] , dtype=torch.long), requires_grad=False )
+                #endregion 
 
+                #region EDU tokenization may be different from text tokenization due to the RST parser
+                # evening up the tokenization lengths
+                _len = sum( item[2] for item in li_pos_edu_idslen_ids)
+                if  _len != rtu_len - rt_len and training:
 
-                # Then cycle through these lengths, and create the masking over the encoder
-                    # Each edu should only attend to the rst and keyp phrases with pos in its parents pos
-                    # Remember to create a 3 extras, for the starting eos and bos token and the ending eos token
-                for pos, edu_txt, edu_txt_len in li_pos_edu_idslen:
+                    # Find the Index of positions where the utterance indices match
+                    edu_ids_  = [ item[3] for item in li_pos_edu_idslen_ids ]
+                    edu_ids_flat = sum( edu_ids_, [] )
+                    # edu_ids_len = [  item[2] for item in li_pos_edu_idslen_ids ]
+                    edu_ids_len_cum = np.cumsum( [  item[2] for item in li_pos_edu_idslen_ids ] )
 
+                        # list of tuples containing pairs where indices represent matching tokens
+                    matching_indexes = [] 
+                    max_non_matches_till_id1_skip = 4
+                    # This is 0(n^2) 
+                    for idx1, id1 in enumerate(utterance_ids):
+                        
+                        id1_matches_checked = 0 
+                        for idx2, id2 in enumerate(  edu_ids_flat  ): 
+                            
+                            #skip until the most recently matched index for the edu phrases
+                            if len(matching_indexes)>0:
+                                if idx2<=matching_indexes[-1][1]:
+                                    continue
+                            
+                            #if index match then add to record
+                            if id1==id2:
+                                matching_indexes.append( [ idx1, idx2] )
+                                max_non_matches_till_id1_skip = 4 #reset back to original vale
+                                break
+                            
+                            id1_matches_checked += 1
+                            # if we are unable to find a match for id1 in 3-4 idx2  then we skip to the next id1
+                            # we also increase the max non matches by one, to handle any increase variation between sentences
+                            if id1_matches_checked == max_non_matches_till_id1_skip:
+                                max_non_matches_till_id1_skip += 1
+                                break
+                    
+                    # Find the lengths of sequential unmatched indices
+                    matching_indexes_utt, matching_indexes_edus = zip(*matching_indexes )
+                    
+                        # indexes required to arrive at next matching token for each sequence
+                    matching_indices_utt_diff = np.diff(matching_indexes_utt)
+                    matching_indices_edus_diff = np.diff(matching_indexes_edus)
+
+                        # differences in index distance required for each sequence
+                    li_diff_utt_edu =  matching_indices_utt_diff - matching_indices_edus_diff
+
+                    # Reduce spans of edu lengths
+                        # cycle through the mismatched chunks
+                        # For each mismatched chunk decide which edu this corresponds to
+                        # Then change the length in li_pos_edu_idslen_ids
+                    for matched_token_idx, diff_utt_edu  in enumerate(li_diff_utt_edu ):
+                        
+                        if diff_utt_edu != 0:
+                            
+                            # Find out which edu the matched_token is positioned in, within the edu form of utterance
+                            token_idx_in_flattened_edu = matching_indexes_edus[ matched_token_idx ]
+
+                            edu_idx = np.searchsorted(edu_ids_len_cum, token_idx_in_flattened_edu, side='right', sorter=None)
+
+                            #find the edu that the prev match word occurs in 
+                            li_pos_edu_idslen_ids[ edu_idx ][2] += diff_utt_edu
+                    
+                #endregion
+
+                #region creating attn vectors for each edu
+                    #For each edu create attn vector to (rst and kp) with rst pos in the set of edu's parents pos 
+                for pos, edu_txt, edu_txt_len, edu_ids in li_pos_edu_idslen_ids:
+ 
                     li_parent_tree = dict_rstpos_parents[pos]
 
                     pos_tree_aligned_attn = (
-                        all_pos[..., None] == li_parent_tree).any(-1).squeeze() 
+                        all_pos_context[..., None] == li_parent_tree).any(-1).squeeze() 
                     
                     # Repeating by tokenized length of EDU
                     pos_tree_aligned_attn = einops.repeat(pos_tree_aligned_attn,
                         'd -> l d', l=edu_txt_len )
 
                     li_attn_vectors.append(pos_tree_aligned_attn)
-
+                
                 # need to transpose since _expand_mask requires masks to be bsz, 1, tgt_len, src_len
-                attention_mask = torch.cat(li_attn_vectors, dim=0).to(torch.float)
+                attention_mask_utt_context = torch.cat(li_attn_vectors, dim=0).to(torch.float) #shape( rtu_len-rt_len, rt_len )
                 
-                if attention_mask.shape[0] >utt_len:
-                    attention_mask = attention_mask[:utt_len, :]
-            
-            #generating
+                if attention_mask_utt_context.shape[0] > rtu_len-rt_len:
+                    attention_mask_utt_context = attention_mask_utt_context[ :rtu_len-rt_len, : ]
+                #endregion
+
+                attention_mask_utt = torch.tril( torch.ones( ( rtu_len-rt_len, rtu_len-rt_len ) ) )
+
+                #region Combining both sections of attention
+                attention_mask[..., :rt_len, :rt_len ] = attention_mask_context
+                attention_mask[..., rt_len:, :rt_len ] = attention_mask_utt_context
+                attention_mask[..., rt_len: , rt_len:] = attention_mask_utt
+
+                #correcting the kp phrases to have causal attention
+                    #Second each kp has causal masking on the tokens within the topic phrase
+                for ta_idx, phrase_len in zip(ta_tokens_pos, kp_phrase_lens):
+                    s_idx = r_len+ta_idx
+                    e_idx = s_idx+phrase_len
+                    attention_mask[s_idx:e_idx, s_idx:e_idx] = \
+                        torch.tril(attention_mask.new_ones([phrase_len, phrase_len]) )
+
             else:
-                #here
-                all_pos = context_rst_pos
-                
+            
+                # all_pos = context_rstpos
                 li_batch_new_attn = []
+                
+                # creating new attention mask for every element in curr_edu_pos
                 for pos in curr_edu_pos: 
                 
-                    li_parent_tree = torch.tensor( RSTTokenizer.seq_from_root_to_edu_pos(pos.item()) + [pos.item()], device=all_pos.device )
+                    li_parent_tree = torch.tensor( RSTTokenizer.seq_from_root_to_edu_pos(pos.item()) + [pos.item()], device=prev_mask.device )
                     
                     pos_tree_aligned_attn = (
-                            all_pos[..., None] == li_parent_tree).any(-1).squeeze()
+                            context_rstpos[..., None] == li_parent_tree).any(-1).squeeze()
 
-                    li_batch_new_attn.append(pos_tree_aligned_attn)
+                    li_batch_new_attn.append(pos_tree_aligned_attn.unsqueeze(0))
                 
-                # batch_new_attn = torch.cat(li_batch_new_attn, axis=0)
-                
-                batch_new_attn = pad_sequence(li_batch_new_attn, batch_first=True, padding_value=0 )
-                attention_mask = batch_new_attn.unsqueeze(1)
-                
-                if past != None:
-                    attention_mask = torch.cat([past, attention_mask], axis=1)
-                        
-        else:
-            #TODO - Patch the padding, some elems of below need to be masked in order to represent apdding
-            attention_mask = torch.ones((utt_len, rt_len))
+                # this context below does not include the utterance provided as context
+                attention_mask_context = torch.stack( li_batch_new_attn, dim=0 ).float() #shape( bs, 1 , context )
 
+                # next word should attend to all previous utteranec words under causal attention
+                
+                attention_mask = torch.cat( (attention_mask_context, attention_mask_context.new_ones( ( attention_mask_context.shape[0], 1, curr_utt_len ) ) ), axis=-1  )
+                                
+                #appending to new attention_mask if it exists otherwise just return the attention
+                prev_mask = torch.nn.functional.pad( prev_mask, (0, 1), value=0 )
+
+                attention_mask = torch.cat([prev_mask, attention_mask], axis=1)
+
+        return attention_mask
+
+
+    def prepare_attention_mask_handle_padding( self, attention_mask, 
+                                                r_len, rst_pad_len, rst_max_len,
+                                                rt_len, kp_pad_len, kp_max_len ):
+        # Changing attention masks to compensate for the Variable RST batching
+        if rst_max_len != None and rst_pad_len != 0:
+            attention_mask[:, r_len-rst_pad_len:r_len] = 0
+            attention_mask[r_len-rst_pad_len:r_len, :] = 0
+
+        
+        if kp_max_len!=None and kp_pad_len !=0:
+            attention_mask[:, rt_len-kp_pad_len:rt_len] = 0
+            attention_mask[rt_len-kp_pad_len:rt_len, :] = 0
+        
         return attention_mask
 
     @classmethod
     def from_pretrained(cls,
-                        dir_tokenizer="./tokenizers/RSTBart",
-                        base_tokenizer_name="facebook/bart-base",
+                        dir_tokenizer="./tokenizers/RSTGPT2",
+                        base_tokenizer_name="facebook/GPT2-base",
                         rst_params={},
                         **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
 
@@ -1201,8 +1419,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             setattr(cls, k, v)
 
         return tokenizer
-
-class RSTBart_TrainingModule(pl.LightningModule):
+class RSTGPT2_TrainingModule(pl.LightningModule):
 
     def __init__(self,
                  mconfig,
@@ -1218,6 +1435,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                  tag='',
                  batching_style='effecient',
                  **kwargs):
+        
         super().__init__()
 
         self.batch_size = batch_size
@@ -1238,33 +1456,29 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                          )
 
         mconfig.vocab_size = mconfig.vocab_size-2 
-        self.model = RSTBart.from_pretrained( mconfig.base_model_name, config=mconfig )
+        self.model = RSTGPT2.from_pretrained( mconfig.base_model_name, config=mconfig )
         mconfig.vocab_size = mconfig.vocab_size+2
         self.model.config.vocab_size = mconfig.vocab_size
         self.model.resize_token_embeddings(self.model.config.vocab_size)
 
-
         
-        self.pad_values = {'rst_start_token': mconfig.pad_token_id,
+        self.pad_values = {'rst_start_token': mconfig.eos_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
                            'rst_ns': self.model.embed_rst_ns.padding_idx,
                            'rst_pos': self.model.embed_rst_pos.padding_idx,
 
-                           'key_phrase_ids': mconfig.pad_token_id,
+                           'key_phrase_ids': mconfig.eos_token_id,
                            'li_kprstpos': self.model.embed_rst_pos.padding_idx,
 
-                           'position_ids': mconfig.pad_token_id,
+                           'position_ids_kp_utt': mconfig.n_ctx-1,
 
-                           'utt_tok_ids': mconfig.pad_token_id,
+                           'input_ids_utt': mconfig.eos_token_id,
                            'attention_mask': 0.0,
 
                            'labels': self.model.loss_fct.ignore_index,
-                           'decoder_input_ids': mconfig.pad_token_id,
-                           'decoder_cross_attention_mask': 0.0,
 
-                            'decoder_edu_rstpos': -1,
-                                
-                            'decoder_context_rst_pos': -1
+                            'edu_rstpos': -1,
+                            'context_rstpos': -1
                            }
         
         self.RSTTokenizer.pad_values = self.pad_values
@@ -1278,23 +1492,19 @@ class RSTBart_TrainingModule(pl.LightningModule):
             'key_phrase_ids': mconfig.max_len_key_phrase,
             'li_kprstpos': mconfig.max_len_key_phrase,
 
-            'utt_tok_ids': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
-            'labels': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
-            'decoder_input_ids': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
+            'input_ids_utt': mconfig.max_len_utt,
+            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,
 
-            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase,  # axis:max_length
-            'decoder_cross_attention_mask': [ mconfig.max_len_utt , mconfig.max_len_rst+mconfig.max_len_key_phrase ] , #max_lens in both 2d dimensions
+            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,  # axis:max_length
 
-            'position_ids': mconfig.max_len_key_phrase + mconfig.max_len_rst,
+            'position_ids_kp_utt': mconfig.max_len_key_phrase+mconfig.max_len_utt,
             
-            'decoder_edu_rstpos': mconfig.max_rst_pos // 2,
-            'decoder_context_rst_pos':mconfig.max_len_rst + mconfig.max_len_key_phrase
+            'edu_rstpos': mconfig.max_rst_pos // 2,
+            'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase }
 
-        }
         self.RSTTokenizer.pad_maxlens = self.pad_maxlens
         
-        if mconfig.rst_tree_aligned_attention:
-            self.model.RSTTokenizer = self.RSTTokenizer
+        self.model.RSTTokenizer = self.RSTTokenizer
 
         if self.mode in ['train_new', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
@@ -1321,27 +1531,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
             train_params_to_save = self.return_params()
             mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
-                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTBart_Config.__init__).parameters.keys()) ))}
+                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTGPT2_Config.__init__).parameters.keys()) ))}
 
             self.hparams.update({**train_params_to_save, **mparams_to_save})
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
-
-            bad_words = ["<rst>", "<kp>", ]
-            bad_words_ids = [self.RSTTokenizer.encode(
-                bad_word,) for bad_word in bad_words]
-            bad_words_ids = bad_words_ids + \
-                [self.RSTTokenizer.encode(bad_word) for bad_word in bad_words]
-            bad_words_ids = bad_words_ids 
-
-            self.inference_generation_params = {#'num_beams': 1, 
-
-                                                'early_stopping': True,
-                                                'do_sample':True, 
-                                                'top_k':50, 
-                                                'top_p':0.95, 
-                                                'no_repeat_ngram_size': 2,
-                                                'min_length': 5, 'max_length': 10 }
             
             # self.trainer.logger.add_hparams( vars(mconfig) )
 
@@ -1353,7 +1547,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(
             parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data', default="./dataset_v3",
+        parser.add_argument('--dir_data', default="./dataset_v3_1",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=8, type=int)
@@ -1386,13 +1580,13 @@ class RSTBart_TrainingModule(pl.LightningModule):
         """
 
         if tparams['mode'] in ["train_new"]:            
-            mconfig = RSTBart_Config.from_pretrained(mparams['base_model_name'], **mparams)
+            mconfig = RSTGPT2_Config.from_pretrained(mparams['base_model_name'], **mparams)
 
-            training_module = RSTBart_TrainingModule(mconfig, **tparams)
+            training_module = RSTGPT2_TrainingModule(mconfig, **tparams)
 
         elif tparams['mode'] in ["train_cont", "inference"]:
 
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
             # restore/update param files from the checkpoint
@@ -1409,16 +1603,16 @@ class RSTBart_TrainingModule(pl.LightningModule):
             else:
                 print("param files not found utilsing default or user entered params\n")
 
-            mconfig = RSTBart_Config.from_pretrained(mparams['base_model_name'], **mparams)
+            mconfig = RSTGPT2_Config( **mparams)
 
             # Restore/update Training Module
-            training_module = RSTBart_TrainingModule(mconfig, **tparams)
+            training_module = RSTGPT2_TrainingModule(mconfig, **tparams)
 
             training_module.load_state_dict(checkpoint['state_dict'])
 
         elif tparams['mode'] in ["test"]:
 
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
             # restore/update param files from the checkpoint
@@ -1432,7 +1626,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 pass
 
             # Restore/update Training Module
-            training_module = RSTBart_TrainingModule(
+            training_module = RSTGPT2_TrainingModule(
                 **tparams, mparams=mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -1454,13 +1648,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
         callbacks = []
         checkpoint_callback = ModelCheckpoint(monitor='val_loss', 
                                             save_top_k=2,
-                                            mode='min', dirpath=dir_checkpoints,
-                                            filename='{epoch:03d}_{val_loss:.5f}')
-
-        # checkpoint_callback._save_model = types.MethodType(
-        #     utils.monkey_save_model, checkpoint_callback)  # monkey patch
-
-        # checkpoint_callback._save_model = mpatch_save_model(checkpoint_callback._save_model)
+                                              mode='min', dirpath=dir_checkpoints,
+                                              filename='{epoch:03d}_{val_loss:.5f}')
 
         checkpoint_callback._save_model = types.MethodType(
             mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
@@ -1468,12 +1657,15 @@ class RSTBart_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 40,       
+            patience = 15,       
             verbose=False,
             mode='min'
         )
+
+        save_model_callback = SaveModelCallBack()
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
+        callbacks.append(save_model_callback)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -1494,33 +1686,30 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    # val_check_interval=0.05,
-                                                    limit_train_batches = 0.05,
-                                                    limit_val_batches = 0.05,
+                                                    val_check_interval=0.05,
+                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=0,
+                                                    num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
                                                     # track_grad_norm=2,
-                                                    gradient_clip_val=0.5,
+                                                    # gradient_clip_val=0.05,
                                                     **trainer_vars,
                                                     )
 
         elif tparams['mode'] in ["train_cont", "inference"]:
             # restoring checkpoint
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    limit_train_batches = 0.05,
-                                                    limit_val_batches = 0.05,
+                                                    val_check_interval=0.05,
+                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-                                                    gradient_clip_val=0.5,
-
                                                     **trainer_vars,
                                                     )
 
@@ -1529,10 +1718,10 @@ class RSTBart_TrainingModule(pl.LightningModule):
             
             try:
                 trainer.global_step = checkpoint['global_step']
-                trainer.current_epoch = checkpoint['epoch'] - 1
+                trainer.current_epoch = checkpoint['epoch']
             except Exception:
                 trainer.fit_loop.global_step = checkpoint['global_step']
-                trainer.fit_loop.current_epoch = checkpoint['epoch'] -1
+                trainer.fit_loop.current_epoch = checkpoint['epoch']
 
             # restore the optimizers
             optimizer_states = checkpoint['optimizer_states']
@@ -1559,7 +1748,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         elif tparams['mode'] in ["test"]:
 
             # restoring checkpoint
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
             training_module.load_state_dict(checkpoint['state_dict'])
@@ -1610,7 +1799,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
         if tparams['mode'] in ["test"]:
 
-            checkpoint = RSTBart_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
             training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -1713,7 +1902,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
         
-        if False and step_name == "val" and _get_rank() == 0:
+        if step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
             
@@ -1730,7 +1919,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 # If there file does not exists we add the true observed records
                 if not os.path.exists(fp):
 
-                    df = pd.DataFrame(columns=['epoch', 'rst_rels', 'topics', 'utterance',
+                    df = pd.DataFrame(columns=['epoch', 'rst_rels', 'keyphrase', 'utterance',
                                             'dict_pos_edu', 'li_kprstpos',
 
                                             'rst_ns',
@@ -1741,7 +1930,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     rst_ns = encoded_input.pop('orig_rst_ns')
                     rst_pos = encoded_input.pop('orig_rst_pos')
 
-                    topics = encoded_input.pop('orig_key_phrase')
+                    keyphrase = encoded_input.pop('orig_key_phrase')
                     utterance = encoded_input.pop('orig_utt')
                     dict_pos_edu = encoded_input.pop('orig_dict_pos_edu')
 
@@ -1754,7 +1943,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                         'rst_ns': ', '.join(rst_ns),
                         'rst_pos': rst_pos,
 
-                        "topics": ', '.join(topics),
+                        "keyphrase": ', '.join(keyphrase),
                         "utterance": utterance,
                         "dict_pos_edu": json.dumps(dict_pos_edu),
 
@@ -1775,20 +1964,15 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 encoded_input.pop('orig_li_kprstpos', None)
                 # encoded_input.pop('labels', None)
 
-                for k in list(encoded_input.keys()):
-                    encoded_input[k] = encoded_input[k].to(self.model.device )
+                generation_params = copy.deepcopy(self.model.generation_params)
+                generation_params['max_length'] = 60
+                generation_params['time'] = 20
+                decoded_text = self.model.generate_plus( encoded_input, generation_params )
 
-                with torch.no_grad():
-                    output = self.model.generate(
-                        None, use_cache=True, **encoded_input, **self.inference_generation_params)    
-                    output = output[0]
-                
-                decoded_text = self.RSTTokenizer.decode(output,
-                                                    skip_special_tokens=False)
                 datum = {
                     'epoch': self.current_epoch,
                     'rst_rels': '',
-                    'topics': '',
+                    'keyphrase': '',
                     'utterance': json.dumps(decoded_text),
                     'dict_pos_edu': '',
                     'li_kprstpos': '',
@@ -1807,6 +1991,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
                 split_name='train')
+            self.train_dl_used = False
+
         if 'val' in modes:
             self.val_dl = self.dg.prepare_dataloader(
                 split_name='val')
@@ -1819,9 +2005,13 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
     def train_dataloader(self):
         # return self.train_dl
-
-        return self.dg.prepare_dataloader(
+        if self.train_dl_used == False:
+            return self.train_dl
+        else:
+            self.train_dl =  self.dg.prepare_dataloader(
                 split_name='train')
+            self.train_dl_used = True
+            return self.train_dl
 
     def val_dataloader(self):
         # return self.dg.prepare_dataloader(
@@ -1846,9 +2036,6 @@ class RSTBart_TrainingModule(pl.LightningModule):
         
         # optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
         #                 relative_step=True, warmup_init=True, lr=self.learning_rate )
-        # lr_scheduler = get_constant_schedule_with_warmup(optimizer,
-        #                                                  num_warmup_steps=0.10*self.total_steps(),
-        #                                                  )
         
         # optimizer = FusedAdam(self.model.parameters(), lr=0.0001 )
 
@@ -1864,11 +2051,13 @@ class RSTBart_TrainingModule(pl.LightningModule):
         #                                                 num_training_steps=self.total_steps(),
         #                                                 num_cycles=1.5
         #                                                )
-        
+        # lr_scheduler = get_constant_schedule_with_warmup(optimizer,
+        #                                                  num_warmup_steps=0.10*self.total_steps(),
+        #                                                  )
 
         # return [optimizer], [{"scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}]
 
-        return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
+        return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
     
     def return_params(self):
         params = {}
@@ -1919,7 +2108,7 @@ class DataLoaderGenerator():
         #debugging
         fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn]
+            fn)[-1] != "lock" and "dict_len" not in fn]#[:10 ]
                 
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
@@ -1982,7 +2171,7 @@ class DataLoaderGenerator():
             sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle, batching_style=self.batching_style)
 
         elif self.batching_style=='effecient' and self.gpus > 1 and split_name not in ['inference', 'test' ]:
-            raise NotImplementedError("have to implement the batching style in distributed sampler")
+            # raise NotImplementedError("have to implement the batching style in distributed sampler")
             sampler = SizedOrdered_DistributedSampler(
                 concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
         else:
@@ -2036,9 +2225,10 @@ class SingleDataset(torch.utils.data.Dataset):
                                         nrows=(self.line_end-self.line_start))
 
         fp_cached_order = os.path.join(os.path.dirname(
-            file_path), f"dict_lens_{line_start}_to_{line_end}.pkl")
+            file_path), f"gpt2_dict_lens_{line_start}_to_{line_end}.pkl")
 
-        # if os.path.exists( fp_cached_order):
+        # # resetting the cached order files
+        # if os.path.exists( fp_cached_order) and "australia" in self.fp:
         #     os.remove(fp_cached_order)
 
     
@@ -2056,13 +2246,29 @@ class SingleDataset(torch.utils.data.Dataset):
                 [self.tokenizer.encode(ujson.loads(txt), return_tensors='np', add_special_tokens=False,
                                     truncation=False, padding='do_not_pad').size for txt in self.data.txt_preproc.values.tolist()]
             )
+            # np_rstlens and np_keyphrase_lens used by the sampler
+
             # len of rst
             self.np_rstlens = np.array(
                 [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
 
             # len of keyphrase
-            self.np_keyphrase_lens = np.array([len(li_pos_kp) + len(sum([pos_kp[1].split(
-                ) for pos_kp in json.loads(li_pos_kp)], [])) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
+            
+            # self.np_keyphrase_lens = np.array( [len(li_pos_kp) +
+            #                                          len( sum( [pos_kp[1].split() for pos_kp in json.loads(li_pos_kp)], []) ) for li_pos_kp in self.data.li_pos_kp.values.tolist()])
+
+            li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
+
+            li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
+
+            li_kp = [ ''.join(['<|kp|> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
+
+            self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
+                                        add_special_tokens=False, 
+                                        truncation=False,
+                                        padding = 'do_not_pad',
+                                        return_tensors=None).__len__() for kp in li_kp ] )
+
 
             dict_cached_order = {'np_textlens': self.np_textlens,
                                 'np_rstlens': self.np_rstlens,
@@ -2070,9 +2276,17 @@ class SingleDataset(torch.utils.data.Dataset):
 
             pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
 
-        self.rst_len =[tokenizer.max_len_rst]*self.__len__()
+        # # These ones below are used during the RSTTokenizers encode_input function to pad rst and kp
+        # #v1 We initialize the rst/kp  lengths as the max lengths of our training set
+        # # In the Sampler, we change the max length to that of its pre-prescribed batch
+        # self.rst_len = [tokenizer.max_len_rst]*self.__len__()
+        # self.key_phrase_len = [tokenizer.max_len_key_phrase]*self.__len__()
 
-        
+        #v2 We initialize the rst/kp lengths as the actual length of each entry
+        # In the Sampler, we change the max length to that of its pre-prescribed batch
+        self.rst_len = self.np_rstlens
+        self.key_phrase_len = self.np_keyphrase_lens
+
         self.data = self.data.to_dict('records')
 
     def __len__(self):
@@ -2092,7 +2306,10 @@ class SingleDataset(torch.utils.data.Dataset):
                                                   li_kp=li_kp,
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
-                                                  dict_pos_edu=dict_pos_edu)
+                                                  dict_pos_edu=dict_pos_edu,
+                                                  rst_len=self.rst_len[index],
+                                                  key_phrase_len=self.key_phrase_len[index]
+                                                  )
 
             encoded['orig_rst_rels'] = rst_rels
             encoded['orig_rst_ns'] = rst_ns
@@ -2112,10 +2329,10 @@ class SingleDataset(torch.utils.data.Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                rst_len=self.rst_len[index]
+                rst_len=self.rst_len[index],
+                key_phrase_len=self.key_phrase_len[index]
             )
   
-
         return encoded
 
     def getitem_extract_datum(self, index):
@@ -2131,7 +2348,9 @@ class SingleDataset(torch.utils.data.Dataset):
 
         # sorting the order to be left to right in binary tree
         sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: (
-            RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]))]
+            RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]), 
+            ) ]
+
         rst_rels = [rst_rels[idx] for idx in sorted_order]
         rst_ns = [rst_ns[idx] for idx in sorted_order]
         rst_pos = [rst_pos[idx] for idx in sorted_order]
@@ -2151,8 +2370,9 @@ class SingleDataset(torch.utils.data.Dataset):
         utterance = ujson.loads(datum['txt_preproc'])
 
         #pos and edus
-        dict_pos_edu = json.loads(datum['dict_pos_edu'])        
-   
+        dict_pos_edu = json.loads(datum['dict_pos_edu'])   
+
+
         return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu
 
 class SizedOrdered_Sampler(Sampler[int]):
@@ -2184,30 +2404,20 @@ class SizedOrdered_Sampler(Sampler[int]):
                 (np_rst_lens, np_key_phrase_lens, np_txt_lens))
             # We Randomly re-arrange them in batches of batch size
         
+            li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
+                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
 
-
-            if batch_size != -1:
-                li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                                for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
-
-            else:
-                li_chunked_lens = []
-                start_idx = 0
-                batch_lens = OrderedDict( [ (5,150) , (10,140) , (15,135), (20,130) , (25,125) , (30,120), (40,110), (45,100), (50,90), (60,80), (70,70), (90,60), (105,50) , (120,45) , (140,40), (160,35) ,(190,30), (10000, 30) ] )
-                while start_idx < len(np_ordered_lens):
-                    batch_len = next( value for key,value in batch_lens.items() if np_txt_lens[np_ordered_lens[start_idx]]<key  )
-                    end_idx = start_idx + batch_len
-                    li_chunked_lens.append( np_ordered_lens[start_idx:end_idx] )
-                    start_idx = end_idx
 
             if shuffle:
-                # random.Random(4).shuffle(li_chunked_lens)
                 random.shuffle(li_chunked_lens)
 
             # Getting max sizes for rst in each chunk
             self.li_chunk_rst_len = [
                 np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
-
+            
+            self.li_chunk_key_phrase_len = [
+                np.take(np_key_phrase_lens, idxs).max() for idxs in li_chunked_lens] 
+            
             if self.batch_size != -1:
                 self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
             else:
@@ -2216,6 +2426,7 @@ class SizedOrdered_Sampler(Sampler[int]):
             # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
             for chunk_idx, data_idxs in enumerate(li_chunked_lens):
                 rst_len = self.li_chunk_rst_len[chunk_idx]
+                key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
 
                 for data_idx in data_idxs:
                     dataset_idx = bisect.bisect_right(
@@ -2228,6 +2439,7 @@ class SizedOrdered_Sampler(Sampler[int]):
                             self.data_source.cumulative_sizes[dataset_idx - 1]
 
                     self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
+                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
 
     def __iter__(self):
         return iter(self.li_chunked_ordered_lens)
@@ -2356,7 +2568,10 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
         # Getting max sizes for rst and key_phrase in each chunk
         self.li_li_chunk_rst_len = [ [np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens ] 
                                             for li_chunked_lens in li_li_chunked_lens ]
-        
+        self.li_li_chunk_key_phrase_len = [ [
+                np.take(np_key_phrase_lens, idxs).max() 
+                for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens ]
+
         self.li_li_chunked_ordered_lens = [ np.concatenate(li_chunked_lens).tolist() for li_chunked_lens in li_li_chunked_lens ]
         
         for (li_chunked_lens, li_chunk_rst_len) in zip( li_li_chunked_lens, self.li_li_chunk_rst_len ) :
@@ -2364,6 +2579,7 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
             
             for chunk_idx, data_idxs in enumerate(li_chunked_lens):
                 rst_len = li_chunk_rst_len[chunk_idx]
+                key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
 
                 for data_idx in data_idxs:
                     dataset_idx = bisect.bisect_right(
@@ -2376,6 +2592,7 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
                             self.data_source.cumulative_sizes[dataset_idx - 1]
 
                     self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
+                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
                 
     def __iter__(self) -> Iterator[T_co]:
 
@@ -2413,21 +2630,21 @@ def main(tparams={}, mparams={}):
     os.makedirs(tparams['dir_checkpoints'], exist_ok=True)
 
     # initiating training loop
-    training_module = RSTBart_TrainingModule.instatiate_training_module(
+    training_module = RSTGPT2_TrainingModule.instatiate_training_module(
         tparams, mparams)
-    trainer, training_module = RSTBart_TrainingModule.instatiate_trainer(
+    trainer, training_module = RSTGPT2_TrainingModule.instatiate_trainer(
         tparams, tb_logger, training_module)
-    RSTBart_TrainingModule.start(trainer, tparams, training_module, mparams)
+    RSTGPT2_TrainingModule.start(trainer, tparams, training_module, mparams)
 
 if __name__ == '__main__':
 
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 
     # add model specific args
-    mparams = RSTBart.parse_model_specific_args(parent_parser)
+    mparams = RSTGPT2.parse_model_specific_args(parent_parser)
 
     # add the trainer specific args
-    tparams = RSTBart_TrainingModule.parse_train_specific_args(parent_parser)
+    tparams = RSTGPT2_TrainingModule.parse_train_specific_args(parent_parser)
 
     if tparams.mode == "test":
         assert tparams.gpus in [0, 1]
@@ -2442,7 +2659,7 @@ if __name__ == '__main__':
         print(traceback.format_exc())
 
 # dullduks server version 1 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RstBart --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTBart --learning_rate 3e-4 
+# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT2.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTGPT2 --learning_rate 3e-4 
 
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 32 --version 12  --precision 16 --mode train_new --workers 14 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention scheme"
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 13  --precision 16 --mode train_new --workers 14 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with aligned attention scheme"
+# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT2.py --batch_size 32 --version 12  --precision 16 --mode train_new --workers 14 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTGPT2 with normal attention scheme"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT2.py --batch_size 32 --version 13  --precision 16 --mode train_new --workers 14 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTGPT2 with aligned attention scheme"

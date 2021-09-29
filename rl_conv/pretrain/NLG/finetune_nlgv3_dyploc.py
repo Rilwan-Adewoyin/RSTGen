@@ -161,8 +161,6 @@ class NLG(nn.Module, utils.GenerationMixin42_gpt):
         )
         self.prefix_claim_embed.requires_grad_ = True
 
-        
-
         # endregion
     
         with torch.no_grad():

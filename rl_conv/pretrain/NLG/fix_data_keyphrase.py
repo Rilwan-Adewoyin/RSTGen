@@ -7,11 +7,6 @@ import argparse
 import numpy as np
 
 
-# This script provides two functions:
-# 1) TODO: clean text that may incude garble
-#endregion
-
-
 def main(data_dir):
     
     # getting list of files
@@ -23,8 +18,6 @@ def main(data_dir):
         if idx % 10 == 0:
             print(f"Operating on file {idx} of {len(li_fps)}")
         process_and_save(fp )
-
-
 
 
 def process_and_save( fp ):

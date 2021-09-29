@@ -65,7 +65,7 @@ def load_pretrained_transformer( model_name='bert-base-cased', transformer=True,
     if transformer == True:
         output['transformer'] = GPT2LMHeadModel.from_pretrained(_dir_transformer)
     
-    return output
+    return output 
 
 def load_pretrained_tokenizer_local( model_name='NLG'):
 
@@ -330,7 +330,7 @@ class RstTokenizerMixin():
 
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
-    def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.5
+    def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.05
                     ):
         super(EmbeddingRstPos, self).__init__()
 
@@ -340,7 +340,7 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
 
         self.init_val = init_val
         self.fixed_rst_encoding = self.make_rst_encoding( )
-        self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=False )
+        self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=True )
         
         self.padding_idx = self.fixed_rst_encoding.padding_idx
         
@@ -389,6 +389,38 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
 
         return fixed_rst_encoding
 
+class EmbeddingRstPos_v2(nn.Module, RstTokenizerMixin):
+    def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,init_val=0.05
+                    ):
+        super(EmbeddingRstPos_v2, self).__init__()
+
+        self.max_rst_index = max_rst_index
+        self.max_rst_level = max_rst_level
+        self.left_right_seq_from_root_to_edu_pos = EmbeddingRstPos.left_right_seq_from_root_to_edu_pos
+
+        self.init_val = init_val
+        self.fixed_rst_encoding = torch.nn.Embedding( self.max_rst_index, self.max_rst_level,
+                                    padding_idx=self.max_rst_index-1,
+                                    scale_grad_by_freq=True ) 
+        
+        self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=True )
+        
+        self.padding_idx = self.fixed_rst_encoding.padding_idx
+        
+        
+    def forward(self, x ):
+        if x.numel()==0:
+            return x
+            
+        while x.max() >= self.max_rst_index:
+            x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
+   
+
+        x = self.fixed_rst_encoding(x)
+        x = self.ffd( x )
+        x = torch.nn.functional.gelu(x)
+        return x
+  
 #endregion
 
 #region dataloading

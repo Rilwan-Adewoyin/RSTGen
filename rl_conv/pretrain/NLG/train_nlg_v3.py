@@ -580,7 +580,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
             Return 
             w/o da
             dictionary
-            attn_mask : Bidirectional up to bos token, Causal Up till EOS, 0s till end of padding
+            attention_mask : Bidirectional up to bos token, Causal Up till EOS, 0s till end of padding
 
         Note this method returns integer encodings for tokens that will be processed by BERT embedding layer
             and possibly one-hot encoded vectors that will not be encoded by same pert embedding layer
@@ -604,25 +604,25 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
         utt_dim = rt_dim + tknzd_utt.shape[-1]
 
         # Building Attention Mask
-        attn_mask = torch.tril( torch.ones([utt_dim, utt_dim]), diagonal=rt_dim )
+        attention_mask = torch.tril( torch.ones([utt_dim, utt_dim]), diagonal=rt_dim )
             #correcting for padding in rst section
 
 
             # Implementing causal masking for each topic subphrase 
                 # First, each topic subphrase only attends to other words within that topic subphrase (including ta token) and not the other topcics
                 # So set the template attn to 0 
-        attn_mask[ r_dim:rt_dim, r_dim:rt_dim ] = 0
+        attention_mask[ r_dim:rt_dim, r_dim:rt_dim ] = 0
                 #Second each topic phrase has causal masking on the tokens within the topic phrase
                 # use ta_tokens_pos
                 # essentially for idx i, i+1
-                # add a tril att attn_mask[ i:i+1 , i:i+1 ] so that in each topic phrase each word only attmeds to the previous words
+                # add a tril att attention_mask[ i:i+1 , i:i+1 ] so that in each topic phrase each word only attmeds to the previous words
         for ta_idx, phrase_len in zip( ta_tokens_pos, ta_phrase_lens):
-            attn_mask[ r_dim+ta_idx:r_dim+ta_idx+phrase_len, r_dim+ta_idx:r_dim+ta_idx+phrase_len ] = torch.tril( attn_mask.new_ones( [phrase_len,phrase_len]  )  )
+            attention_mask[ r_dim+ta_idx:r_dim+ta_idx+phrase_len, r_dim+ta_idx:r_dim+ta_idx+phrase_len ] = torch.tril( attention_mask.new_ones( [phrase_len,phrase_len]  )  )
 
                 #correcting for padding in and after utterance section
                     #when the utterance padding starts then we mask
-        #attn_mask[ utt_dim-utt_pad_count: , : ] = 0
-        attn_mask[ utt_dim: , : ] = 0
+        #attention_mask[ utt_dim-utt_pad_count: , : ] = 0
+        attention_mask[ utt_dim: , : ] = 0
 
         #Creating labels/targets
         try:
@@ -656,7 +656,7 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
                 'tnsr_rst_rels':tnsr_rst_rels,'tnsr_rst_ns':tnsr_rst_ns, 'tnsr_rst_pos':tnsr_rst_pos,
                 'tnsr_topics_phrase':tnsr_topics_phrase.contiguous(), 'tnsr_topics_pos': tnsr_topics_pos.contiguous(),
                  'tknzd_utt':tknzd_utt.contiguous(),
-                 'attention_mask':attn_mask.contiguous(),
+                 'attention_mask':attention_mask.contiguous(),
                  'labels':labels,
                  'position_ids':position_ids.contiguous(),
                  'token_type_ids':token_type_ids.contiguous()
@@ -694,8 +694,6 @@ class NLG_tokenizer(utils.EffeciencyMixin, utils.RstTokenizerMixin):
             tnsr_rels = tnsr_rels[:max_len ] 
             tnsr_ns = tnsr_ns[:max_len]
             tnsr_pos = tnsr_pos[:max_len]
-
-        #return tnsr_rels, diff, tnsr_ns, tnsr_pos
         
         return tnsr_rels, tnsr_ns, tnsr_pos
 
