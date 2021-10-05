@@ -75,6 +75,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
+import contextlib
 
 # patched method
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
@@ -557,6 +558,32 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
 
         return inputs_embeds
 
+    def generate_plus(self, encoded_input, generation_params=None):
+        if self.rst_tree_aligned_attention:
+            with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+                self.rst_parser = DiscourseParser(verbose=False, skip_parsing=True,global_features=False)
+
+        if generation_params == None:
+            generation_params = self.generation_params
+
+        for k in list(encoded_input.keys()):
+            encoded_input[k] = encoded_input[k].to(self.device)
+
+        with torch.no_grad():
+            # encoder_outputs = self.model.embed(**encoded_input)
+            output = self.generate(
+                None, use_cache=True, **encoded_input, **generation_params)    
+            output = output[0]
+
+        decoded_text = self.RSTTokenizer.decode(output,skip_special_tokens=False)
+
+        if self.rst_tree_aligned_attention:
+            with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+                self.rst_parser.unload()
+            del self.rst_parser
+
+        return decoded_text
+
     def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
@@ -583,16 +610,17 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                 
                 
                 decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
-                                                                                                past = None, utt_len = decoder_input_ids.shape[1],
+                                                                                                prev_mask = decoder_cross_attention_mask, utt_len = decoder_input_ids.shape[1],
                                                                                                 utterance_ids = decoder_input_ids,
                                                                                                 curr_edu_pos = curr_edu_pos )
-
+                if use_cache:
+                    decoder_cross_attention_mask = decoder_cross_attention_mask[..., -1: ,:]
 
             else:
                 # calculating the new cross attention mask
                 if decoder_input_ids.shape[1]!= decoder_cross_attention_mask.shape[-2]:
                     decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
-                                                                                                past = decoder_cross_attention_mask,
+                                                                                                prev_mask = decoder_cross_attention_mask,
                                                                                                 utt_len = decoder_input_ids.shape[1],
                                                                                                 utterance_ids = decoder_input_ids,
                                                                                                 curr_edu_pos = curr_edu_pos )
@@ -813,8 +841,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         attention_mask = self.prepare_encoder_attention_mask(
             r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]),
             li_kprstpos=li_kprstpos)
-
-        
 
         decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat([ rst_pos[0:1], rst_pos]),
                                                                          li_kprstpos, utt_len, rt_len,
@@ -1216,7 +1242,8 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                     # Each edu should only attend to the rst and keyp phrases with pos in its parents pos
                     # Remember to create a 3 extras, for the starting eos and bos token and the ending eos token
                 for pos, edu_txt, edu_txt_len, edu_ids in li_pos_edu_idslen_ids:
-
+                    if edu_txt_len <= 0:
+                        continue
                     li_parent_tree = dict_rstpos_parents[pos]
 
                     pos_tree_aligned_attn = (
@@ -1255,8 +1282,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
 
                 # appending to new attention_mask if it exists otherwise just return the attention
-                prev_mask = torch.nn.functional.pad(prev_mask, (0, 1), value=0)
-
                 attention_mask = torch.cat([prev_mask, attention_mask], axis=1)
                         
         else:
@@ -1595,8 +1620,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
             trainer_vars = {    'accelerator': 'ddp',
                             'plugins': DeepSpeedPlugin(stage=1, 
-                                                        contiguous_gradients=True,
-                                                         ) 
+                                                        contiguous_gradients=True) 
                             # 'plugins' : DDPPlugin(find_unused_parameters=True)
                             }
 
@@ -1628,7 +1652,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     val_check_interval=0.05,
                                                     limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=0,
+                                                    num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
 
                                                     **trainer_vars,
@@ -1638,11 +1662,18 @@ class RSTBart_TrainingModule(pl.LightningModule):
             trainer.on_load_checkpoint(checkpoint)
             
             try:
+                #debugging
+                trainer.current_epoch = checkpoint['epoch']
                 trainer.global_step = checkpoint['global_step']
-                trainer.current_epoch = checkpoint['epoch'] - 1
+                trainer.batch_index = checkpoint['batch_idx']
+                trainer.total_batch_index = checkpoint['total_batch_idx']
+
             except Exception:
+                trainer.fit_loop.current_epoch = checkpoint['epoch']
                 trainer.fit_loop.global_step = checkpoint['global_step']
-                trainer.fit_loop.current_epoch = checkpoint['epoch'] -1
+                trainer.fit_loop.batch_index = checkpoint['batch_idx']
+                trainer.fit_loop.total_batch_index = checkpoint['total_batch_idx']
+
 
             # restore the optimizers
             optimizer_states = checkpoint['optimizer_states']
@@ -1823,7 +1854,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
         
-        if step_name == "val" and _get_rank() == 0:
+        if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
             
@@ -1885,16 +1916,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 encoded_input.pop('orig_li_kprstpos', None)
                 # encoded_input.pop('labels', None)
 
-                for k in list(encoded_input.keys()):
-                    encoded_input[k] = encoded_input[k].to(self.model.device )
+                generation_params = copy.deepcopy(self.model.generation_params)
+                generation_params['max_time'] = 30
+                decoded_text = self.model.generate_plus(
+                    encoded_input, generation_params)
 
-                with torch.no_grad():
-                    output = self.model.generate(
-                        None, use_cache=True, **encoded_input, **self.model.generation_params)    
-                    output = output[0]
-                
-                decoded_text = self.RSTTokenizer.decode(output,
-                                                    skip_special_tokens=False)
                 datum = {
                     'epoch': self.current_epoch,
                     'rst_rels': '',
@@ -1908,9 +1934,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
                 pd.DataFrame.from_records([datum]).to_csv(fp, index=False, mode='a', header=False)
                 # Saving to file
-        
         else:
             pass
+    
         
     def create_data_loaders(self, modes ):
 
@@ -2008,7 +2034,7 @@ class DataLoaderGenerator():
         #debugging
         fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn][:10]
+            fn)[-1] != "lock" and "dict_len" not in fn]
                 
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
@@ -2513,5 +2539,5 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with non attention"
+# CUDA_VISIBLE_DEVICES=2 python3 train_RSTBart.py --batch_size 32 --version 6  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"

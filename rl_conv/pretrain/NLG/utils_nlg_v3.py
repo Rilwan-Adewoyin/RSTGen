@@ -219,29 +219,27 @@ class RstModelMixin():
         """
         li_edu_rst_pos: the list of possible edus positions for each text in this batch
         """
-
+        
         # Decode the output ids to get a text
         li_gen_text = [self.RSTTokenizer.decode(
-            ids, skip_special_tokens=True) for ids in decoder_input_ids]
+            ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
 
         # run edu splitter on text generated so far
         # li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= ujson.dumps([li_gen_text]),
         #                                     skip_parsing=True, redirect_output=True)
 
-        li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text,
-                                                               )
-
+        li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text)
         # calculating edu of current text
         li_edu_count = [
             ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
 
         # removing any padding
-        li_edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-            as_tuple=True)[0]] for tens in edu_rstpos.unbind(dim=0)]
+        edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+            as_tuple=True)[0]] for tens in edu_rstpos][0]
 
         # selecting approapriate edu value.
         curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
-                        for edu_count, edu_rstpos in zip(li_edu_count, li_edu_rstpos)]
+                        for edu_count in li_edu_count]
 
         return curr_edu_pos 
 

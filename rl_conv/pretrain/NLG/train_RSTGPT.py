@@ -1713,11 +1713,17 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             trainer.on_load_checkpoint(checkpoint)
 
             try:
-                trainer.global_step = checkpoint['global_step']
                 trainer.current_epoch = checkpoint['epoch']
+                trainer.global_step = checkpoint['global_step']
+                trainer.batch_index = checkpoint['batch_idx']
+                trainer.total_batch_index = checkpoint['total_batch_idx']
+
+
             except Exception:
-                trainer.fit_loop.global_step = checkpoint['global_step']
                 trainer.fit_loop.current_epoch = checkpoint['epoch']
+                trainer.fit_loop.global_step = checkpoint['global_step']
+                trainer.fit_loop.batch_index = checkpoint['batch_idx']
+                trainer.fit_loop.total_batch_index = checkpoint['total_batch_idx']
 
             # restore the optimizers
             optimizer_states = checkpoint['optimizer_states']
@@ -1776,7 +1782,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             if os.path.exists(best_ckpt_path) == False:
                 root_dir = Path(__file__).resolve().parents[4]
                 best_ckpt_path = os.path.join(
-                    root_dir._str, best_ckpt_path[best_ckpt_path.index('mastering-conversation'):])
+                    str(root_dir), best_ckpt_path[best_ckpt_path.index('mastering-conversation'):])
 
             if torch.cuda.is_available():
                 checkpoint = torch.load(best_ckpt_path, map_location='cpu')
