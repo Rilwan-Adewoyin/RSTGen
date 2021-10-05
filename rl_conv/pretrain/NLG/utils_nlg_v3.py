@@ -684,6 +684,7 @@ def split(sequence, sep):
     yield chunk
 
 def non_parseable_remover(li_dict_rsttext):
+    print("Start non parseable remover")
     if len(li_dict_rsttext) == 0:
         return li_dict_rsttext
 
@@ -710,7 +711,8 @@ def non_parseable_remover(li_dict_rsttext):
 
 
             #making dict_pos_edu and li_edus again
-
+    
+    print("End non parseable remover")
     return li_dict_rsttext
 
 def position_edus(li_dict_rsttext):
@@ -747,7 +749,7 @@ def _parse_trees(li_strtree):
     # Parsing a list of subtrees in the utterance tree li_strtree
     for idx, pt_str in enumerate(li_strtree):
         try:
-            if pt_str in ['',None]: raise ValueError
+            if pt_str in ['', None]: raise ValueError
             _ = nltk.tree.Tree.fromstring(pt_str, brackets="{}")
         except ValueError:
             _ = None

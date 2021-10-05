@@ -56,10 +56,10 @@ def main( batch_process_size = 10, mp_count=1 ):
     dir_sourcedset = "./dataset_cmv/dyploc"
     
     batch_size = batch_process_size
-
     
     # iterate through train, val, test
-    for dset_section in ['test','val','train']:
+    # for dset_section in ['test','val','train']:
+    for dset_section in ['train']:
         
                 
         # loading dataset
@@ -68,7 +68,6 @@ def main( batch_process_size = 10, mp_count=1 ):
             total_batch_count = int( math.ceil( len(li_records) / batch_size ) )
 
         # Operating on the dataset in batches
-        batches_completed = 0
         model_formats = conversions_map[dset_section]
         
         batches_completed = 0
@@ -77,8 +76,9 @@ def main( batch_process_size = 10, mp_count=1 ):
         while len(li_records) > 0:
 
             batch_li_records = li_records[:batch_size]
-            print(f"\n\tOperating on batch {batches_completed} of {total_batch_count}")
-
+            print(f"\n\t Batch {batches_completed} of {total_batch_count}")
+            
+            
             # Preprocess the reference text 
             cs =  max( 3, math.ceil( batch_size / (mp_count) ) )
 
@@ -94,13 +94,14 @@ def main( batch_process_size = 10, mp_count=1 ):
                     #seq2seq: convert_dyploc_to_seqseq
 
                 # setting up imap pipes
-                res_rst = pool.imap( rst_tree_parse_records, res_1)
+                res_rst_edu = pool.imap( rst_tree_parse_records, res_1)
 
-                res_rst_skw = pool.imap( salience_keywords_parse, res_rst)
-                rrs_1, rrs_2 = tee(res_rst_skw,2)
+                res_rst_edu_skw = pool.imap( salience_keywords_parse, res_rst_edu)
+                rrs_1, rrs_2 = tee(res_rst_edu_skw,2)
 
-                res_rst_skw_edu = pool.imap(li_edu_parse_records, rrs_1)
-                res_rst_skw_edu = pool.imap( non_parseable_remover, res_rst_skw_edu ) # removing text with grammar so bad that it can not be parsed properly
+                # res_rst_skw_edu = pool.imap(li_edu_parse_records, rrs_1)
+                
+                res_rst_skw_edu = pool.imap( non_parseable_remover, rrs_1 ) # removing text with grammar so bad that it can not be parsed properly
                 res_rst_skw_edu = pool.imap( position_edus, res_rst_skw_edu)
                 rrse_1, rrse_2 = tee( res_rst_skw_edu, 2)
 
@@ -111,7 +112,7 @@ def main( batch_process_size = 10, mp_count=1 ):
                 if dset_section in ['val','test']:
                     res_dyploc_to_pair = pool.imap( convert_dyploc_to_pair, rrs_2 )
                 
-                # #getting results
+                # getting results
                 li_recs_dyploc_rst = sum( list(res_dyploc_to_rst), [] )
                 li_recs_dyploc_pair_rst= sum( list(res_dyploc_to_pair_rst), [] )
                 li_recs_seq2seq = sum( list(res_dyploc_to_seq2seq), [] )   
@@ -121,7 +122,7 @@ def main( batch_process_size = 10, mp_count=1 ):
                 dict_li_records = {}
                 dict_li_records['dyploc_pair_rst']=li_recs_dyploc_pair_rst
                 dict_li_records['dyploc_rst']=li_recs_dyploc_rst
-                # dict_li_records['dyploc_seq2seq']=li_recs_seq2seq
+                dict_li_records['dyploc_seq2seq']=li_recs_seq2seq
 
                 
                 if dset_section in ['test']:
@@ -179,73 +180,93 @@ def preprocess(li_records):
 
         li_records[idx]['txt_preproc'] = reference
         li_records[idx]['title'] = title
-            
+    
+    # print("Ending  preprocess")
     return li_records
 
 def rst_tree_parse_records(li_records):
 
     # region Parsing RST trees from reference sentences
     li_refs = [ record['txt_preproc'] for record in li_records ]
-
-    with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
-        rst_parser = DiscourseParser(verbose=False, skip_parsing=False,
-                        global_features=True)
     
-        li_unparsed_tree = rst_parser.parse_li_utterances(  li_refs )
+    try:
+        with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+            rst_parser = DiscourseParser(verbose=False, skip_parsing=False,
+                            global_features=True, segment_and_parse_tree=True)
         
-        rst_parser.unload()
-
-
-    li_subtrees = _parse_trees(li_unparsed_tree)
-    
-    li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
-
-
-    # Attaching the rst trees to the records
-        # and removing records which could not be parsed
-    for idx in reversed( range(len(li_records)) ):
-        
-        if li_rst_dict[idx] == None:
-            li_rst_dict.pop(idx)
-            li_records.pop(idx)
-
-        elif len(li_rst_dict[idx])==1 and li_rst_dict[idx][0]['ns'] == 'a' :
-            li_rst_dict.pop(idx)
-            li_records.pop(idx)
-
-        else:
-            li_records[idx]['rst'] = li_rst_dict[idx]
+            li_textwedutoken, li_unparsed_tree = rst_parser.parse_li_utterances(  li_refs )
             
-    return li_records
+            li_textwedutoken = list(li_textwedutoken)
+            
+            rst_parser.unload()
+            
+            del rst_parser
 
-def li_edu_parse_records(li_records):
-    # getting edus
-        # for each record
-            # Divide text into edus with positions
-            # then get a list of keyphrases from the context
-            # get keyphrase position of each context word in target
-    li_records = copy.deepcopy(li_records)
+        li_subtrees = _parse_trees(li_unparsed_tree)
 
-    li_refs = [ record['txt_preproc'] for record in li_records ]
-
-    with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
-        rst_parser = DiscourseParser(verbose=False, skip_parsing=True,
-                        global_features=True)
+        li_rst_dict = [ _tree_to_rst_code(_tree) if _tree!=None else None for _tree in li_subtrees ]
     
-        li_textwedutoken = rst_parser.parse_li_utterances(  li_refs )
+        # Attaching the rst trees to the records
+            # and removing records which could not be parsed
+        for idx in reversed( range(len(li_records)) ):
+            
+            if li_rst_dict[idx] == None or li_textwedutoken[idx]==None :
+                li_rst_dict.pop(idx)
+                li_records.pop(idx)
+                li_textwedutoken.pop(idx)
+
+            elif len(li_rst_dict[idx])==1 and li_rst_dict[idx][0]['ns'] == 'a' :
+                li_rst_dict.pop(idx)
+                li_records.pop(idx)
+                li_textwedutoken.pop(idx)
+
+            else:
+                li_records[idx]['rst'] = li_rst_dict[idx]
         
-        rst_parser.unload()
+        # Now parsing the edu records 
+        li_li_edus = edu_fixer( li_textwedutoken,  [ record['txt_preproc'] for record in li_records ] )
+        
+        for idx in range(len(li_records)):
+            li_records[idx]['li_edus'] = li_li_edus[idx]
 
-
-        # corrects Parser wrapper seperates at apostrophes
-    li_li_edus = edu_fixer( li_textwedutoken, li_refs )
-
-    for idx in range(len(li_records)):
-        li_records[idx]['li_edus'] = li_li_edus[idx]
-
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e
+    
+    # print("Ending rst_tree_parse_records")
     return li_records
+
+# def li_edu_parse_records(li_records):
+#     # getting edus
+#         # for each record
+#             # Divide text into edus with positions
+#             # then get a list of keyphrases from the context
+#             # get keyphrase position of each context word in target
+#     li_records = copy.deepcopy(li_records)
+
+#     li_refs = [ record['txt_preproc'] for record in li_records ]
+
+#     with open(os.devnull, "w") as f, contextlib.redirect_stdout(f):
+#         rst_parser = DiscourseParser(verbose=False, skip_parsing=True,
+#                         global_features=True)
+    
+#         li_textwedutoken = rst_parser.parse_li_utterances(  li_refs )
+        
+#         rst_parser.unload()
+        
+#         del rst_parser
+
+
+#         # corrects Parser wrapper seperates at apostrophes
+#     li_li_edus = edu_fixer( li_textwedutoken, li_refs )
+
+#     for idx in range(len(li_records)):
+#         li_records[idx]['li_edus'] = li_li_edus[idx]
+
+#     return li_records
 
 def salience_keywords_parse(li_records):
+    
     #extract kp_set_str from dyploc context
         # get kp_set_str from actual reference text based on word salience
         # use compute_topic_signatures script
@@ -254,18 +275,20 @@ def salience_keywords_parse(li_records):
     tsc.receive_data()
     tsc.calculate_llr()
     li_records = tsc.return_records() #adds a 'kp_set_str' to each record
+    # print("Ending salience keywords parse")
     return li_records
-
+    
 def convert_dyploc_to_rst( li_records ):
-
+    # print("Starting salience_keywords_parse")
+    
+    if len(li_records) == 0:
+        return li_records
     try:
-
         li_records = copy.deepcopy(li_records)
 
         for idx in range(len(li_records)):
             li_records[idx].pop('kp_set_str',None)
         
-
         #extracting keyphrases
 
         for idx in reversed(range(len(li_records))):
@@ -346,7 +369,9 @@ def convert_dyploc_to_rst( li_records ):
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
             li_records[idx].pop('sentence_types',None)
-    
+
+        print("Finishing Convert dyploc to rst")
+        
         return li_records
 
     except Exception as e:
@@ -354,6 +379,8 @@ def convert_dyploc_to_rst( li_records ):
         raise e
 
 def convert_dyploc_to_pair( li_records ):
+    # print("Starting Convert dyploc to pair")
+    
     try:
 
         # extract pair from the reference text
@@ -378,16 +405,19 @@ def convert_dyploc_to_pair( li_records ):
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
             li_records[idx].pop('sentence_types',None)
+            li_records[idx].pop('li_edus',None)
+            
 
-        #endregion
-
+        print("End Convert dyploc to pair") 
         return li_records
+        #endregion
     
     except Exception as e:
         print(traceback.format_exc())
         raise e
 
 def pair_template_maker(  kp_set_str, reference, tokenizer ):
+    # print("Starting pair template maker")
 
     try: 
             
@@ -437,6 +467,8 @@ def pair_template_maker(  kp_set_str, reference, tokenizer ):
             decoded_tokens = tokenizer.decode(tokens)
             li_split_text = decoded_tokens.split(' ')[1:]
             template_text.extend( li_split_text )
+    
+        # print("Ending pair template maker")
 
         return template_text
 
@@ -445,6 +477,8 @@ def pair_template_maker(  kp_set_str, reference, tokenizer ):
         raise e
 
 def convert_dyploc_to_pair_rst(li_records):    
+    # print("Starting Convert dyploc to pair rst")
+    
     try:
         li_records = copy.deepcopy(li_records)
         
@@ -495,7 +529,7 @@ def convert_dyploc_to_pair_rst(li_records):
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
             li_records[idx].pop('sentence_types',None)
-        
+        # print("Ending Convert dyploc to pair rst")
         return li_records
     
     except Exception as e:
@@ -503,7 +537,6 @@ def convert_dyploc_to_pair_rst(li_records):
         raise e
 
 def convert_dyploc_to_seqseq( li_records ):
-    
     try:
         li_records = copy.deepcopy(li_records)
         
@@ -529,41 +562,46 @@ def _save_data(li_records, dset_section, m_format):
         # (fn-format = file_number_utterances in file )
             # then append more lines
                 
+    try:
+        # print("Starting saving")
+        li_record_enc = [ { str(k):json.dumps(v) for k,v in dict_.items() } for dict_ in li_records ]
+                    
+        save_dir = os.path.join( "./dataset_cmv/", m_format, dset_section)
+        os.makedirs(save_dir, exist_ok=True)
 
-    li_record_enc = [ { str(k):json.dumps(v) for k,v in dict_.items() } for dict_ in li_records ]
-                
-    save_dir = os.path.join( "./dataset_cmv/", m_format, dset_section)
-    os.makedirs(save_dir, exist_ok=True)
+        
+        files_ = [ fp for fp in os.listdir(save_dir) ]
+        if len(files_)>0:
+            fn = files_[0]
+        else:       
+            fn = "0.csv"           
+            with open( os.path.join(save_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
+                dict_writer = csv.DictWriter(_f,fieldnames=list(li_record_enc[0].keys() ) )
+                dict_writer.writeheader()
+                pass
+        
+        curr_len = int(fn[:-4])
+        new_len = curr_len + len(li_record_enc)
 
-    
-    files_ = [ fp for fp in os.listdir(save_dir) ]
-    if len(files_)>0:
-        fn = files_[0]
-    else:       
-        fn = "0.csv"           
-        with open( os.path.join(save_dir,fn),"a+",newline=None,encoding='utf-8') as _f:
-            dict_writer = csv.DictWriter(_f,fieldnames=list(li_record_enc[0].keys() ) )
-            dict_writer.writeheader()
-            pass
-    
-    curr_len = int(fn[:-4])
-    new_len = curr_len + len(li_record_enc)
+        old_fp = os.path.join(save_dir,fn)
+        new_fp = os.path.join(save_dir,f"{new_len}.csv")
+        
+        pd.DataFrame(li_record_enc).to_csv(old_fp, mode='a', header=False, index=False)
+        os.rename(old_fp, new_fp)
+        # print("Ending saving")
+    except Exception as e:
+        print(traceback.format_exc())
+        raise e            
 
-    old_fp = os.path.join(save_dir,fn)
-    new_fp = os.path.join(save_dir,f"{new_len}.csv")
-    
-    pd.DataFrame(li_record_enc).to_csv(old_fp, mode='a', header=False, index=False)
-    os.rename(old_fp, new_fp)
-            
 if __name__ == '__main__':
     parent_parser = argparse.ArgumentParser(add_help=False) 
     
     parser = argparse.ArgumentParser(parents=[parent_parser], add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=160,
+    parser.add_argument('-bps','--batch_process_size', default=700,
                              help='', type=int)        
    
-    parser.add_argument('--mp_count', default=8, type=int)
+    parser.add_argument('--mp_count', default=7, type=int)
 
     args = parser.parse_args()
     
