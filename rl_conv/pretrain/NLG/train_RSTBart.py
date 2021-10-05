@@ -1215,7 +1215,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 # Then cycle through these lengths, and create the masking over the encoder
                     # Each edu should only attend to the rst and keyp phrases with pos in its parents pos
                     # Remember to create a 3 extras, for the starting eos and bos token and the ending eos token
-                for pos, edu_txt, edu_txt_len in li_pos_edu_idslen_ids:
+                for pos, edu_txt, edu_txt_len, edu_ids in li_pos_edu_idslen_ids:
 
                     li_parent_tree = dict_rstpos_parents[pos]
 
