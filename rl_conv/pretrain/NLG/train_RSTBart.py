@@ -20,7 +20,7 @@ import types
 from functools import lru_cache
 from itertools import islice
 from pathlib import Path
-from typing import (Any, Dict, Iterator, List, Optional, TypeVar)
+from typing import (Any, Dict, Iterator, List, Optional, TypeVar, Tuple, Union)
 
 import einops
 import numpy as np
@@ -48,7 +48,7 @@ from transformers import (BartConfig, BartTokenizerFast)
 from transformers.modeling_outputs import (BaseModelOutput, ModelOutput,
                                            Seq2SeqLMOutput, Seq2SeqModelOutput)
 from transformers.models.bart.modeling_bart import (
-    BartForConditionalGeneration, _expand_mask, shift_tokens_right)
+    BartForConditionalGeneration, shift_tokens_right)
 from transformers.optimization import AdafactorSchedule
 from transformers.tokenization_utils_base import AddedToken
 import string
@@ -104,6 +104,223 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.bool(), torch.finfo(dtype).min)
 
 transformers.models.bart.modeling_bart._expand_mask = _expand_mask
+
+# Monkey Patch for the BartModel Encoder forward - to prevent the automatic addition of positional encoding
+def bart_encoder_forward(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    head_mask=None,
+    inputs_embeds=None,
+    output_attentions=None,
+    output_hidden_states=None,
+    return_dict=None,
+    ):
+    r"""
+    Args:
+        input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
+            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
+            provide it.
+            Indices can be obtained using :class:`~transformers.BartTokenizer`. See
+            :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__`
+            for details.
+            `What are input IDs? <../glossary.html#input-ids>`__
+        attention_mask (:obj:`torch.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+            `What are attention masks? <../glossary.html#attention-mask>`__
+        head_mask (:obj:`torch.Tensor` of shape :obj:`(encoder_layers, encoder_attention_heads)`, `optional`):
+            Mask to nullify selected heads of the attention modules. Mask values selected in ``[0, 1]``:
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+        inputs_embeds (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
+            Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded
+            representation. This is useful if you want more control over how to convert :obj:`input_ids` indices
+            into associated vectors than the model's internal embedding lookup matrix.
+        output_attentions (:obj:`bool`, `optional`):
+            Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
+            returned tensors for more detail.
+        output_hidden_states (:obj:`bool`, `optional`):
+            Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors
+            for more detail.
+        return_dict (:obj:`bool`, `optional`):
+            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
+    """
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # retrieve input_ids and inputs_embeds
+    if inputs_embeds is not None:
+        input_shape = inputs_embeds.size()[:-1]
+    elif inputs_embeds is None:
+        raise ValueError("Inputs embeds must be defined")
+    # elif input_ids is not None:
+    #     input_shape = input_ids.size()
+    #     input_ids = input_ids.view(-1, input_shape[-1])
+
+    # else:
+    #     raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+    # if inputs_embeds is None:
+    #     raise ValueError("Inputs embeds must be defined")
+        # inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+        # embed_pos = self.embed_positions(input_shape)
+
+    hidden_states = inputs_embeds  
+    hidden_states = self.layernorm_embedding(hidden_states)
+    hidden_states = nn.functional.dropout(
+        hidden_states, p=self.dropout, training=self.training)
+
+    # expand attention_mask
+    if attention_mask is None:
+        raise ValueError("Attention mask must be defined")
+
+    # [bsz,tgt_seq_len, src_seq_len ] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
+
+    encoder_states = () if output_hidden_states else None
+    all_attentions = () if output_attentions else None
+
+    # check if head_mask has a correct number of layers specified if desired
+    if head_mask is not None:
+        assert head_mask.size()[0] == (
+            len(self.layers)
+        ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+    for idx, encoder_layer in enumerate(self.layers):
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+        # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+        dropout_probability = random.uniform(0, 1)
+        if self.training and (dropout_probability < self.layerdrop):  # skip the layer
+            layer_outputs = (None, None)
+        else:
+            if getattr(self.config, "gradient_checkpointing", False) and self.training:
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs, output_attentions)
+
+                    return custom_forward
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(encoder_layer),
+                    hidden_states,
+                    attention_mask,
+                    (head_mask[idx] if head_mask is not None else None),
+                )
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    attention_mask,
+                    layer_head_mask=(
+                        head_mask[idx] if head_mask is not None else None),
+                    output_attentions=output_attentions,
+                )
+
+            hidden_states = layer_outputs[0]
+
+        if output_attentions:
+            all_attentions = all_attentions + (layer_outputs[1],)
+
+    if output_hidden_states:
+        encoder_states = encoder_states + (hidden_states,)
+
+    if not return_dict:
+        return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+    return BaseModelOutput(
+        last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+    )
+
+# Monkey Patch for BartModel forward - to allow a seperate cross-attention mask to be passed in as a argument
+def bart_forward(self,
+                 input_ids=None, attention_mask=None,
+                 decoder_input_ids=None,
+                 decoder_attention_mask=None,
+                 decoder_cross_attention_mask=None,
+                 head_mask=None,
+                 decoder_head_mask=None,
+                 cross_attn_head_mask=None,
+                 encoder_outputs=None,
+                 past_key_values=None,
+                 inputs_embeds=None,
+                 decoder_inputs_embeds=None,
+
+                            decoder_context_rstpos=None,
+                            decoder_edu_rstpos=None,
+                 use_cache=None,
+                 output_attentions=None,
+                 output_hidden_states=None,
+                 return_dict=None,
+                 ):
+
+    # different to other models, Bart automatically creates decoder_input_ids from
+    # input_ids if no decoder_input_ids are provided
+    if decoder_input_ids is None and decoder_inputs_embeds is None:
+        decoder_input_ids = shift_tokens_right(
+            input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
+        )
+
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if encoder_outputs is None:
+        encoder_outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+    # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
+    elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+        encoder_outputs = BaseModelOutput(
+            last_hidden_state=encoder_outputs[0],
+            hidden_states=encoder_outputs[1] if len(
+                encoder_outputs) > 1 else None,
+            attentions=encoder_outputs[2] if len(
+                encoder_outputs) > 2 else None,
+        )
+
+    # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+    decoder_outputs = self.decoder(
+        input_ids=decoder_input_ids,
+        attention_mask=decoder_attention_mask,
+        # encoder_hidden_states=None, #encoder_outputs.last_hidden_state,
+        encoder_hidden_states=encoder_outputs.last_hidden_state,
+        encoder_attention_mask=decoder_cross_attention_mask,
+        head_mask=decoder_head_mask,
+        cross_attn_head_mask=cross_attn_head_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=decoder_inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    if not return_dict:
+        return decoder_outputs + encoder_outputs
+
+    return Seq2SeqModelOutput(
+        last_hidden_state=decoder_outputs.last_hidden_state,
+        past_key_values=decoder_outputs.past_key_values,
+        decoder_hidden_states=decoder_outputs.hidden_states,
+        decoder_attentions=decoder_outputs.attentions,
+        cross_attentions=decoder_outputs.cross_attentions,
+        encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+        encoder_hidden_states=encoder_outputs.hidden_states,
+        encoder_attentions=encoder_outputs.attentions,
+    )
 
 class RSTBart_Config(BartConfig):
 
@@ -489,222 +706,38 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
         mparams = parser.parse_known_args()[0]
         return mparams
 
-# Monkey Patch for the BartModel Encoder forward - to prevent the automatic addition of positional encoding
-def bart_encoder_forward(
-    self,
-    input_ids=None,
-    attention_mask=None,
-    head_mask=None,
-    inputs_embeds=None,
-    output_attentions=None,
-    output_hidden_states=None,
-    return_dict=None,
-    ):
-    r"""
-    Args:
-        input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-            provide it.
-            Indices can be obtained using :class:`~transformers.BartTokenizer`. See
-            :meth:`transformers.PreTrainedTokenizer.encode` and :meth:`transformers.PreTrainedTokenizer.__call__`
-            for details.
-            `What are input IDs? <../glossary.html#input-ids>`__
-        attention_mask (:obj:`torch.Tensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-            `What are attention masks? <../glossary.html#attention-mask>`__
-        head_mask (:obj:`torch.Tensor` of shape :obj:`(encoder_layers, encoder_attention_heads)`, `optional`):
-            Mask to nullify selected heads of the attention modules. Mask values selected in ``[0, 1]``:
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-        inputs_embeds (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
-            Optionally, instead of passing :obj:`input_ids` you can choose to directly pass an embedded
-            representation. This is useful if you want more control over how to convert :obj:`input_ids` indices
-            into associated vectors than the model's internal embedding lookup matrix.
-        output_attentions (:obj:`bool`, `optional`):
-            Whether or not to return the attentions tensors of all attention layers. See ``attentions`` under
-            returned tensors for more detail.
-        output_hidden_states (:obj:`bool`, `optional`):
-            Whether or not to return the hidden states of all layers. See ``hidden_states`` under returned tensors
-            for more detail.
-        return_dict (:obj:`bool`, `optional`):
-            Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
-    """
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    # retrieve input_ids and inputs_embeds
-    if inputs_embeds is not None:
-        input_shape = inputs_embeds.size()[:-1]
-    elif inputs_embeds is None:
-        raise ValueError("Inputs embeds must be defined")
-    # elif input_ids is not None:
-    #     input_shape = input_ids.size()
-    #     input_ids = input_ids.view(-1, input_shape[-1])
-
-    # else:
-    #     raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-    # if inputs_embeds is None:
-    #     raise ValueError("Inputs embeds must be defined")
-        # inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
-        # embed_pos = self.embed_positions(input_shape)
-
-    hidden_states = inputs_embeds  
-    hidden_states = self.layernorm_embedding(hidden_states)
-    hidden_states = nn.functional.dropout(
-        hidden_states, p=self.dropout, training=self.training)
-
-    # expand attention_mask
-    if attention_mask is None:
-        raise ValueError("Attention mask must be defined")
-
-    # [bsz,tgt_seq_len, src_seq_len ] -> [bsz, 1, tgt_seq_len, src_seq_len]
-    attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
-
-    encoder_states = () if output_hidden_states else None
-    all_attentions = () if output_attentions else None
-
-    # check if head_mask has a correct number of layers specified if desired
-    if head_mask is not None:
-        assert head_mask.size()[0] == (
-            len(self.layers)
-        ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
-    for idx, encoder_layer in enumerate(self.layers):
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
-        # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-        dropout_probability = random.uniform(0, 1)
-        if self.training and (dropout_probability < self.layerdrop):  # skip the layer
-            layer_outputs = (None, None)
-        else:
-            if getattr(self.config, "gradient_checkpointing", False) and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(encoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    (head_mask[idx] if head_mask is not None else None),
-                )
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask=(
-                        head_mask[idx] if head_mask is not None else None),
-                    output_attentions=output_attentions,
-                )
-
-            hidden_states = layer_outputs[0]
-
-        if output_attentions:
-            all_attentions = all_attentions + (layer_outputs[1],)
-
-    if output_hidden_states:
-        encoder_states = encoder_states + (hidden_states,)
-
-    if not return_dict:
-        return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
-    return BaseModelOutput(
-        last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
-    )
-
-# Monkey Patch for BartModel forward - to allow a seperate cross-attention mask to be passed in as a argument
-def bart_forward(self,
-                 input_ids=None, attention_mask=None,
-                 decoder_input_ids=None,
-                 decoder_attention_mask=None,
-                 decoder_cross_attention_mask=None,
-                 head_mask=None,
-                 decoder_head_mask=None,
-                 cross_attn_head_mask=None,
-                 encoder_outputs=None,
-                 past_key_values=None,
-                 inputs_embeds=None,
-                 decoder_inputs_embeds=None,
-
-                            decoder_context_rstpos=None,
-                            decoder_edu_rstpos=None,
-                 use_cache=None,
-                 output_attentions=None,
-                 output_hidden_states=None,
-                 return_dict=None,
-                 ):
-
-    # different to other models, Bart automatically creates decoder_input_ids from
-    # input_ids if no decoder_input_ids are provided
-    if decoder_input_ids is None and decoder_inputs_embeds is None:
-        decoder_input_ids = shift_tokens_right(
-            input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs: ModelOutput = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
         )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
 
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    use_cache = use_cache if use_cache is not None else self.config.use_cache
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
 
-    if encoder_outputs is None:
-        encoder_outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-    # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
-    elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
-        encoder_outputs = BaseModelOutput(
-            last_hidden_state=encoder_outputs[0],
-            hidden_states=encoder_outputs[1] if len(
-                encoder_outputs) > 1 else None,
-            attentions=encoder_outputs[2] if len(
-                encoder_outputs) > 2 else None,
-        )
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
 
-    # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-    decoder_outputs = self.decoder(
-        input_ids=decoder_input_ids,
-        attention_mask=decoder_attention_mask,
-        # encoder_hidden_states=None, #encoder_outputs.last_hidden_state,
-        encoder_hidden_states=encoder_outputs.last_hidden_state,
-        encoder_attention_mask=decoder_cross_attention_mask,
-        head_mask=decoder_head_mask,
-        cross_attn_head_mask=cross_attn_head_mask,
-        past_key_values=past_key_values,
-        inputs_embeds=decoder_inputs_embeds,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-    )
+        if model_kwargs.get("decoder_cross_attention_mask") is not None:
+            model_kwargs["decoder_cross_attention_mask"] =  model_kwargs["decoder_cross_attention_mask"].index_select(0, expanded_return_idx)
 
-    if not return_dict:
-        return decoder_outputs + encoder_outputs
-
-    return Seq2SeqModelOutput(
-        last_hidden_state=decoder_outputs.last_hidden_state,
-        past_key_values=decoder_outputs.past_key_values,
-        decoder_hidden_states=decoder_outputs.hidden_states,
-        decoder_attentions=decoder_outputs.attentions,
-        cross_attentions=decoder_outputs.cross_attentions,
-        encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-        encoder_hidden_states=encoder_outputs.hidden_states,
-        encoder_attentions=encoder_outputs.attentions,
-    )
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+            model_kwargs["encoder_outputs"] = encoder_outputs
+        
+        return input_ids, model_kwargs
 
 class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
     rst_tree_aligned_attention = False  
@@ -803,7 +836,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             #     decoder_start_token_id=self.eos_token_id)[0]
             utt_len = decoder_input_ids.shape[-1]
                 
-
         if utterance != None:
             #utterance = self.eos_token + self.bos_token + " " + utterance + self.eos_token
             utterance = self.bos_token + utterance + self.eos_token + self.pad_token
@@ -828,7 +860,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 decoder_start_token_id=self.eos_token_id)[0]
             utt_len = decoder_input_ids.shape[-1]
                 
-
         decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat( [ rst_pos[0:1], rst_pos]),
                                                                          li_kprstpos, utt_len,
                                                                          rt_len)
@@ -1228,8 +1259,23 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 attention_mask = torch.cat([prev_mask, attention_mask], axis=1)
                         
         else:
+            #debugging
             #TODO - Patch the padding, some elems of below need to be masked in order to represent apdding
             attention_mask = torch.ones((utt_len, rt_len))
+
+        return attention_mask
+
+    def prepare_attention_mask_handle_padding(self, attention_mask,
+                                                r_len, rst_pad_len, rst_max_len,
+                                                rt_len, kp_pad_len, kp_max_len ):
+
+        if rst_max_len != None and rst_pad_len != 0:
+            attention_mask[:, r_len-rst_pad_len:r_len] = 0
+            attention_mask[r_len-rst_pad_len:r_len, :] = 0
+
+        if kp_max_len != None and kp_pad_len != 0:
+            attention_mask[:, rt_len-kp_pad_len:rt_len] = 0
+            attention_mask[rt_len-kp_pad_len:rt_len, :] = 0
 
         return attention_mask
 
@@ -1952,7 +1998,7 @@ class DataLoaderGenerator():
         #debugging
         fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn][:10]
+            fn)[-1] != "lock" and "dict_len" not in fn]
                 
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
@@ -2017,14 +2063,12 @@ class DataLoaderGenerator():
             sampler = None
 
         dataloader = torch.utils.data.DataLoader(concat_dset, 
-                                                batch_size= bs if self.batch_size!=-1 else 1 ,
+                                                batch_size= bs,
                                                  num_workers=self.workers,
                                                 
-                                                 sampler=sampler if self.batch_size!=-1 else None,
+                                                 sampler=sampler,
 
-                                                 batch_sampler=sampler if self.batch_size==-1 else None,
-                                                # shuffle = True if (sampler==None) else False,
-                                                 pin_memory=True,
+                                                 pin_memory=False,
                                                  collate_fn=collate_fn,
                                                 # prefetch_factor = prefetch_factor,                                               
                                                 )
@@ -2467,8 +2511,4 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# dullduks server version 1 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 60 --version 2 --precision 16 --mode train_new --workers 13 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RstBart --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTBart --learning_rate 3e-4 
-
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTBart.py --batch_size 32 --version 12  --precision 16 --mode train_new --workers 14 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention scheme"
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 13  --precision 16 --mode train_new --workers 14 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with aligned attention scheme"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"
