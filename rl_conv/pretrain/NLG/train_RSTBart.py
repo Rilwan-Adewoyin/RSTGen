@@ -586,19 +586,25 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                                                                                                 past = None, utt_len = decoder_input_ids.shape[1],
                                                                                                 utterance_ids = decoder_input_ids,
                                                                                                 curr_edu_pos = curr_edu_pos )
-            
+
+
             else:
                 # calculating the new cross attention mask
                 if decoder_input_ids.shape[1]!= decoder_cross_attention_mask.shape[-2]:
                     decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
                                                                                                 past = decoder_cross_attention_mask,
                                                                                                 utt_len = decoder_input_ids.shape[1],
+                                                                                                utterance_ids = decoder_input_ids,
                                                                                                 curr_edu_pos = curr_edu_pos )
 
         else:        
-            if past is not None:
+            if past is not None and use_cache==True:
                 decoder_input_ids = decoder_input_ids[:, -1:]
                 decoder_cross_attention_mask=decoder_cross_attention_mask[:, -1:, : ]
+            elif past is None:
+                decoder_cross_attention_mask = decoder_cross_attention_mask
+                decoder_input_ids = decoder_input_ids
+            
 
         
         return {
@@ -772,7 +778,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
-                     rst_len=None,
+                     max_len_rst=None,
                      exclude_from_output=[], device=None):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -789,9 +795,11 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             utterance = utterance.lstrip( string.punctuation )
 
         rst_rel, rst_ns, rst_pos, rst_pad_len = self.encode_rst(
-            rst_rel, rst_ns, rst_pos, rst_len)
+            rst_rel, rst_ns, rst_pos, max_len_rst)
         key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens = self.encode_keyphrase(
             li_kp, li_kprstpos)
+
+        decoder_input_ids, labels, utt_len = self.encode_utterance(utterance, utterance_prompt, context_len=1 + rst_rel.shape[-1] + key_phrase_ids.shape[-1] )
 
         r_len = 1 + rst_rel.shape[-1]
         rt_len = r_len + key_phrase_ids.shape[-1]
@@ -806,72 +814,20 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             r_len, rt_len, ta_tokens_pos, kp_phrase_lens, rst_pos= torch.cat( [ rst_pos[0:1], rst_pos]),
             li_kprstpos=li_kprstpos)
 
-        # Creating labels/targets
-        # Creating labels/targets
-        if utterance_prompt != None:
-            # utterance_prompt = self.bos_token + utterance_prompt
-            utterance_prompt = self.eos_token + self.bos_token + utterance_prompt
+        
 
-            utt_prompt_tok_ids = self.encode(
-                utterance_prompt, 
-                add_special_tokens=False,
-                # add_special_tokens=True,
+        decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat([ rst_pos[0:1], rst_pos]),
+                                                                         li_kprstpos, utt_len, rt_len,
+                                                                         utterance_ids = decoder_input_ids,
+                                                                         training=True
+                                                                         )
+        
 
-                return_attention_mask=False,
-                padding='do_not_pad',
-                        truncation=False,
-                max_length=self.max_len_utt,
-                return_tensors='pt',
-                return_length=False,
-            )[0]
-
-            decoder_input_ids = utt_prompt_tok_ids.contiguous()
-            # utt_len = utt_prompt_tok_ids.shape[-1]
-            # labels = None
-
-            #labels = utt_tok_ids
-            labels = None
-            # decoder_input_ids = shift_tokens_right(utt_prompt_tok_ids[:-1].unsqueeze(0), 
-            #     self.pad_token_id ,
-            #     decoder_start_token_id=self.eos_token_id)[0]
-            utt_len = decoder_input_ids.shape[-1]
-                
-        if utterance != None:
-            #utterance = self.eos_token + self.bos_token + " " + utterance + self.eos_token
-            utterance = self.bos_token + utterance + self.eos_token + self.pad_token
-            utt_tok_ids = self.encode(
-                utterance, 
-               add_special_tokens=False,
-                # add_special_tokens=True,
-
-                return_attention_mask=False,
-                padding='do_not_pad',
-                        truncation=True,
-            #                max_length=self.max_len_utt+1,
-                max_length=self.max_len_utt,
-
-                return_tensors='pt',
-                return_length=False,
-            )[0]
-
-            labels = utt_tok_ids
-            decoder_input_ids = shift_tokens_right(labels.unsqueeze(0), 
-                self.pad_token_id ,
-                decoder_start_token_id=self.eos_token_id)[0]
-            utt_len = decoder_input_ids.shape[-1]
-                
-        decoder_cross_attention_mask = self.prepare_cross_attention_mask(dict_pos_edu, torch.cat( [ rst_pos[0:1], rst_pos]),
-                                                                         li_kprstpos, utt_len,
-                                                                         rt_len)
-
-        # Changing attention masks to compensate for the Variable RST batching
-        if rst_len != None and rst_pad_len != 0:
-
-            attention_mask[:, r_len-rst_pad_len:r_len] = 0
-            attention_mask[r_len-rst_pad_len:r_len, :] = 0
-
-            decoder_cross_attention_mask[:, r_len-rst_pad_len:r_len] = 0
-            decoder_cross_attention_mask[r_len-rst_pad_len:r_len, :] = 0
+        attention_mask = self.prepare_attention_mask_handle_padding(attention_mask,
+                            r_len, rst_pad_len, max_len_rst)
+        
+        decoder_cross_attention_mask = self.prepare_attention_mask_handle_padding(decoder_cross_attention_mask,
+                            r_len, rst_pad_len, max_len_rst, cross_attn=True)
 
         output =  {'rst_start_token_id': self.rst_start_token_id,
                 
@@ -909,6 +865,52 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 
 
         return output
+
+    def encode_utterance(self, utterance=None, utterance_prompt=None, context_len=None):
+
+        # Creating labels/targets
+        # Creating labels/targets
+        if utterance_prompt != None:
+            # utterance_prompt = self.bos_token + utterance_prompt
+            utterance_prompt = self.eos_token + self.bos_token + utterance_prompt
+
+            utt_prompt_tok_ids = self.encode(
+                utterance_prompt, 
+                add_special_tokens=False,
+                # add_special_tokens=True,
+
+                return_attention_mask=False,
+                padding='do_not_pad',
+                        truncation=False,
+                max_length=self.max_len_utt,
+                return_tensors='pt',
+                return_length=False,
+            )[0]
+
+            decoder_input_ids = utt_prompt_tok_ids.contiguous()
+            labels = None
+            utt_len = decoder_input_ids.shape[-1]
+                
+        if utterance != None:
+            utterance = self.bos_token + utterance + self.eos_token + self.pad_token
+            labels = self.encode(
+                utterance, 
+               add_special_tokens=False,
+                # add_special_tokens=True,
+                return_attention_mask=False,
+                padding='do_not_pad',
+                        truncation=True,
+                max_length=self.max_len_utt,
+                return_tensors='pt',
+                return_length=False,
+            )[0]
+
+            decoder_input_ids = shift_tokens_right(labels.unsqueeze(0), 
+                                    self.pad_token_id ,
+                                    decoder_start_token_id=self.eos_token_id)[0]
+            utt_len = decoder_input_ids.shape[-1]
+
+        return decoder_input_ids, labels, utt_len
 
     def encode_rst(self, rst_rels, rst_ns, rst_pos, variable_padding_size=None):
         """Converts rst_rels in a series of vectors
@@ -1095,7 +1097,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         return attention_mask
 
     def prepare_cross_attention_mask(self, 
-                                    
                                     dict_pos_edu=None, rst_pos=None, li_kprstpos=None,
                                      utt_len=None, rt_len=None, prev_mask=None, curr_edu_pos=None, context_rst_pos=None,
                                      utterance_ids=None,
@@ -1259,23 +1260,32 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 attention_mask = torch.cat([prev_mask, attention_mask], axis=1)
                         
         else:
-            #debugging
-            #TODO - Patch the padding, some elems of below need to be masked in order to represent apdding
-            attention_mask = torch.ones((utt_len, rt_len))
+            #training
+            if prev_mask == None:
+                # NOTE: padding in rst section must be handled later
+                attention_mask = torch.ones((utt_len, rt_len))
+            #generation
+            else:
+                dims = prev_mask.shape()
+                attention_mask = torch.cat(
+                    [prev_mask[:, -1:, :], prev_mask.new_ones([dims[0], 1, 1])], axis=-1)
 
         return attention_mask
 
     def prepare_attention_mask_handle_padding(self, attention_mask,
-                                                r_len, rst_pad_len, rst_max_len,
-                                                rt_len, kp_pad_len, kp_max_len ):
+                                                r_len=None, rst_pad_len=0, max_len_rst=None,
+                                                rt_len=None, kp_pad_len=0, kp_max_len=None,
+                                                cross_attn =False ):
 
-        if rst_max_len != None and rst_pad_len != 0:
+        if max_len_rst != None and rst_pad_len != 0:
             attention_mask[:, r_len-rst_pad_len:r_len] = 0
-            attention_mask[r_len-rst_pad_len:r_len, :] = 0
+            if not cross_attn:
+                attention_mask[r_len-rst_pad_len:r_len, :] = 0
 
         if kp_max_len != None and kp_pad_len != 0:
             attention_mask[:, rt_len-kp_pad_len:rt_len] = 0
-            attention_mask[rt_len-kp_pad_len:rt_len, :] = 0
+            if not cross_attn:
+                attention_mask[rt_len-kp_pad_len:rt_len, :] = 0
 
         return attention_mask
 
@@ -1998,7 +2008,7 @@ class DataLoaderGenerator():
         #debugging
         fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn]
+            fn)[-1] != "lock" and "dict_len" not in fn][:10]
                 
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
@@ -2019,7 +2029,6 @@ class DataLoaderGenerator():
             line_starts = [int(fs*self.splits['train']) for fs in files_sizes]
             line_ends = [ls+int(fs*self.splits['val'])
                          for ls, fs in zip(line_starts, files_sizes)]
-            
             shuffle = True
             inference = False
             bs = self.batch_size
@@ -2029,12 +2038,11 @@ class DataLoaderGenerator():
         elif split_name == 'test':
             line_starts = [int(fs*(1-self.splits['test']))
                            for fs in files_sizes]
+            shuffle = False
             line_ends = files_sizes
             inference = False
             bs = self.batch_size
-            def collate_fn(batch): return self.tokenizer.default_collate_pad(
-                batch)
-            shuffle = False
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
             
 
         elif split_name == 'inference':
@@ -2045,7 +2053,6 @@ class DataLoaderGenerator():
             inference = True
             shuffle=False
             bs = 1
-            #collate_fn = default_convert
             collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
 
         li_dsets = [SingleDataset(_f, self.tokenizer, line_start, line_end, inference )
@@ -2055,23 +2062,17 @@ class DataLoaderGenerator():
 
         if self.gpus <= 1 and split_name not in ['inference', 'test']:
             sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle, batching_style=self.batching_style)
-
         elif self.batching_style=='effecient' and self.gpus > 1 and split_name not in ['inference', 'test' ]:
-            sampler = SizedOrdered_DistributedSampler(
-                concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
+            sampler = SizedOrdered_DistributedSampler(concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
         else:
             sampler = None
 
         dataloader = torch.utils.data.DataLoader(concat_dset, 
                                                 batch_size= bs,
                                                  num_workers=self.workers,
-                                                
                                                  sampler=sampler,
-
                                                  pin_memory=False,
-                                                 collate_fn=collate_fn,
-                                                # prefetch_factor = prefetch_factor,                                               
-                                                )
+                                                 collate_fn=collate_fn)
 
                                                  
         return dataloader
@@ -2176,6 +2177,7 @@ class SingleDataset(torch.utils.data.Dataset):
                                                   li_kp=li_kp,
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
+                                                  max_len_rst=self.rst_len[index],
                                                   dict_pos_edu=dict_pos_edu)
 
             encoded['orig_rst_rels'] = rst_rels
@@ -2196,7 +2198,7 @@ class SingleDataset(torch.utils.data.Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                rst_len=self.rst_len[index]
+                max_len_rst=self.rst_len[index],
             )
   
 
@@ -2512,3 +2514,4 @@ if __name__ == '__main__':
         print(traceback.format_exc())
 
 # CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"

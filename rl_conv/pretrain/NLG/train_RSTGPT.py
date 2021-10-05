@@ -818,7 +818,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
-                     rst_len=None, key_phrase_len=None,
+                     max_rst_len=None, max_key_phrase_len=None,
                      exclude_from_output=[], device=None):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
@@ -836,10 +836,10 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         # Encoding rst, keyphrase and utterance info
         rst_rel, rst_ns, rst_pos, rst_pad_len = self.encode_rst(
-            rst_rel, rst_ns, rst_pos, rst_len)
+            rst_rel, rst_ns, rst_pos, max_rst_len)
 
         key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens, kp_pad_len = self.encode_keyphrase(
-            li_kp, li_kprstpos, key_phrase_len)
+            li_kp, li_kprstpos, max_key_phrase_len)
 
         input_ids_utt, labels, utt_len = self.encode_utterance(utterance, utterance_prompt,
                                                                context_len=1 + rst_rel.shape[-1] + key_phrase_ids.shape[-1])
@@ -873,8 +873,8 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         attention_mask = self.prepare_attention_mask_handle_padding(
             attention_mask,
-            r_len, rst_pad_len, rst_len,
-            rt_len, kp_pad_len, key_phrase_len)
+            r_len, rst_pad_len, max_rst_len,
+            rt_len, kp_pad_len, max_key_phrase_len)
 
         output = {'rst_start_token_id': self.rst_start_token_id,
 
@@ -1349,7 +1349,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
                 # this context below does not include the utterance provided as context
                 attention_mask_context = torch.stack(
-                    li_batch_new_attn, dim=0).float()  # shape( bs, 1 , context )
+                    li_batch_new_attn, wdim=0).float()  # shape( bs, 1 , context )
 
                 # next word should attend to all previous utteranec words under causal attention
 
@@ -1364,14 +1364,14 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         return attention_mask
 
     def prepare_attention_mask_handle_padding(self, attention_mask,
-                                              r_len, rst_pad_len, rst_max_len,
-                                              rt_len, kp_pad_len, kp_max_len):
+                                              r_len, rst_pad_len, max_rst_len,
+                                              rt_len, kp_pad_len, max_kp_len):
         # Changing attention masks to compensate for the Variable RST batching
-        if rst_max_len != None and rst_pad_len != 0:
+        if max_rst_len != None and rst_pad_len != 0:
             attention_mask[:, r_len-rst_pad_len:r_len] = 0
             attention_mask[r_len-rst_pad_len:r_len, :] = 0
 
-        if kp_max_len != None and kp_pad_len != 0:
+        if max_kp_len != None and kp_pad_len != 0:
             attention_mask[:, rt_len-kp_pad_len:rt_len] = 0
             attention_mask[rt_len-kp_pad_len:rt_len, :] = 0
 
@@ -2314,8 +2314,8 @@ class SingleDataset(torch.utils.data.Dataset):
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu,
-                                                  rst_len=self.rst_len[index],
-                                                  key_phrase_len=self.key_phrase_len[index]
+                                                  max_rst_len=self.rst_len[index],
+                                                  max_key_phrase_len=self.key_phrase_len[index]
                                                   )
 
 
@@ -2337,8 +2337,8 @@ class SingleDataset(torch.utils.data.Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                rst_len=self.rst_len[index],
-                key_phrase_len=self.key_phrase_len[index]
+                max_rst_len=self.rst_len[index],
+                max_key_phrase_len=self.key_phrase_len[index]
             )
 
 
