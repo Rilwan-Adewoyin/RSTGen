@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformers
-from transformers import BartForConditionalGeneration
+from transformers import BartForConditionalGeneration, Adafactor, AdamW, get_cosine_schedule_with_warmup
 import ujson
 import yaml
 from pytorch_lightning import loggers as pl_loggers
@@ -1363,6 +1363,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                  mode='train_new',
                  tag='',
                  batching_style='effecient',
+                 optimizer = 'adafactor',
                  **kwargs):
         super().__init__()
 
@@ -1371,6 +1372,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.batching_style = batching_style
+        self.optimizer = optimizer
         self.RSTTokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
@@ -1509,6 +1511,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             type=int, help="The Experimental Versioning for this run")
         parser.add_argument('--precision', default=16, required=False,
                             type=int, help="Precision to use", choices=[16, 32])
+        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','adamw','adafactor_lr'])
         parser.add_argument('--tag', default='', required=True, type=str)
         parser.add_argument('--override', default=False,
                             type=lambda x: bool(int(x)), choices=[0, 1])
@@ -1537,7 +1540,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
             # restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                     'learning_rate', 'precision', 'splits', 'tag']})
+                     'learning_rate', 'precision', 'splits', 'tag','optimizer']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase',
@@ -1589,30 +1592,6 @@ class RSTBart_TrainingModule(pl.LightningModule):
         """
         dir_checkpoints = tparams['dir_checkpoints']
 
-        # Creating Callbacks    
-        callbacks = []
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss', 
-                                            save_top_k=2,
-                                            mode='min', dirpath=dir_checkpoints,
-                                            filename='{epoch:03d}_{val_loss:.5f}')
-
-        # checkpoint_callback._save_model = types.MethodType(
-        #     utils.monkey_save_model, checkpoint_callback)  # monkey patch
-
-        # checkpoint_callback._save_model = mpatch_save_model(checkpoint_callback._save_model)
-
-        checkpoint_callback._save_model = types.MethodType(
-            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
-
-        early_stop_callback = EarlyStopping(
-            monitor='val_loss',
-            min_delta=0.00,
-            patience = 40,       
-            verbose=False,
-            mode='min'
-        )
-        callbacks.append(checkpoint_callback)
-        callbacks.append(early_stop_callback)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -1624,7 +1603,29 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             # 'plugins' : DDPPlugin(find_unused_parameters=True)
                             }
 
+        # Creating Callbacks    
+        callbacks = []
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', 
+                                            save_top_k=2,
+                                            mode='min', dirpath=dir_checkpoints,
+                                            filename='{epoch:03d}_{val_loss:.5f}')
+
+        checkpoint_callback._save_model = types.MethodType(
+            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
+
+        early_stop_callback = EarlyStopping(
+            monitor='val_loss',
+            min_delta=0.00,
+            patience = 5,       
+            verbose=False,
+            mode='min'
+        )
+        callbacks.append(checkpoint_callback)
+        callbacks.append(early_stop_callback)
+        
         if tparams['mode'] in ["train_new"]:
+
+
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     #progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
@@ -1632,11 +1633,12 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=0.05,
+                                                    val_check_interval=0.1,
                                                     limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
+                                                    gradient_clip_val = 0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -1645,11 +1647,20 @@ class RSTBart_TrainingModule(pl.LightningModule):
             checkpoint = RSTBart_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
+            #restoring callback state
+            for idx in range(len(callbacks)):
+                if type(callbacks[idx]) == EarlyStopping:
+                    callbacks[idx].on_load_checkpoint( checkpoint['callbacks'][type(callbacks[idx])] )
+
+                elif type(callbacks[idx]) == ModelCheckpoint:
+                    callbacks[idx].on_load_checkpoint( None, None, checkpoint['callbacks'][type(callbacks[idx])] )
+                
+
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=0.05,
+                                                    val_check_interval=0.1,
                                                     limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
@@ -1665,14 +1676,14 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 #debugging
                 trainer.current_epoch = checkpoint['epoch']
                 trainer.global_step = checkpoint['global_step']
-                trainer.batch_index = checkpoint['batch_idx']
-                trainer.total_batch_index = checkpoint['total_batch_idx']
+                # trainer.batch_index = checkpoint['batch_idx']
+                # trainer.total_batch_index = checkpoint['total_batch_idx']
 
             except Exception:
                 trainer.fit_loop.current_epoch = checkpoint['epoch']
                 trainer.fit_loop.global_step = checkpoint['global_step']
-                trainer.fit_loop.batch_index = checkpoint['batch_idx']
-                trainer.fit_loop.total_batch_index = checkpoint['total_batch_idx']
+                # trainer.fit_loop.batch_index = checkpoint['batch_idx']
+                # trainer.fit_loop.total_batch_index = checkpoint['total_batch_idx']
 
 
             # restore the optimizers
@@ -1971,16 +1982,36 @@ class RSTBart_TrainingModule(pl.LightningModule):
     def total_steps(self):
 
         ds_size = len(self.train_dl) // self.gpus
-        steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
+        steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches * self.batch_size)
         return steps
 
     def configure_optimizers(self):
 
-        optimizer = optim.Adafactor(self.model.parameters(), scale_parameter=True, 
-                        relative_step=True, warmup_init=True, lr=None )
+        if self.optimizer == 'adafactor':
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
+                            relative_step=True, warmup_init=True, lr=None )
 
 
-        lr_scheduler = AdafactorSchedule(optimizer)
+            lr_scheduler = AdafactorSchedule(optimizer)
+
+        elif self.optimizer == 'adafactor_lr':
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
+                            relative_step=False, warmup_init=False, lr=self.learning_rate )
+
+
+            lr_scheduler = AdafactorSchedule(optimizer)
+
+        
+        elif self.optimizer == 'adamw':
+
+            optimizer = torch.optim.AdamW( self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
+
+            lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
+                                                             num_warmup_steps=0.10*self.total_steps(),
+                                                            num_training_steps=self.total_steps(),
+                                                            num_cycles=1.5
+                                                           )
+            lr_scheduler = None
 
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
@@ -2331,10 +2362,8 @@ class SizedOrdered_Sampler(Sampler[int]):
         return iter(self.li_chunked_ordered_lens)
 
     def __len__(self) -> int:
-        if self.batch_size != -1:
-            return len(self.data_source)
-        else:
-            return len( self.li_chunked_ordered_lens )
+        return len(self.data_source)
+
 
 class SizedOrdered_DistributedSampler(Sampler[T_co]):
     r"""

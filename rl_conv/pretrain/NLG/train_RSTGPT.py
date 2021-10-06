@@ -9,7 +9,7 @@ from torch.utils.data import Sampler
 
 import sys
 from transformers.tokenization_utils_base import AddedToken
-from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
+from transformers.optimization import Adafactor, AdafactorSchedule, AdamW, get_cosine_schedule_with_warmup
 from transformers import GPT2LMHeadModel
 from transformers.modeling_outputs import (ModelOutput,
                                            BaseModelOutputWithPastAndCrossAttentions,
@@ -1430,6 +1430,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                  tag='',
                  low_var_start = False,
                  batching_style='effecient',
+                 optimizer='adafactor',
                  **kwargs):
 
         super().__init__()
@@ -1439,6 +1440,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.batching_style = batching_style
+        self.optimizer = optimizer
         self.RSTTokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
@@ -1565,6 +1567,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--tag', default='', required=True, type=str)
         parser.add_argument('--override', default=False,
                             type=lambda x: bool(int(x)), choices=[0, 1])
+        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','adamw'])
         tparams = parser.parse_known_args()[0]
 
         return tparams
@@ -1591,7 +1594,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             # restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'learning_rate', 'precision', 'splits', 'tag']})
+                    'learning_rate', 'precision', 'splits', 'tag','optimizer']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_key_phrase',
@@ -1643,28 +1646,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         """
         dir_checkpoints = tparams['dir_checkpoints']
 
-        # Creating Callbacks
-        callbacks = []
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss',
-                                              save_top_k=2,
-                                              mode='min', dirpath=dir_checkpoints,
-                                              filename='{epoch:03d}_{val_loss:.5f}')
 
-        checkpoint_callback._save_model = types.MethodType(
-            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
-
-        early_stop_callback = EarlyStopping(
-            monitor='val_loss',
-            min_delta=0.00,
-            patience=15,
-            verbose=False,
-            mode='min'
-        )
-
-        save_model_callback = SaveModelCallBack()
-        callbacks.append(checkpoint_callback)
-        callbacks.append(early_stop_callback)
-        # callbacks.append(save_model_callback)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -1677,7 +1659,30 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                             'plugins': DDPPlugin(find_unused_parameters=False)
                             }
 
+        callbacks = []
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss',
+                                            save_top_k=2,
+                                            mode='min', dirpath=dir_checkpoints,
+                                            filename='{epoch:03d}_{val_loss:.5f}')
+
+        checkpoint_callback._save_model = types.MethodType(
+            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
+
+        early_stop_callback = EarlyStopping(
+            monitor='val_loss',
+            min_delta=0.00,
+            patience=15,
+            verbose=False,
+            mode='min'
+        )
+        save_model_callback = SaveModelCallBack()
+        callbacks.append(checkpoint_callback)
+        callbacks.append(early_stop_callback)
+        # callbacks.append(save_model_callback)
+
         if tparams['mode'] in ["train_new"]:
+            # Creating Callbacks
+
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     default_root_dir=tparams['dir_checkpoints'],
@@ -1697,6 +1702,16 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
+            #restoring callback state
+            for idx in range(len(callbacks)):
+                if type(callbacks[idx]) == EarlyStopping:
+                    callbacks[idx].on_load_checkpoint( checkpoint['callbacks'][type(callbacks[idx])] )
+
+                elif type(callbacks[idx]) == ModelCheckpoint:
+                    callbacks[idx].on_load_checkpoint( None, None, checkpoint['callbacks'][type(callbacks[idx])] )
+
+
+
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
@@ -1708,6 +1723,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
                                                     )
+            trainer.scaler.load_state_dict(checkpoint['native_amp_scaling_state'])
 
             # load callback states
             trainer.on_load_checkpoint(checkpoint)
@@ -1715,15 +1731,11 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             try:
                 trainer.current_epoch = checkpoint['epoch']
                 trainer.global_step = checkpoint['global_step']
-                trainer.batch_index = checkpoint['batch_idx']
-                trainer.total_batch_index = checkpoint['total_batch_idx']
 
 
             except Exception:
                 trainer.fit_loop.current_epoch = checkpoint['epoch']
                 trainer.fit_loop.global_step = checkpoint['global_step']
-                trainer.fit_loop.batch_index = checkpoint['batch_idx']
-                trainer.fit_loop.total_batch_index = checkpoint['total_batch_idx']
 
             # restore the optimizers
             optimizer_states = checkpoint['optimizer_states']
@@ -2038,26 +2050,23 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        # optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
-        #                       relative_step=False, warmup_init=False, lr=self.learning_rate)
-
-        optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
-                        relative_step=True, warmup_init=True, lr=None )
+        if self.optimzer == 'adafactor':
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
+                            relative_step=True, warmup_init=True, lr=None )
 
 
-        lr_scheduler = AdafactorSchedule(optimizer)
+            lr_scheduler = AdafactorSchedule(optimizer)
+        
+        elif self.optimizer == 'AdamW':
 
-        # optimizer = AdamW( self.model.parameters(), lr=self.learning_rate)
-        # lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
-        #                                                  num_warmup_steps=0.10*self.total_steps(),
-        #                                                 num_training_steps=self.total_steps(),
-        #                                                 num_cycles=1.5
-        #                                                )
-        # lr_scheduler = get_constant_schedule_with_warmup(optimizer,
-        #                                                  num_warmup_steps=0.10*self.total_steps(),
-        #                                                  )
+            optimizer = AdamW( self.model.parameters(), lr=self.learning_rate)
 
-        # return [optimizer], [{"scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}]
+            lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
+                                                             num_warmup_steps=0.10*self.total_steps(),
+                                                            num_training_steps=self.total_steps(),
+                                                            num_cycles=1.5
+                                                           )
+
 
         return {'optimizer': optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
