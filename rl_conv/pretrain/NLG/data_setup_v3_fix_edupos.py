@@ -1,6 +1,5 @@
-#This script makes the second version of data for the NLG model
-# This script uses data made by data_setup_v2 and extends it to include the edu position of each key phrase.
-# As such the model trained with data from this script should be able to place the keyphrases that it is using
+#This script corrects the order of the positions in li_pos_kp
+#Used to create dataset_v3_1
 
 import sys, os
 
