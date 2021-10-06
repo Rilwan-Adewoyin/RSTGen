@@ -1511,7 +1511,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             type=int, help="The Experimental Versioning for this run")
         parser.add_argument('--precision', default=16, required=False,
                             type=int, help="Precision to use", choices=[16, 32])
-        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','adamw'])
+        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','adamw','adafactor_lr'])
         parser.add_argument('--tag', default='', required=True, type=str)
         parser.add_argument('--override', default=False,
                             type=lambda x: bool(int(x)), choices=[0, 1])
@@ -1616,7 +1616,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 40,       
+            patience = 5,       
             verbose=False,
             mode='min'
         )
@@ -1633,11 +1633,12 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=0.05,
+                                                    val_check_interval=0.1,
                                                     limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
+                                                    gradient_clip_val = 0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -1659,7 +1660,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=0.05,
+                                                    val_check_interval=0.1,
                                                     limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
@@ -1981,7 +1982,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
     def total_steps(self):
 
         ds_size = len(self.train_dl) // self.gpus
-        steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
+        steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches * self.batch_size)
         return steps
 
     def configure_optimizers(self):
@@ -1992,16 +1993,25 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
 
             lr_scheduler = AdafactorSchedule(optimizer)
-        
-        elif self.optimizer == 'AdamW':
 
-            optimizer = AdamW( self.model.parameters(), lr=self.learning_rate)
+        elif self.optimizer == 'adafactor_lr':
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
+                            relative_step=False, warmup_init=False, lr=self.learning_rate )
+
+
+            lr_scheduler = AdafactorSchedule(optimizer)
+
+        
+        elif self.optimizer == 'adamw':
+
+            optimizer = torch.optim.AdamW( self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
 
             lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
                                                              num_warmup_steps=0.10*self.total_steps(),
                                                             num_training_steps=self.total_steps(),
                                                             num_cycles=1.5
                                                            )
+            lr_scheduler = None
 
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
@@ -2352,10 +2362,8 @@ class SizedOrdered_Sampler(Sampler[int]):
         return iter(self.li_chunked_ordered_lens)
 
     def __len__(self) -> int:
-        if self.batch_size != -1:
-            return len(self.data_source)
-        else:
-            return len( self.li_chunked_ordered_lens )
+        return len(self.data_source)
+
 
 class SizedOrdered_DistributedSampler(Sampler[T_co]):
     r"""
