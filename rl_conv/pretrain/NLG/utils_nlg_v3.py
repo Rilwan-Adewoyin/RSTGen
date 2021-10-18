@@ -224,22 +224,33 @@ class RstModelMixin():
         li_gen_text = [self.RSTTokenizer.decode(
             ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
 
-        # run edu splitter on text generated so far
-        # li_textwedutoken = parser_wrapper3.main( json_li_li_utterances= ujson.dumps([li_gen_text]),
-        #                                     skip_parsing=True, redirect_output=True)
+        if self.rst_segment_method == "fenghirst":
+        
+            li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text)
+            # calculating edu of current text
+            li_edu_count = [
+                ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
 
-        li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text)
-        # calculating edu of current text
-        li_edu_count = [
-            ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
+            # removing any padding
+            edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                as_tuple=True)[0]] for tens in edu_rstpos][0]
 
-        # removing any padding
-        edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-            as_tuple=True)[0]] for tens in edu_rstpos][0]
+            # selecting approapriate edu value.
+            curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
+                            for edu_count in li_edu_count]
+        
+        elif self.rst_segment_method == "segbot":
+            li_segmented_text = self.segmenter.segment_li_utterances(li_gen_text)
+            
+            li_edu_count = [ len(seg_text) for seg_text in li_segmented_text ]
 
-        # selecting approapriate edu value.
-        curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
-                        for edu_count in li_edu_count]
+          # removing any padding
+            edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                as_tuple=True)[0]] for tens in edu_rstpos][0]
+                        
+            curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
+                            for edu_count in li_edu_count]
+            
 
         return curr_edu_pos 
 
@@ -430,7 +441,6 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
         
         self.padding_idx = self.fixed_rst_encoding.padding_idx
         
-        
     def forward(self, x ):
         if x.numel()==0:
             return x
@@ -474,7 +484,6 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
                                     freeze=True, padding_idx=self.max_rst_index-1 )
 
         return fixed_rst_encoding
-
 
 #endregion
 
@@ -641,10 +650,8 @@ class EffeciencyMixin():
                     
                 dict_output[key] = self.default_collate_pad( li_ )    
             return dict_output
-
         elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-            return elem_type(*(self.default_collate_pad(samples) for samples in zip(*batch)))
-        
+            return elem_type(*(self.default_collate_pad(samples) for samples in zip(*batch)))        
         elif isinstance(elem, collections.abc.Sequence):
             # check to make sure that the elements in batch have consistent size
             it = iter(batch)
@@ -653,7 +660,6 @@ class EffeciencyMixin():
                 raise RuntimeError('each element in list of batch should be of equal size')
             transposed = zip(*batch)
             return [self.default_collate_pad(samples ) for samples in transposed]
-        
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 
 #endregion
@@ -760,7 +766,6 @@ def position_edus(li_dict_rsttext):
     
     return li_dict_rsttext
 
-
 def _parse_trees(li_strtree):
     
     #parses tree into an nltk object
@@ -777,7 +782,6 @@ def _parse_trees(li_strtree):
         li_subtrees.append(_)
     
     return li_subtrees
-
 
 def _tree_to_rst_code(_tree):
     """Converst RST Tree to rst code used in NLG model
@@ -886,7 +890,6 @@ def __parse_leaves(tree_leaves ):
 
    return _str3
 
-
 def find_child_edus(pos_parentnode, li_rst_pos):
         #returns the pos of any child elements of a parent node(rst) that are edus
                
@@ -896,16 +899,5 @@ def find_child_edus(pos_parentnode, li_rst_pos):
 
         return li_child_edu_pos 
 
-
 #endregion
-
-#Debugging tools
-
-
-class TimeoutException(Exception):   # Custom exception class
-    pass
-
-def timeout_handler(signum, frame):   # Custom signal handler
-    raise TimeoutException
-
 
