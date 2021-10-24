@@ -170,12 +170,12 @@ class RSTBartPair(RSTBart):
 class RSTTokenizerPair(RSTTokenizer):
     
     title_start_token = "<tl>"
+    max_len_title = 20
 
+    def __init__(self, *args,  **kwargs):
         
-    def __init__(self, **kwargs):
-        
-        super().__init__(**kwargs)
-        self.max_len_title = kwargs.get( 'max_len_title', 20)
+        super().__init__(*args, **kwargs)
+        self.max_len_title = kwargs.get( 'max_len_title', self.max_len_title)
         
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
@@ -188,6 +188,8 @@ class RSTTokenizerPair(RSTTokenizer):
                      max_len_rst=max_len_rst, exclude_from_output= exclude_from_output, device=device)
         
         #encoding title
+        if title != None:
+            title = title.lstrip(string.punctuation+" ")
         title = self.title_start_token + title
         ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
@@ -246,13 +248,10 @@ class RSTTokenizerPair(RSTTokenizer):
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
         
-        tokenizer.title_start_token_id = tokenizer.encode(
-            tokenizer.title_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        tokenizer.rst_start_token_id = tokenizer.encode(
-            tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id = tokenizer.encode(
-            tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
+        tokenizer.title_start_token_id = torch.full( (1,), 50267 , dtype=torch.long )
+
+        tokenizer.rst_start_token_id = torch.full( (1,), 50265 , dtype=torch.long )
+        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50266 , dtype=torch.long )        
         tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
 
         for k, v in kwargs.items():
@@ -494,10 +493,13 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
 
             mconfig = RSTBart_Config.from_pretrained(mparams['base_model_name'], **mparams)
 
-            # Restore/update Training Module
-            training_module = RSTBartPair_TrainingModule(mconfig, **tparams)
+  
+            model = RSTBartPair(mconfig)
+            pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
+            model.load_state_dict( pytorch_state_dict )
+            tokenizer = RSTTokenizerPair.from_pretrained(**mparams)            
+            training_module = RSTBartPair_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
 
-            training_module.load_state_dict(checkpoint['state_dict'])
 
         elif tparams['mode'] in ["test"]:
 
@@ -557,7 +559,7 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 3,       
+            patience = 6,       
             verbose=False,
             mode='min'
         )
@@ -573,8 +575,8 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     # replace_sampler_ddp=False,
-                                                    num_sanity_val_steps=2,
-                                                    val_check_interval=0.99,
+                                                    num_sanity_val_steps=0,
+                                                    val_check_interval=0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -597,9 +599,9 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    num_sanity_val_steps=0,
+                                                    val_check_interval=0.5,
                                                     replace_sampler_ddp=False,
-
                                                     **trainer_vars,
                                                     )
 
@@ -744,21 +746,6 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
 
         return output
     
-    def step_end(self, output, step_name):
-        
-        if step_name == "train":
-            loss_key = "loss"
-            loss = output[loss_key].mean()
-            on_step = True
-            on_epoch = False
-        else:
-            loss_key =  f"{step_name}_loss"
-            loss = output[loss_key].mean()
-            on_step = False
-            on_epoch = True
-
-        self.log(loss_key, loss, logger=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True )
-
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
         return output
@@ -771,12 +758,6 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
         output = self.step(batch, "test")
         return output
     
-    def training_step_end(self, output ):
-        return self.step_end(output, "train")
-    
-    def validation_step_end(self, output):
-        return self.step_end(output, "val")
-
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs, "train")
 
@@ -795,7 +776,7 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True, on_step=False)
         
-        if step_name == "val" and _get_rank() == 0:
+        if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
             
@@ -1007,7 +988,7 @@ class SingleDataset(Dataset):
             # len of keyphrase
             li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
             li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            li_kp = [ ''.join(['<kp> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
+            li_kp = ['<kp> ' + '<kp> '.join(li_kp) for li_kp in li_li_kp  ]
             
             self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
                                         add_special_tokens=False, 

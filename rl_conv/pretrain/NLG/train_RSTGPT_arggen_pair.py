@@ -40,7 +40,6 @@ from transformers.tokenization_utils_base import AddedToken
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
 
-from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 
 T_co = TypeVar('T_co', covariant=True)
 
@@ -56,6 +55,7 @@ for path_ in modules_paths:
     if path_ not in sys.path:
         sys.path.append(path_)
 from torch.nn.utils.rnn import pad_sequence
+from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
@@ -138,7 +138,7 @@ class RSTGPT2Pair(RSTGPT2):
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
-            tok = training_module.RSTTokenizer
+            tok = training_module.tokenizer
 
             # Deleting checkpoints to free up GPU space
             del checkpoint
@@ -156,19 +156,22 @@ class RSTGPT2Pair(RSTGPT2):
 class RSTTokenizerPair(RSTTokenizer):
 
     title_start_token = "<|tl|>"
+    max_len_title = 20
     
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         
         self.pad_token =  self.eos_token
-        self.max_len_title = kwargs.get( 'max_len_title' ,20)
+        self.max_len_title = kwargs.get( 'max_len_title' , self.max_len_title)
         
-    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_rst_len=None, max_key_phrase_len=None, exclude_from_output=[], device=None, title='', max_title_len=None):
+    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, title='', max_title_len=None):
        
-        encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_rst_len=max_rst_len, max_key_phrase_len=max_key_phrase_len, exclude_from_output=exclude_from_output, device=device)
+        encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_len_rst=max_len_rst, max_len_key_phrase=max_len_key_phrase, exclude_from_output=exclude_from_output, device=device)
 
         #encoding title
+        if title != None:
+            title = title.lstrip(string.punctuation+" ")
         title = self.title_start_token + title
         ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
@@ -232,13 +235,9 @@ class RSTTokenizerPair(RSTTokenizer):
             tokenizer = cls
 
 
-        tokenizer.title_start_token_id = tokenizer.encode(
-            tokenizer.title_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        tokenizer.rst_start_token_id = tokenizer.encode(
-            tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id = tokenizer.encode(
-            tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
+        tokenizer.title_start_token_id = torch.full( (1,), 50259 , dtype=torch.long )
+        tokenizer.rst_start_token_id = torch.full( (1,), 50257 , dtype=torch.long )
+        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50258 , dtype=torch.long )        
         tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
 
         for k, v in kwargs.items():
@@ -274,7 +273,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         self.batching_style = batching_style
 
         if tokenizer  == None:
-            self.RSTTokenizer = RSTTokenizerPair.from_pretrained(f"./tokenizers/{mconfig.model_name}",
+            self.tokenizer = RSTTokenizerPair.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
@@ -287,7 +286,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                                      }
                                                          )
         else:
-            self.RSTTokenizer = tokenizer
+            self.tokenizer = tokenizer
 
         if model is not None:
             self.model = model
@@ -314,7 +313,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                             'context_rstpos': -1
                            }
         
-        self.RSTTokenizer.pad_values = self.pad_values
+        self.tokenizer.pad_values = self.pad_values
 
         self.pad_maxlens = {
             'rst_start_token': 1,
@@ -336,16 +335,16 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             'edu_rstpos': mconfig.max_rst_pos // 2,
             'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase }
 
-        self.RSTTokenizer.pad_maxlens = self.pad_maxlens
+        self.tokenizer.pad_maxlens = self.pad_maxlens
         
-        self.model.RSTTokenizer = self.RSTTokenizer
+        self.model.tokenizer = self.tokenizer
 
         if self.mode in ['finetune', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
-            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.RSTTokenizer,
+            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
                                  batching_style=self.batching_style
@@ -448,17 +447,17 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                     'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase',
                     'max_len_title','scale_grad_by_freq','rst_tree_aligned_attention' ]})
 
-                mparams = mparams
-
             else:
                 print("param files not found utilsing default or user entered params\n")
 
             mconfig = RSTGPT2PairConfig( **mparams)
 
-            # Restore/update Training Module
-            training_module = RSTGPT2Pair_TrainingModule(mconfig, **tparams)
+            model = RSTGPT2Pair(mconfig)
+            pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
+            model.load_state_dict( pytorch_state_dict )
+            tokenizer = RSTTokenizerPair.from_pretrained(**mparams)            
+            training_module = RSTGPT2Pair_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
 
-            training_module.load_state_dict(checkpoint['state_dict'])
 
         elif tparams['mode'] in ["test"]:
 
@@ -507,7 +506,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 3,       
+            patience = 6,       
             verbose=False,
             mode='min'
         )
@@ -535,6 +534,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
+                                                    val_check_interval=0.25,
                                                     **trainer_vars,
                                                     )
 
@@ -687,36 +687,20 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
     #region
     def step(self, batch, step_name):
 
-        input_ = batch
-        output = self.forward(input_)
-        loss = output.loss
-
-        loss_key = f"{step_name}_loss"
+        output = self.forward(batch)
         output = {}
-
+        
         if step_name == 'train':
-            output["loss"] = loss
+            output["loss"] = output.loss
+            self.log( "loss", output.loss, sync_dist=True)
 
         else:
-            str_loss_key = loss_key
-            output[str_loss_key] = loss
+            loss_key = f"{step_name}_loss"
+            self.log( loss_key, output.loss, sync_dist=True)
+            output[loss_key]=output.loss
 
         return output
     
-    def step_end(self, output, step_name):
-        
-        if step_name == "train":
-            loss_key = "loss"
-            loss = output[loss_key].mean()
-            on_step = True
-            on_epoch = False
-        else:
-            loss_key =  f"{step_name}_loss"
-            loss = output[loss_key].mean()
-            on_step = False
-            on_epoch = True
-
-        self.log(loss_key, loss, logger=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True )
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
@@ -730,12 +714,6 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         output = self.step(batch, "test")
         return output
     
-    def training_step_end(self, output ):
-        return self.step_end(output, "train")
-    
-    def validation_step_end(self, output):
-        return self.step_end(output, "val")
-
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs, "train")
 
@@ -1005,8 +983,10 @@ class SizedOrdered_Sampler(Sampler[int]):
         np_title_lens = self.data_source.np_title_lens
 
         # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
+        
+        random_idxs = np.random.random( np_txt_lens.size )
         np_ordered_lens = np.lexsort(
-            (np_rst_lens, np_key_phrase_lens, np_title_lens, np_txt_lens))
+            (random_idxs, np_rst_lens, np_key_phrase_lens, np_title_lens, np_txt_lens))
         # We Randomly re-arrange them in batches of batch size
 
         self.li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
@@ -1089,7 +1069,8 @@ class SingleDataset(Dataset):
             # len of keyphrase
             li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
             li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            li_kp = [ ''.join(['<|kp|> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
+            #TODO: This was corrected so need to remake dict_cache_records
+            li_kp = [ '<|kp|> ' + '<|kp|> '.join(li_kp) for li_kp in li_li_kp  ]
             
             self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
                                         add_special_tokens=False, 
@@ -1136,8 +1117,8 @@ class SingleDataset(Dataset):
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu,
-                                                  max_rst_len= min( self.rst_len[index], self.tokenizer.max_len_rst ),
-                                                  max_key_phrase_len= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
+                                                  max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
+                                                  max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
                                                     title=title,
                                                     max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
 
@@ -1160,8 +1141,8 @@ class SingleDataset(Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                max_rst_len= min( self.rst_len[index], self.tokenizer.max_len_rst ),
-                max_key_phrase_len= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
+                max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
+                max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
                 title=title,
                 max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
 

@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 # import pytorch_lightning as pl
 import torch
-torch.utils.data._utils.MP_STATUS_CHECK_INTERVAL = 300
 
 from pytorch_lightning import LightningModule, core, Trainer
 
@@ -36,8 +35,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 from pytorch_lightning.utilities.distributed import _get_rank
-from torch.utils.data.dataset import Dataset
-# torch.utils.data._utils.MP_STATUS_CHECK_INTERVAL = 300
+from torch.utils.data import Dataset
 
 from transformers.optimization import AdafactorSchedule
 from transformers.tokenization_utils_base import AddedToken
@@ -49,8 +47,6 @@ from train_RSTGPT_arggen_dyploc import DataLoaderGenerator
 
 T_co = TypeVar('T_co', covariant=True)
 
-import sys
-from seg_bot_segmenter import Segmenter, Lang
 from torch.nn.utils.rnn import pad_sequence
 
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
@@ -112,6 +108,7 @@ class RSTBartDyploc(RSTBart):
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         parser.add_argument('--rst_tree_aligned_attention',
                             type=lambda x: bool(int(x)), default=False)
+        parser.add_argument('--rst_segment_method', type=str, default=None, choices=['None','fenghirst','segbot'])
         mparams = parser.parse_known_args()[0]
         return mparams
 
@@ -172,12 +169,15 @@ class RSTTokenizerDyploc(RSTTokenizer):
     
     claim_start_token = "<cl>"
     title_start_token = "<tl>"
+    
+    max_len_claim = 20
+    max_len_title = 20
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         
-        super().__init__(**kwargs)
-        self.max_len_claim = kwargs.get( 'max_len_claim', 20)
-        self.max_len_title = kwargs.get( 'max_len_title', 20)
+        super().__init__(*args, **kwargs)
+        self.max_len_claim = kwargs.get( 'max_len_claim', self.max_len_claim)
+        self.max_len_title = kwargs.get( 'max_len_title', self.max_len_title)
         
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
@@ -191,6 +191,8 @@ class RSTTokenizerDyploc(RSTTokenizer):
                      max_len_rst=max_len_rst, exclude_from_output= exclude_from_output, device=device)
         
         #encoding title
+        if title != None:
+            title = title.lstrip(string.punctuation+" ")
         title = self.title_start_token + title
         ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
@@ -201,11 +203,12 @@ class RSTTokenizerDyploc(RSTTokenizer):
         title_pad = (ids_title == self.pad_token_id).sum(dim=0)
         
         #encoding claim
-       #encoding claim
+        # Address later
         if len( claim.split(' ') ) >50:
            claim = ""
-           
-        claim = self.claim_start_token + claim
+        else:
+            claim = self.claim_start_token + claim
+            
         ids_claim = self.encode(claim, add_special_tokens=False,
                 return_attention_mask=False,
                 padding= 'max_length' if max_claim_len else 'do_not_pad',
@@ -267,7 +270,6 @@ class RSTTokenizerDyploc(RSTTokenizer):
             at_title_start = AddedToken(cls.title_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.title_start_token, str) else cls.title_start_token
             
-            # additional_special_tokens = [at_rst_start, at_topic_start, at_claim_start, at_title_start]
             additional_special_tokens = [at_claim_start, at_title_start]
 
             cls = super(RSTTokenizerDyploc, cls).from_pretrained(
@@ -278,18 +280,14 @@ class RSTTokenizerDyploc(RSTTokenizer):
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
 
-        # tokenizer.claim_start_token_id = tokenizer.encode(
-        #     tokenizer.claim_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        # tokenizer.title_start_token_id = tokenizer.encode(
-        #     tokenizer.title_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        # tokenizer.rst_start_token_id = tokenizer.encode(
-        #     tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        # tokenizer.keyphrase_start_token_id = tokenizer.encode(
-        #     tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        # tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
+        #Debug figure out why these are different
+        tokenizer.claim_start_token_id = torch.full( (1,), 50267 , dtype=torch.long )
+        tokenizer.title_start_token_id = torch.full( (1,), 50268 , dtype=torch.long )
 
+        tokenizer.rst_start_token_id = torch.full( (1,), 50265 , dtype=torch.long )
+        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50266 , dtype=torch.long )        
+        tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
+        
         for k, v in kwargs.items():
             setattr(tokenizer, k, v)
 
@@ -359,8 +357,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
             self.model = model
         else:
             mconfig.vocab_size = mconfig.vocab_size-4
-            self.model = RSTBartDyploc.from_pretrained(
-                mconfig.base_model_name, config=mconfig)
+            self.model = RSTBartDyploc.from_pretrained(mconfig.base_model_name, config=mconfig)
             mconfig.vocab_size = mconfig.vocab_size+4
             self.model.config.vocab_size = mconfig.vocab_size
             self.model.resize_token_embeddings(self.model.config.vocab_size)
@@ -413,7 +410,6 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                         
             'decoder_edu_rstpos': mconfig.max_rst_pos // 2,
             'decoder_context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase
-
         }
         self.RSTTokenizer.pad_maxlens = self.pad_maxlens
         
@@ -431,9 +427,9 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                                  )
 
             if self.mode == "test":
-                self.create_data_loaders(['test'])
+                self.ctrl_loaders(['test'])
             else:
-                self.create_data_loaders(['train', 'val', 'inference'] )
+                self.ctrl_loaders(['train', 'val', 'inference'] )
                 torch.utils.data._utils.MP_STATUS_CHECK_INTERVAL = 300
                 self.inference_samples = list(islice(self.inference_dl, 3))
                 del self.inference_dl
@@ -450,7 +446,6 @@ class RSTBartDyploc_TrainingModule(LightningModule):
             self.hparams.update({**train_params_to_save, **mparams_to_save})
             core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
-
 
         if self.mode in ['inference']:
             self.eval()
@@ -522,23 +517,23 @@ class RSTBartDyploc_TrainingModule(LightningModule):
             # restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                     'learning_rate', 'precision', 'splits', 'tag','optimizer']})
+                     'learning_rate', 'precision', 'splits', 'tag']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase',
                     'scale_grad_by_freq','rst_tree_aligned_attention' ]})
-
-                mparams = mparams
 
             else:
                 print("param files not foun d utilsing default or user entered params\n")
 
             mconfig = RSTBartDyplocConfig.from_pretrained(mparams['base_model_name'], **mparams)
 
-            # Restore/update Training Module
-            training_module = RSTBartDyploc_TrainingModule(mconfig, **tparams)
+            model = RSTBartDyploc(mconfig)
+            pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
+            model.load_state_dict( pytorch_state_dict )
+            tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)            
+            training_module = RSTBartDyploc_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
 
-            training_module.load_state_dict(checkpoint['state_dict'])
 
         elif tparams['mode'] in ["test"]:
 
@@ -598,7 +593,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 3,       
+            patience = 6,       
             verbose=False,
             mode='min'
         )
@@ -618,8 +613,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    val_check_interval=0.999,
-                                                    # gradient_clip_val = ,
+                                                    val_check_interval=0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -644,7 +638,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-
+                                                    val_check_interval=0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -789,21 +783,6 @@ class RSTBartDyploc_TrainingModule(LightningModule):
 
         return output
     
-    def step_end(self, output, step_name):
-        
-        if step_name == "train":
-            loss_key = "loss"
-            loss = output[loss_key].mean()
-            on_step = True
-            on_epoch = False
-        else:
-            loss_key =  f"{step_name}_loss"
-            loss = output[loss_key].mean()
-            on_step = False
-            on_epoch = True
-
-        self.log(loss_key, loss, logger=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True )
-
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
         return output
@@ -816,12 +795,6 @@ class RSTBartDyploc_TrainingModule(LightningModule):
         output = self.step(batch, "test")
         return output
     
-    def training_step_end(self, output ):
-        return self.step_end(output, "train")
-    
-    def validation_step_end(self, output):
-        return self.step_end(output, "val")
-
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs, "train")
 
@@ -840,7 +813,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True, on_step=False)
         
-        if step_name == "val" and _get_rank() == 0:
+        if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
             
@@ -910,17 +883,15 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                 generation_params = copy.deepcopy(self.model.generation_params)
 
 
-                bad_words = ["<rst>", "<kp>", "<pad>"]
+                bad_words = ["<rst>", "<kp>", "<pad>", "<cl>", "<tl>"]
         
                 bad_words_ids = [self.RSTTokenizer.encode(
-                    bad_word,) for bad_word in bad_words]
-                bad_words_ids = bad_words_ids + \
-                    [self.RSTTokenizer.encode(bad_word) for bad_word in bad_words]
+                    bad_word) for bad_word in bad_words]
                 bad_words_ids = bad_words_ids 
                 
                 generation_params['bad_words_ids'] = bad_words_ids
 
-                generation_params['max_time'] = 30
+                generation_params['max_time'] = 45
                 decoded_text = self.model.generate_plus(
                     encoded_input, generation_params)
 
@@ -1048,6 +1019,19 @@ class SingleDataset(Dataset):
             self.np_rstlens = dict_cached_order['np_rstlens']
             self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
             self.np_title_lens = dict_cached_order['np_title_lens']
+            try:
+                self.li_claim_lens = dict_cached_order['li_claim_lens']
+            except KeyError as e:
+                li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
+                li_claims = [ [ f"<cl>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
+                
+                self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
+                                                add_special_tokens=False, 
+                                                truncation=False,
+                                                padding = 'do_not_pad',
+                                                return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
+                dict_cached_order['li_claim_lens'] = self.li_claim_lens
+                pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
             
         else:
             # len of text
@@ -1061,7 +1045,7 @@ class SingleDataset(Dataset):
             # len of keyphrase
             li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
             li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            li_kp = [ ''.join(['<kp> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
+            li_kp = [ '<kp> ' + '<kp> '.join(li_kp) for li_kp in li_li_kp  ]
             
             self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
                                         add_special_tokens=False, 
@@ -1077,25 +1061,30 @@ class SingleDataset(Dataset):
                                             padding = 'do_not_pad',
                                             return_tensors=None).__len__() for title in li_title] )
 
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens,
-                                'np_title_lens':self.np_title_lens}
-
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-        # length of claim and title combined
-        
-        # This is random so it may change each epoch
-        li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
-        self.li_claim_idxs = [ random.randint(0,len(li_claim)-1) if len(li_claim)!=0 else -1 for li_claim in li_claims ] 
-        
-        li_claims = [ f"<cl>{li_claim[idx]}" if len(li_claim)>0 else "" for li_claim, idx in zip(li_claims, self.li_claim_idxs)  ]
-        
-        self.np_claim_lens = np.array( [self.tokenizer.encode(claim,
+            #encoding length of all claims for each datum
+            li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
+            li_claims = [ [ f"<cl>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
+            
+            self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
                                             add_special_tokens=False, 
                                             truncation=False,
                                             padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for claim in li_claims] )
+                                            return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
+            
+            
+            dict_cached_order = {'np_textlens': self.np_textlens,
+                                'np_rstlens': self.np_rstlens,
+                                'np_keyphrase_lens': self.np_keyphrase_lens,
+                                'np_title_lens':self.np_title_lens,
+                                'li_claim_lens':self.li_claim_lens }
+
+            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
+        # length of claim and title combined
+
+   
+        #randomly choosing a claim
+        self.li_claim_idxs = [ random.randint(0,len(claim_lens)-1) if len(claim_lens)!=0 else -1 for claim_lens in self.li_claim_lens ] 
+        self.np_claim_lens = np.array( [ self.li_claim_lens[datum_idx][claim_idx] if claim_idx>-1 else 0 for datum_idx, claim_idx in enumerate(self.li_claim_idxs) ] )
                             
         #v2 We initialize the rst/kp lengths as the actual length of each entry
         # In the Sampler, we change the max length to that of its pre-prescribed batch

@@ -572,7 +572,6 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             else:
                 raise NotImplementedError(f"Invalid segmentation method specified - curr val={self.rst_segment_method}")
             
-            
         if generation_params == None:
             generation_params = self.generation_params
 
@@ -826,6 +825,16 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     rst_start_token = "<rst>"
     keyphrase_start_token = "<kp>"
 
+    def __init__(self, *args, **kwargs):
+        
+        super().__init__( *args, **kwargs)
+        
+        self.max_len_rst = kwargs.get('max_len_rst', self.max_len_rst)
+        self.max_len_key_phrase = kwargs.get('max_len_key_phrase',self.max_len_key_phrase)
+        self.max_len_utt = kwargs.get('max_len_utt', self.max_len_utt)
+        self.max_rst_pos = kwargs.get('max_rst_pos', self.max_rst_pos )
+
+
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
                      max_len_rst=None,
@@ -1050,7 +1059,13 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         if len(topics)!=0:
             max_len = self.max_len_key_phrase
 
-            str_topics = ''.join(['<kp> '+topic for topic in topics])
+            if len(topics) >= max_len/2:
+                indexes = list(range(len(topics)))
+                random.shuffle(indexes)
+                topics, li_kprstpos = list( zip(*[ (topics[idx] ,li_kprstpos[idx]) for idx in indexes ] ) )
+                
+            str_topics = '<kp> ' + '<kp> '.join(topics)
+
             dict_encoding = self(str_topics, add_special_tokens=False,
                                 return_attention_mask=False,
                                 truncation=True,
@@ -1351,12 +1366,15 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 dir_tokenizer, local_files_only=True, **kwargs)
 
         else:
+            additional_special_tokens = kwargs.pop(
+                'additional_special_tokens', [])
 
             at_rst_start = AddedToken(cls.rst_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.rst_start_token, str) else cls.rst_start_token
             at_topic_start = AddedToken(cls.keyphrase_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.keyphrase_start_token, str) else cls.keyphrase_start_token
-            additional_special_tokens = [at_rst_start, at_topic_start]
+            additional_special_tokens = [
+                at_rst_start, at_topic_start] + additional_special_tokens
 
             cls = super(RSTTokenizer, cls).from_pretrained(base_tokenizer_name,
                                                            additional_special_tokens=additional_special_tokens)
@@ -1364,9 +1382,9 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
 
-        tokenizer.rst_start_token_id        = tokenizer.encode( tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id  = tokenizer.encode( tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
+        tokenizer.rst_start_token_id = torch.full( (1,), 50265 , dtype=torch.long )
+        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50266 , dtype=torch.long )        
+        tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()        
 
         for k, v in rst_params.items():
             setattr(cls, k, v)
@@ -1497,15 +1515,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
 
-            bad_words = ["<rst>", "<kp>"]
-            bad_words_ids = [self.RSTTokenizer.encode(
-                bad_word,) for bad_word in bad_words]
-            bad_words_ids = bad_words_ids + \
-                [self.RSTTokenizer.encode(bad_word) for bad_word in bad_words]
-            bad_words_ids = bad_words_ids 
 
-
-            
             # self.trainer.logger.add_hparams( vars(mconfig) )
 
         if self.mode in ['inference']:
@@ -1656,11 +1666,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
                                                     val_check_interval=0.1,
-                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-                                                    gradient_clip_val = 0.5,
                                                     **trainer_vars,
                                                     )
 
@@ -1683,9 +1691,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
                                                     val_check_interval=0.1,
-                                                    limit_val_batches = 0.25,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
 
                                                     **trainer_vars,
@@ -1752,8 +1759,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
     @staticmethod
     def get_ckpt_file(_dir_checkpoint, mode='best'):
         if mode == 'best':
-            checkpoint_yaml_file = os.path.join(
-                _dir_checkpoint, "best_k_models.yaml")
+            checkpoint_yaml_file = os.path.join(_dir_checkpoint, "best_k_models.yaml")
             # key= ckptpath, value = val_loss
             scores_dict = yaml.load(open(checkpoint_yaml_file, "r"), Loader=yaml.FullLoader)
             best_ckpt_path = min(scores_dict, key=scores_dict.get)
@@ -1817,36 +1823,21 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
     def step(self, batch, step_name):
 
-        input_ = batch
-        output = self.forward(input_)
-        loss = output.loss
-
-        loss_key = f"{step_name}_loss"
+        output = self.forward(batch)
         output = {}
-
+        
         if step_name == 'train':
-            output["loss"] = loss
+            output["loss"] = output.loss
+            self.log( "loss", output.loss, sync_dist=True)
 
         else:
-            str_loss_key = loss_key
-            output[str_loss_key] = loss
+            loss_key = f"{step_name}_loss"
+            self.log( loss_key, output.loss, sync_dist=True)
+            output[loss_key]=output.loss
 
         return output
     
-    def step_end(self, output, step_name):
-        
-        if step_name == "train":
-            loss_key = "loss"
-            loss = output[loss_key].mean()
-            on_step = True
-            on_epoch = False
-        else:
-            loss_key =  f"{step_name}_loss"
-            loss = output[loss_key].mean()
-            on_step = False
-            on_epoch = True
 
-        self.log(loss_key, loss, logger=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True )
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
@@ -1860,12 +1851,6 @@ class RSTBart_TrainingModule(pl.LightningModule):
         output = self.step(batch, "test")
         return output
     
-    def training_step_end(self, output ):
-        return self.step_end(output, "train")
-    
-    def validation_step_end(self, output):
-        return self.step_end(output, "val")
-
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs, "train")
 
@@ -2222,7 +2207,7 @@ class SingleDataset(torch.utils.data.Dataset):
             li_li_kp = [[kp for pos, kp in li_pos_kp]
                         for li_pos_kp in li_li_pos_kp]
 
-            li_kp = [''.join(['<kp> ' + kp for kp in li_kp])
+            li_kp = [ '<kp> ' + '<kp> '.join(li_kp)
                      for li_kp in li_li_kp]
 
             self.np_keyphrase_lens = np.array([self.tokenizer.encode(kp,

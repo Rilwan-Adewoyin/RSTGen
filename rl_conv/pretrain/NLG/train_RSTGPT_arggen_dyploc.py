@@ -2,9 +2,6 @@ import os
 
 # os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
-# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-# os.environ['PYDEVD_THREAD_DUMP_ON_WARN_EVALUATION_TIMEOUT'] = "true"
-from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 
 import string
 import argparse
@@ -33,15 +30,15 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 from pytorch_lightning.utilities.distributed import _get_rank
+from torch.utils.data import Dataset
 from torch.utils.data import Sampler 
-from torch.utils.data.dataset import Dataset
-from torch.utils.data.sampler import Sampler
 
 from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
 import bisect
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
+from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 
 
 T_co = TypeVar('T_co', covariant=True)
@@ -60,6 +57,7 @@ for path_ in modules_paths:
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers.utils import logging
+from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 logger = logging.get_logger(__name__)
 
   
@@ -79,9 +77,6 @@ class RSTGPT2Dyploc(RSTGPT2):
     def __init__(self, config: RSTGPT2DyplocConfig):
         
         super().__init__(config)
-        # #Freeze all weights except for prefix weight,
-        # for name, param in self.model.named_parameters(): 
-        #     param.requires_grad = False
         
     def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_kp_utt, **kwargs ):
         
@@ -116,6 +111,8 @@ class RSTGPT2Dyploc(RSTGPT2):
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         parser.add_argument('--rst_tree_aligned_attention',
                             type=lambda x: bool(int(x)), default=False)
+        parser.add_argument('--rst_segment_method', type=str, default='None', choices=['None','fenghirst','segbot'])
+
         mparams = parser.parse_known_args()[0]
         return mparams
 
@@ -145,7 +142,7 @@ class RSTGPT2Dyploc(RSTGPT2):
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
-            tok = training_module.RSTTokenizer
+            tok = training_module.tokenizer
 
             # Deleting checkpoints to free up GPU space
             del checkpoint
@@ -166,23 +163,29 @@ class RSTTokenizerDyploc(RSTTokenizer):
     claim_start_token = "<|cl|>"
     title_start_token = "<|tl|>"
     
-    def __init__(self, **kwargs):
+    max_len_claim = 20
+    max_len_title = 20
+    
+    def __init__(self, *args, **kwargs):
         
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         
         self.pad_token =  self.eos_token
-        self.max_len_claim = kwargs.get( 'max_len_claim', 20)
-        self.max_len_title = kwargs.get( 'max_len_title', 20)
+        self.max_len_claim = kwargs.get( 'max_len_claim', self.max_len_claim )
+        self.max_len_title = kwargs.get( 'max_len_title', self.max_len_title  )
         
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, claim='', title='', max_claim_len=None, max_title_len=None):
        
         encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_len_rst=max_len_rst, max_len_key_phrase=max_len_key_phrase, exclude_from_output=exclude_from_output, device=device)
         
        #encoding claim
+       #TODO: make it work without this over 50 restriction
         if len( claim.split(' ') ) >50:
            claim = "" 
-           
-        claim = self.claim_start_token + claim
+        else:
+            claim = self.claim_start_token + claim
+            
+            
         ids_claim = self.encode(claim, add_special_tokens=False,
                 return_attention_mask=False,
                 padding= 'max_length' if max_claim_len else 'do_not_pad',
@@ -194,6 +197,8 @@ class RSTTokenizerDyploc(RSTTokenizer):
         
         
         #encoding title
+        if title != None:
+            title = title.lstrip(string.punctuation+" ")
         title = self.title_start_token + title
         ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
@@ -261,7 +266,6 @@ class RSTTokenizerDyploc(RSTTokenizer):
             at_title_start = AddedToken(cls.title_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.title_start_token, str) else cls.title_start_token
             
-            # additional_special_tokens = [at_rst_start, at_topic_start, at_claim_start, at_title_start]
             additional_special_tokens = [at_claim_start, at_title_start]
 
             cls = super(RSTTokenizerDyploc, cls).from_pretrained(
@@ -271,17 +275,13 @@ class RSTTokenizerDyploc(RSTTokenizer):
 
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
+        
+        tokenizer.claim_start_token_id = torch.full( (1,), 50259 , dtype=torch.long )
+        tokenizer.title_start_token_id = torch.full( (1,), 50260 , dtype=torch.long )
+        
 
-        tokenizer.claim_start_token_id = tokenizer.encode(
-            tokenizer.claim_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        tokenizer.title_start_token_id = tokenizer.encode(
-            tokenizer.title_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        
-        tokenizer.rst_start_token_id = tokenizer.encode(
-            tokenizer.rst_start_token, return_tensors="pt", add_special_tokens=False)[0]
-        tokenizer.keyphrase_start_token_id = tokenizer.encode(
-            tokenizer.keyphrase_start_token, return_tensors="pt", add_special_tokens=False)[0]
+        tokenizer.rst_start_token_id = torch.full( (1,), 50257 , dtype=torch.long )
+        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50258 , dtype=torch.long )        
         tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
 
         for k, v in kwargs.items():
@@ -318,7 +318,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         
 
         if tokenizer  == None:
-            self.RSTTokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
+            self.tokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
@@ -332,26 +332,18 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                                      }
                                                          )
         else:
-            # self.RSTTokenizer = copy.deepcopy(tokenizer)
-            self.RSTTokenizer = tokenizer
-            # self.RSTTokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
-            #                                              base_tokenizer_name=mconfig.base_model_name,
-            #                                              rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
-            #                                                                                                    'max_len_key_phrase',
-            #                                                                                                    'max_rst_depth',
-            #                                                                                                    'max_len_utt', 
-            #                                                                                                    'max_rst_pos',
-            #                                                                                                    'max_rst_pos',
-            #                                                                                                    'max_len_title',
-            #                                                                                                    'max_len_claim',
-            #                                                                                                    'rst_tree_aligned_attention'] if hasattr(mconfig, name)
-            #                                              } )
+            self.tokenizer = tokenizer
+ 
 
-            
         if model is not None:
             self.model = model
         else:
-            raise Exception
+            mconfig.vocab_size = mconfig.vocab_size-4
+            self.model = RSTGPT2Dyploc.from_pretrained(
+                mconfig.base_model_name, config=mconfig)
+            mconfig.vocab_size = mconfig.vocab_size+4
+            self.model.config.vocab_size = mconfig.vocab_size
+            self.model.resize_token_embeddings(self.model.config.vocab_size)
                     
         self.pad_values = {'rst_start_token': mconfig.eos_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
@@ -375,7 +367,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                             'context_rstpos': -1
                            }
         
-        self.RSTTokenizer.pad_values = self.pad_values
+        self.tokenizer.pad_values = self.pad_values
 
         self.pad_maxlens = {
             'rst_start_token': 1,
@@ -400,16 +392,16 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             'edu_rstpos': mconfig.max_rst_pos // 2,
             'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase }
 
-        self.RSTTokenizer.pad_maxlens = self.pad_maxlens
+        self.tokenizer.pad_maxlens = self.pad_maxlens
         
-        self.model.RSTTokenizer = self.RSTTokenizer
+        self.model.tokenizer = self.tokenizer
 
         if self.mode in ['finetune', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
-            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.RSTTokenizer,
+            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
                                  batching_style=self.batching_style
@@ -512,17 +504,19 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                     'max_len_claim','max_len_title',
                     'scale_grad_by_freq','rst_tree_aligned_attention' ]})
 
-                mparams = mparams
-
             else:
                 print("param files not found utilsing default or user entered params\n")
 
-            mconfig = RSTGPT2DyplocConfig( **mparams)
+            mconfig = RSTGPT2DyplocConfig.from_pretrained(mparams['base_model_name'], **mparams)
+            
 
             # Restore/update Training Module
-            training_module = RSTGPT2Dyploc_TrainingModule(mconfig, **tparams)
-
-            training_module.load_state_dict(checkpoint['state_dict'])
+            model = RSTGPT2Dyploc(mconfig)
+            pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
+            model.load_state_dict( pytorch_state_dict )
+            tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)            
+            training_module = RSTGPT2Dyploc_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
+            
 
         elif tparams['mode'] in ["test"]:
 
@@ -571,7 +565,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 3,       
+            patience = 6,       
             verbose=False,
             mode='min'
         )
@@ -600,8 +594,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    # val_check_interval=0.5,
-                                                    
+                                                    val_check_interval=0.25,
                                                     **trainer_vars,
                                                     )
 
@@ -627,9 +620,10 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks, 
                                                     # val_check_interval=
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
+                                                    val_check_interval=0.5,
                                                     )
 
             # load callback states
@@ -754,36 +748,20 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     #region
     def step(self, batch, step_name):
 
-        input_ = batch
-        output = self.forward(input_)
-        loss = output.loss
-
-        loss_key = f"{step_name}_loss"
+        output = self.forward(batch)
         output = {}
-
+        
         if step_name == 'train':
-            output["loss"] = loss
+            output["loss"] = output.loss
+            self.log( "loss", output.loss, sync_dist=True)
 
         else:
-            str_loss_key = loss_key
-            output[str_loss_key] = loss
+            loss_key = f"{step_name}_loss"
+            self.log( loss_key, output.loss, sync_dist=True)
+            output[loss_key]=output.loss
 
         return output
     
-    def step_end(self, output, step_name):
-        
-        if step_name == "train":
-            loss_key = "loss"
-            loss = output[loss_key].mean()
-            on_step = True
-            on_epoch = False
-        else:
-            loss_key =  f"{step_name}_loss"
-            loss = output[loss_key].mean()
-            on_step = False
-            on_epoch = True
-
-        self.log(loss_key, loss, logger=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True )
 
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
@@ -797,11 +775,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         output = self.step(batch, "test")
         return output
     
-    def training_step_end(self, output ):
-        return self.step_end(output, "train")
-    
-    def validation_step_end(self, output):
-        return self.step_end(output, "val")
 
     def training_epoch_end(self, outputs):
         self.epoch_end_log(outputs, "train")
@@ -893,8 +866,15 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                 # encoded_input.pop('labels', None)
 
                 generation_params = copy.deepcopy(self.model.generation_params)
-                generation_params['max_length'] = 60
-                generation_params['max_time'] = 20
+                generation_params['max_time'] = 45
+                bad_words = ["<|rst|>", "<|kp|>", ]
+        
+                bad_words_ids = [self.tokenizer.encode(
+                    bad_word) for bad_word in bad_words]
+
+                bad_words_ids = bad_words_ids 
+                
+                generation_params['bad_words_ids'] = bad_words_ids
                 decoded_text = self.model.generate_plus( encoded_input, generation_params )
 
                 datum = {
@@ -920,17 +900,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     def create_data_loaders(self, modes ):
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
-                split_name='train')
+                split_name='train', custom_dset_class= SingleDataset)
             self.train_dl_used = False
         if 'val' in modes:
             self.val_dl = self.dg.prepare_dataloader(
-                split_name='val')
+                split_name='val', custom_dset_class= SingleDataset)
         if 'test' in modes:
             self.test_dl = self.dg.prepare_dataloader(
-                split_name='test')
+                split_name='test',  custom_dset_class= SingleDataset)
         if 'inference' in modes:
             self.inference_dl = self.dg.prepare_dataloader(
-                split_name='inference')
+                split_name='inference',  custom_dset_class= SingleDataset)
 
     def train_dataloader(self):
         # return self.train_dl
@@ -942,8 +922,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             return self.train_dl
 
     def val_dataloader(self):
-        # return self.dg.prepare_dataloader(
-        #         split_name='val')
         return self.val_dl 
 
     def test_dataloader(self):
@@ -1055,9 +1033,9 @@ class DataLoaderGenerator():
                                                  pin_memory=False,
                                                 #  collate_fn=self.tokenizer.default_collate_pad,
                                                  collate_fn=collate_fn,
-                                                 
+                                                 multiprocessing_context = kwargs.get('multiprocessing_context', None) )
                                                 #  timeout=30
-                                                )
+                                                
 
                                                  
         return dataloader
@@ -1081,8 +1059,10 @@ class SizedOrdered_Sampler(Sampler[int]):
         np_title_lens = self.data_source.np_title_lens
 
         # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
+        random_idxs = np.random.random( np_txt_lens.size )
+        
         np_ordered_lens = np.lexsort(
-            (np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens, np_txt_lens))
+            (random_idxs, np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens, np_txt_lens))
         # We Randomly re-arrange them in batches of batch size
 
         li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
@@ -1221,8 +1201,9 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
             [ds.np_title_lens for ds in self.data_source.datasets]).flatten()
         
         # Indices are sorted in order of the text lens of records in the datasets
+        random_idxs = np.random.random( np_title_lens.size )
         np_ordered_lens = np.lexsort(
-            (np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens ,np_txt_lens))
+            (random_idxs, np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens , np_txt_lens))
 
         # We Randomly re-arrange them in batches of batch size
         li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
@@ -1316,7 +1297,6 @@ class SingleDataset(Dataset):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.inference = inference
-
         self.data = pd.read_csv(self.fp, sep=',', header=0 )
 
         fp_cached_order = os.path.join(os.path.dirname(
@@ -1333,7 +1313,21 @@ class SingleDataset(Dataset):
             self.np_rstlens = dict_cached_order['np_rstlens']
             self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
             self.np_title_lens = dict_cached_order['np_title_lens']
-            
+            try:
+                self.li_claim_lens = dict_cached_order['li_claim_lens']
+            except KeyError as e:
+                li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
+                li_claims = [ [ f"<|cl|>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
+                
+                self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
+                                                add_special_tokens=False, 
+                                                truncation=False,
+                                                padding = 'do_not_pad',
+                                                return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
+                dict_cached_order['li_claim_lens'] = self.li_claim_lens
+                pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
+
+                
         else:
             # len of text
 
@@ -1347,7 +1341,8 @@ class SingleDataset(Dataset):
             # len of keyphrase
             li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
             li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            li_kp = [ ''.join(['<|kp|> '+ kp for kp in li_kp]) for li_kp in li_li_kp  ]
+            #TODO: this was corrected so need to redo dict cache records
+            li_kp = [ '<|kp|> ' + '<|kp|> '.join(li_kp) for li_kp in li_li_kp  ]
             
             self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
                                         add_special_tokens=False, 
@@ -1363,26 +1358,30 @@ class SingleDataset(Dataset):
                                             padding = 'do_not_pad',
                                             return_tensors=None).__len__() for title in li_title] )
 
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens,
-                                'np_title_lens':self.np_title_lens}
-
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-        # length of claim and title combined
-        
-        # This is random so it may change each epoch
-        li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
-        self.li_claim_idxs = [ random.randint(0,len(li_claim)-1) if len(li_claim)!=0 else -1 for li_claim in li_claims ] 
-        
-        li_claims = [ f"<|cl|>{li_claim[idx]}" if len(li_claim)>0 else "" for li_claim, idx in zip(li_claims, self.li_claim_idxs)  ]
-        
-        self.np_claim_lens = np.array( [self.tokenizer.encode(claim,
+            #encoding length of all claims for each datum
+            li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
+            li_claims = [ [ f"<|cl|>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
+            
+            self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
                                             add_special_tokens=False, 
                                             truncation=False,
                                             padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for claim in li_claims] )
-                            
+                                            return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
+            
+            
+            dict_cached_order = {'np_textlens': self.np_textlens,
+                                'np_rstlens': self.np_rstlens,
+                                'np_keyphrase_lens': self.np_keyphrase_lens,
+                                'np_title_lens':self.np_title_lens,
+                                'li_claim_lens':self.li_claim_lens }
+
+            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
+        
+        
+        #randomly choosing a claim
+        self.li_claim_idxs = [ random.randint(0,len(claim_lens)-1) if len(claim_lens)!=0 else -1 for claim_lens in self.li_claim_lens ] 
+        self.np_claim_lens = np.array( [ self.li_claim_lens[datum_idx][claim_idx] if claim_idx>-1 else 0 for datum_idx, claim_idx in enumerate(self.li_claim_idxs) ] )
+
         #v2 We initialize the rst/kp lengths as the actual length of each entry
         # In the Sampler, we change the max length to that of its pre-prescribed batch
         self.rst_len = copy.deepcopy( self.np_rstlens )
@@ -1533,5 +1532,5 @@ if __name__ == '__main__':
 
 # dullduks server version 1 - No Freezing, Full RST
 
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT2_arggen_dyploc.py --batch_size 26 --version 1 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --learning_rate 3e-4 --finetune_version 1
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT2_arggen_dyploc.py --batch_size 26 --version 6 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag "RSTGPT2 with rst aligned attn" --max_len_utt 180 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --learning_rate 3e-4 --finetune_version 6
+# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT_arggen_dyploc.py --batch_size 26 --version 1 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --learning_rate 3e-4 --finetune_version 1 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_dyploc.py --batch_size 26 --version 6 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag "RSTGPT2 with rst aligned attn" --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --finetune_version 6 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
