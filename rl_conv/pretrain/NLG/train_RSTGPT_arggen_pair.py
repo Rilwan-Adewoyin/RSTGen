@@ -39,6 +39,7 @@ from transformers.tokenization_utils_base import AddedToken
 
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
+from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 
 
 T_co = TypeVar('T_co', covariant=True)
