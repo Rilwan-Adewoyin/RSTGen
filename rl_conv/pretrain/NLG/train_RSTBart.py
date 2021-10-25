@@ -40,7 +40,6 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 from pytorch_lightning.utilities.distributed import _get_rank
 from sklearn import preprocessing as sklp
-from torch.nn import CrossEntropyLoss
 from torch.utils.data import Sampler 
 from torch.utils.data._utils.collate import default_convert
 from torch.utils.data.dataset import Dataset

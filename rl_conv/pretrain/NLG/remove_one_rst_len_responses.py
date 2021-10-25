@@ -2,7 +2,9 @@ import glob
 import os
 import pandas as pd
 import json
-
+import regex as re
+    
+# clearning change my view dataset
 def main():
     dir_data = "./dataset_cmv/"
     li_fps = glob.glob(os.path.join( dir_data, "nlg*","train","*") ) + \
