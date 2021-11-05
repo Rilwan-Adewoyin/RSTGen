@@ -16,6 +16,7 @@ from transformers import BartTokenizer
 from functools import partial
 from itertools import tee
 import traceback
+import syntok.segmenter as segmenter
 
 # Docker Images Parser and RST tree labeller
 mp1 = os.path.abspath(os.path.join('..'))
@@ -52,10 +53,15 @@ def main( batch_process_size = 10, mp_count=1 ):
     #     "test":["dyploc_rst","dyploc_pair","dyploc_ctrl","dyploc_pair_rst"]
     # }
     conversions_map = {
-        "train":["dyploc_ctrl"],
-        "val":["dyploc_ctrl"],
+        # "train":["dyploc_ctrl"],
+        # "val":["dyploc_ctrl"],
         "test":["dyploc_pair"]
     }
+    # conversions_map = {
+    #     # "test":["dyploc_pair",dyploc_pair_rst"],
+    #     # "val":[ "dyploc_pair_rst"],
+    #     # "train":['dyploc_pair_rst'],
+    # }
 
     dir_sourcedset = "./dataset_cmv/dyploc"
     
@@ -63,7 +69,7 @@ def main( batch_process_size = 10, mp_count=1 ):
     
     # iterate through train, val, test
     # for dset_section in ['test','val','train']:
-    for dset_section in ['test']:
+    for dset_section in list(conversions_map.keys()):
         
                 
         # loading dataset
@@ -159,7 +165,6 @@ def preprocess(li_records):
             continue
         
         # remove CMv from title
-
             # Remove CMV at end of seq
         title = re.sub( regex_cmv_end, r"\1", title)
             # Remove CMV at beginning of seq
@@ -180,7 +185,7 @@ def preprocess(li_records):
         li_records[idx]['txt_preproc'] = reference
         li_records[idx]['title'] = title
     
-    print("Ending  preprocess")
+    # print("Ending preprocess")
     return li_records
 
 
@@ -189,12 +194,109 @@ def salience_keywords_parse(li_records):
     #extract kp_set_str from dyploc context
         # get kp_set_str from actual reference text based on word salience
         # use compute_topic_signatures script
+        # create kp_plan_str which is the ordered version of kp_set_str
     
     tsc = TopicSignatureConstruction(li_records)
+    tsc._init_totals()
     tsc.receive_data()
     tsc.calculate_llr()
-    li_records = tsc.return_records() #adds a 'kp_set_str' to each record
-    print("Ending salience keywords parse")
+    li_records = tsc.return_records() #adds a 'kp_set_str' to each record (an ordered set of kps)
+    
+    for idx1 in reversed(range(len(li_records))):
+        utterance= li_records[idx1]['txt_preproc']
+        
+        if 'kp_set_str' not in li_records[idx1]:
+            li_records.pop(idx1)
+            continue
+        
+        #removing all kps less than 3 letters long
+        #Moved to compute_topic_signature
+        # kp_set_str = '<s>'.join([ word for word in li_records[idx1]['kp_set_str'].split('<s>') if len(word.strip())>3 ] )
+        kp_set_str = li_records[idx1]['kp_set_str']
+        
+        li_kps = kp_set_str.split('<s>')
+        li_kp_sidx_eidx = []
+        
+        #retrieve start and end idx for each kp in utterance
+        for kp in li_kps:
+            # _ = re.search(r'\b({})\b'.format(kp.strip()), utterance.lower())
+            # _ = re.search(r'\b({})\b'.format(kp.strip()), utterance )
+            
+            _ = re.search(r'[\b]?({})\b'.format(kp), utterance ) #testing
+            if _ == None:
+                _ = re.search(rf'[\b]?[{string.punctuation}]?({kp})\b', utterance )
+            if _ == None:
+                _ = re.search(r'[\b]?({})\b'.format(kp.strip()), utterance ) #testing                
+            if _ == None:
+                _ = re.search(rf'[{string.punctuation}]({kp})[{string.punctuation}]', utterance ) #testing
+            if _ == None:
+                continue
+            
+            s_idx = _.start()
+            e_idx = _.end()
+            li_kp_sidx_eidx.append([kp, s_idx, e_idx])
+        
+        # retreive posiitons of sentence end markers
+        li_sentence_end_pos = []
+        for paragraph in segmenter.analyze(utterance):
+            for sentence in paragraph:
+                for token in sentence:
+                    pass
+                li_sentence_end_pos.append(token.offset)
+        
+        # Sorting list in order of sidx
+        li_kp_sidx_eidx = sorted(li_kp_sidx_eidx, key=lambda subli: subli[1] )
+        
+        # Now create a string
+        # Where we only keep sentence words that appear in the 
+        # with each kp seperated by <s>
+        # Also ensure that if any consecutiev kps have eidx = sidx then don't add <s>
+        kp_plan_str = ''
+        for idx2 in range(len(li_kp_sidx_eidx)):
+            if idx2!=0:
+                curr_sidx = li_kp_sidx_eidx[idx2][1]
+                prev_eidx = li_kp_sidx_eidx[idx2-1][2]
+                
+                if curr_sidx > prev_eidx + 1 or ( curr_sidx == prev_eidx+1 and utterance[prev_eidx]=="."):
+                    # kp_plan_str += " <s> "
+                    kp_plan_str += " <s>" #testing
+                    
+                else:
+                    # kp_plan_str += " "
+                    kp_plan_str += "" #testing
+                    
+                      
+            # kp_plan_str += li_kp_sidx_eidx[idx2][0].strip()
+            kp_plan_str += li_kp_sidx_eidx[idx2][0] 
+            
+        # li_records[idx1]['kp_plan_str_1'] = kp_plan_str.strip() # <s> placed at word seperation boundaries
+        li_records[idx1]['kp_plan_str_1'] = kp_plan_str # <s> placed at word seperation boundaries
+                  
+        #Now create a string
+        # Where each sentence is divided by <s>
+        # Each sentence only includes has all words not in kp removed
+        kp_plan_str = ''
+        for idx2 in range(len(li_kp_sidx_eidx)):
+            
+            #We check if the idx2 is larger than the next sentence end index in the list of sentence end indicies
+            # If it is we append the  <s> and remove the next sentence end index from the list
+            if li_kp_sidx_eidx[idx2][1] >= li_sentence_end_pos[0]:
+                # kp_plan_str += " <s> "
+                kp_plan_str += " <s>"
+                li_sentence_end_pos.pop(0)
+            else:                
+                # kp_plan_str += " "
+                if li_kp_sidx_eidx[idx2][0][0] != " ":
+                    kp_plan_str += " "
+
+            # kp_plan_str += li_kp_sidx_eidx[idx2][0].strip()
+            kp_plan_str += li_kp_sidx_eidx[idx2][0]
+        
+        # li_records[idx1]['kp_plan_str'] = kp_plan_str.strip()
+        li_records[idx1]['kp_plan_str'] = kp_plan_str
+        
+   
+    # print("Ending salience keywords parse")
     return li_records
     
     
@@ -260,7 +362,9 @@ def convert_dyploc_to_rst( li_records ):
 
         for idx in range(len(li_records)):
             li_records[idx].pop('kp_set_str',None)
-        
+            li_records[idx].pop('kp_plan_str',None)
+            li_records[idx].pop('kp_plan_str_1',None)
+
         #extracting keyphrases
 
         for idx in reversed(range(len(li_records))):
@@ -364,7 +468,7 @@ def convert_dyploc_to_pair( li_records ):
 
         for idx in range(len(li_records)):
                 
-            li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_set_str'], li_records[idx]['txt_preproc'], tokenizer )
+            li_records[idx]['template'] = pair_template_maker( li_records[idx]['kp_plan_str_1'], li_records[idx]['txt_preproc'], tokenizer )
 
             li_records[idx]['prompt'] = li_records[idx].pop('title',None)
 
@@ -375,7 +479,7 @@ def convert_dyploc_to_pair( li_records ):
             li_records[idx].pop('li_edus',None)
             
 
-        print("End Convert dyploc to pair") 
+        # print("End Convert dyploc to pair") 
         return li_records
         #endregion
     
@@ -383,29 +487,57 @@ def convert_dyploc_to_pair( li_records ):
         print(traceback.format_exc())
         raise e
 
-def pair_template_maker(  kp_set_str, reference, tokenizer ):
-    print("Starting pair template maker")
-
+def pair_template_maker(  kp_plan_str, reference, tokenizer ):
+    # print("Starting pair template maker")
+    """
+    This uses the kp_plan_str where every word is seperated by <s> not just the sentences
+    """
+    
     try: 
             
         # Find the position of each tokenized word in the tokenized text
             # Must use the tokenizer used by the generation model
 
-        li_kp_str = kp_set_str.split( ' <s>') #words must have space at the front
-            
-        reference_tokenized = tokenizer.encode( ' '+reference.lower().translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
+        li_kp_str = kp_plan_str.split(' <s>') #words must have space at the front
+                   
+        # reference_tokenized = tokenizer.encode( ' '+reference.lower().translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
+        # reference_tokenized = tokenizer.encode( ' '+reference.translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
+        reference_tokenized = tokenizer.encode( reference.translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
 
-        kp_set_str_tokenized = tokenizer.batch_encode_plus( li_kp_str,  add_special_tokens=False )['input_ids']
+        kp_plan_str_tokenized = tokenizer.batch_encode_plus( li_kp_str,  add_special_tokens=False )['input_ids']
 
         li_tokens_posidx = []
         # getting position of tokenized kp in tokenized reference
-        for tokens, word in zip(kp_set_str_tokenized,li_kp_str):
+        for idx1, (tokens, word) in enumerate( zip(kp_plan_str_tokenized,li_kp_str) ):
 
             start_idx = [i for i in range(0,len(reference_tokenized))
                 if reference_tokenized[i:i+len(tokens)]==tokens][:1]
             
             if len(start_idx) == 1:
                 li_tokens_posidx.append( [ tokens, start_idx ] )
+                        
+            else:
+                # adding space before first word - helps cases where first word is surrounded by punctuation
+                tokens2 = tokenizer.encode( " "+li_kp_str[idx1],add_special_tokens=False)
+
+                start_idx2 = [i for i in range(0,len(reference_tokenized))
+                    if reference_tokenized[i:i+len(tokens2)]==tokens2][:1]
+                
+                if len(start_idx2) == 1:
+                    li_tokens_posidx.append( [ tokens2, start_idx2 ] )
+                    
+                else:
+                    # breaking up the words in the kp
+                    li_subwords = word.split(' ')
+                    subword_tknzed = tokenizer.batch_encode_plus( li_subwords,  add_special_tokens=False )['input_ids']
+                    
+                    for tokens1, word1 in zip(subword_tknzed, li_subwords):
+                        start_idx1 = [i for i in range(0,len(reference_tokenized))
+                            if reference_tokenized[i:i+len(tokens1)]==tokens1][:1]
+                        
+                        if len(start_idx) == 1:
+                            li_tokens_posidx.append( [ tokens1, start_idx1 ] )
+                    
         
         # building template
         li_tokens_posidx.sort( key=lambda sub_li: sub_li[1] ) #sort by posix
@@ -431,11 +563,16 @@ def pair_template_maker(  kp_set_str, reference, tokenizer ):
             template_tokens.extend( tokens )
             
             # tempalate_words
-            decoded_tokens = tokenizer.decode(tokens)
-            li_split_text = decoded_tokens.split(' ')[1:]
+            # decoded_tokens = tokenizer.decode(tokens)
+            
+            # li_split_text = decoded_tokens.split(' ')[1:]
+            li_split_text = [ re.sub( "^ " ,"\u0120" ,tokenizer.decode(subtok)) for subtok in tokens]
+
+            # Adding the \u0120 to start of subwords with leading space to allow interoperability with pair model
+            
             template_text.extend( li_split_text )
     
-        print("Ending pair template maker")
+        # print("Ending pair template maker")
 
         return template_text
 
@@ -450,18 +587,19 @@ def convert_dyploc_to_pair_rst(li_records):
         li_records = copy.deepcopy(li_records)
         
         
-        # positioning keyphrase using dict_pos_edu and kp_set_str
+        # positioning keyphrase using dict_pos_edu and kp_plan_str
         for idx in reversed(range(len(li_records))):
             
             li_records[idx]['li_pos_kp'] = [] # a list of lists. each sublists holds pos and keyphrase
 
-            if 'kp_set_str' in li_records[idx]:
-                kp_set_str = li_records[idx]['kp_set_str']
+            if 'kp_plan_str_1' in li_records[idx]:
+                kp_plan_str = li_records[idx]['kp_plan_str_1']
+                #This uses the kp_plan_str  tjat has <s> between every word not just sentences
             else:
                 li_records.pop(idx)
                 continue
 
-            li_kp = kp_set_str.split(' <s>')
+            li_kp = kp_plan_str.split(' <s>')
 
             dict_pos_edu = li_records[idx]['dict_pos_edu']
             
@@ -491,6 +629,8 @@ def convert_dyploc_to_pair_rst(li_records):
         for idx in range(len(li_records)):
             li_records[idx]['prompt'] = li_records[idx].pop('title', None)
             li_records[idx].pop('kp_set_str', None)
+            li_records[idx].pop('kp_plan_str',None)
+            li_records[idx].pop('kp_plan_str_1',None)
             li_records[idx].pop('reference_sentences',None)
             li_records[idx].pop('branch_input',None)
             li_records[idx].pop('sentence_types',None)
@@ -557,7 +697,7 @@ def _save_data(li_records, dset_section, m_format):
                 
     try:
         # print("Starting saving")
-        li_record_enc = [ { str(k):json.dumps(v) for k,v in dict_.items() } for dict_ in li_records ]
+        li_record_enc = [ { str(k):( v if type(v)==str else json.dumps(v)) for k,v in dict_.items() } for dict_ in li_records ]
                     
         save_dir = os.path.join( "./dataset_cmv/", m_format, dset_section)
         os.makedirs(save_dir, exist_ok=True)
@@ -590,10 +730,10 @@ if __name__ == '__main__':
    
     parser = argparse.ArgumentParser(add_help=True)
     
-    parser.add_argument('-bps','--batch_process_size', default=700,
+    parser.add_argument('-bps','--batch_process_size', default=280,
                              help='', type=int)        
    
-    parser.add_argument('--mp_count', default=12, type=int)
+    parser.add_argument('--mp_count', default=140, type=int)
 
     args = parser.parse_args()
     

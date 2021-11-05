@@ -457,6 +457,7 @@ class Segmenter():
                 re_unk_list.append(t)
                 ori_list.append(or_toked[i])
 
+
         labey_edus = [0]*len(re_unk_list)
         labey_edus[-1] = 1
 

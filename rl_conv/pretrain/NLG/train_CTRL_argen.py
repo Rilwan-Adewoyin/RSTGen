@@ -78,12 +78,13 @@ class CTRL_ArgConfig(CTRLConfig):
                 #TODO: add eos_token_id at the end of generation
 
         self.vocab_size = self.vocab_size + self.arg_token_count
-
         self.max_len_utt = max_len_utt
         self.max_len_title=max_len_title
         self.max_len_claim=max_len_claim
         self.max_len_concepts=max_len_concepts
         self.max_len_target_entities=max_len_target_entities
+        self.max_length = self.max_len_utt+self.max_len_title+self.max_len_claim+self.max_len_concepts+self.max_len_target_entities
+        
         self.eos_token = "</s>"
         self.eos_token_id = self.vocab_size - 1 #246537
         
@@ -255,7 +256,7 @@ class CTRL_ArgTokenizer(CTRLTokenizer, utils.EffeciencyMixin):
 
     @classmethod
     def from_pretrained(cls,
-                        dir_tokenizer="./tokenizers/ctrl_Arg",
+                        dir_tokenizer="./tokenizers/ctrl_arg",
                         base_tokenizer_name="ctrl",
                         **kwargs):  
 
@@ -352,6 +353,11 @@ class TrainingModule(pl.LightningModule):
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
 
+            #Debugging:Freeze embedding layers
+            #Consider only finetuning the new embedding layers
+            # with torch.no_grad():
+                # self.model.transformer.embedding.requires_grad = False
+                # self.model.lm_head.transformer.requries_grad = False
 
         if self.mode in ['inference']:
             self.eval() 
@@ -680,7 +686,7 @@ class TrainingModule(pl.LightningModule):
         if device != 'cpu' and torch.cuda.is_available():
             model = model.to(device)
         
-        tokenizer = CTRL_ArgTokenizer.from_pretrained("./tokenizers/ctrl_arg", local_files_only=True, **mparams)
+        tokenizer = CTRL_ArgTokenizer.from_pretrained("./tokenizers/ctrl_arg", **mparams)
         return model, tokenizer
 
     def forward(self, batch):
@@ -746,7 +752,7 @@ class TrainingModule(pl.LightningModule):
                 os.makedirs(dir_infer, exist_ok=True)
             
             # Generation Params
-            generation_params = {'max_length':200,
+            generation_params = {'max_new_tokens':200,
             'no_repeat_ngram_size': 3,
                                  }
             bad_words = ["<cl>", "<cp>", "<te>","Comment:"]

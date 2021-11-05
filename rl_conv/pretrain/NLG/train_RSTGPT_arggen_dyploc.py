@@ -117,7 +117,7 @@ class RSTGPT2Dyploc(RSTGPT2):
         return mparams
 
     @classmethod
-    def load_model(cls, model_name="RSTGPT2Dyploc", model_version=None, mparams_new={}, device="cuda:0"):
+    def load_model_tokenizer(cls, model_name="RSTGPT2Dyploc", model_version=None, mparams_new={}, device="cuda:0"):
 
         if model_version != None:
             # load from a pretrained RSTGPT2
@@ -136,9 +136,11 @@ class RSTGPT2Dyploc(RSTGPT2):
             mconfig = RSTGPT2DyplocConfig.from_pretrained(
                 mparams['base_model_name'], **mparams)
 
+            model = RSTGPT2Dyploc(mconfig)
+            
             # Loading Training Module
             training_module = RSTGPT2Dyploc_TrainingModule(
-                mconfig, mode='inference')
+                mconfig, mode='inference', model=model)
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
@@ -257,7 +259,7 @@ class RSTTokenizerDyploc(RSTTokenizer):
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
-                dir_tokenizer, local_files_only=True, **kwargs)
+                dir_tokenizer, local_files_only=True, **kwargs, **rst_params)
 
         else:
 
@@ -867,7 +869,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
                 generation_params = copy.deepcopy(self.model.generation_params)
                 generation_params['max_time'] = 45
-                bad_words = ["<|rst|>", "<|kp|>", ]
+                bad_words = ["<|rst|>", "<|kp|>" ]
         
                 bad_words_ids = [self.tokenizer.encode(
                     bad_word) for bad_word in bad_words]

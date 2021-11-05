@@ -17,6 +17,8 @@ from functools import lru_cache
 from itertools import islice
 from pathlib import Path
 from typing import (Any, Dict, Iterator, List, Optional, TypeVar, Tuple, Union)
+from torch.nn import CrossEntropyLoss
+
 
 import einops
 import numpy as np
@@ -425,7 +427,8 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                 
                 decoder_context_rstpos=None,
                 decoder_edu_rstpos=None,
-                curr_edu_pos=None,
+                # decoder_curr_edu_pos=None,
+                # decoder_li_gen_text=None,
 
                 head_mask=None,
                 decoder_head_mask=None,
@@ -511,9 +514,11 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             encoder_attentions=transformer_outputs.encoder_attentions,
         )
 
-        output['curr_edu_pos'] = curr_edu_pos
         output['context_rstpos'] = decoder_context_rstpos
         output['edu_rstpos'] = decoder_edu_rstpos
+        output['decoder_li_gen_text'] = kwargs.get('decoder_li_gen_text',None)
+        output['curr_edu_pos'] = kwargs.get('decoder_curr_edu_pos', None)
+        
 
         return output
 
@@ -535,14 +540,14 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
         rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) 
 
         # Key Phrase context embedding
-        topics_phrase_embed = self.model.encoder.embed_tokens( key_phrase_ids) 
-        topics_rst_pos_embed = self.embed_rst_pos(li_kprstpos) 
-        topics_embed = topics_rst_pos_embed + topics_phrase_embed
+        key_phrases_phrase_embed = self.model.encoder.embed_tokens( key_phrase_ids) 
+        key_phrases_rst_pos_embed = self.embed_rst_pos(li_kprstpos) 
+        key_phrases_embed = key_phrases_rst_pos_embed + key_phrases_phrase_embed
 
         inputs_embeds = torch.cat([
             rst_start_token_embed,
             rst_embed,
-            topics_embed,
+            key_phrases_embed,
             ], axis=-2) * self.model.encoder.embed_scale
 
         # Position Embedding
@@ -581,7 +586,7 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             output = self.generate(None, use_cache=True, **encoded_input, **generation_params)    
             output = output[0]
 
-        decoded_text = self.RSTTokenizer.decode(output, skip_special_tokens=False)
+        decoded_text = self.tokenizer.decode(output, skip_special_tokens=False)
 
         if self.rst_tree_aligned_attention:
             if self.rst_segment_method ==  "fenghirst":    
@@ -613,11 +618,14 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
         ):
         # cut decoder_input_ids if past is used
         if self.rst_tree_aligned_attention:
-            curr_edu_pos = self.get_curr_edu_pos(decoder_input_ids, decoder_edu_rstpos)
+            curr_edu_pos, li_gen_text = self.get_curr_edu_pos(decoder_input_ids, 
+                                                 decoder_edu_rstpos,
+                                                prev_edu_pos=kwargs.get('decoder_curr_edu_pos'),
+                                                 li_gen_text=kwargs.get('decoder_li_gen_text'))
 
             if past is not None:
                 # calculating the new cross attention mask
-                new_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
+                new_cross_attention_mask = self.tokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
                                                                                                 prev_mask = decoder_cross_attention_mask, utt_len = decoder_input_ids.shape[1],
                                                                                                 utterance_ids = decoder_input_ids,
                                                                                                 curr_edu_pos = curr_edu_pos )
@@ -630,7 +638,7 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             else:
                 # calculating the new cross attention mask
                 if decoder_input_ids.shape[1]!= decoder_cross_attention_mask.shape[-2]:
-                    decoder_cross_attention_mask = self.RSTTokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
+                    decoder_cross_attention_mask = self.tokenizer.prepare_cross_attention_mask( context_rst_pos=decoder_context_rstpos,
                                                                                                 prev_mask = decoder_cross_attention_mask,
                                                                                                 utt_len = decoder_input_ids.shape[1],
                                                                                                 utterance_ids = decoder_input_ids,
@@ -645,8 +653,6 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                 decoder_cross_attention_mask = decoder_cross_attention_mask
                 decoder_input_ids = decoder_input_ids
             
-
-        
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
@@ -659,6 +665,8 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             "cross_attn_head_mask": cross_attn_head_mask,
             # change this to avoid caching (presumably for debugging)
             "use_cache": use_cache,
+            "decoder_li_gen_text":li_gen_text,
+            "decoder_curr_edu_pos":curr_edu_pos
         }
 
     def _prepare_encoder_decoder_kwargs_for_generation(
@@ -720,7 +728,7 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
-            tok = training_module.RSTTokenizer
+            tok = training_module.tokenizer
 
             # Deleting checkpoints to free up GPU space
             del checkpoint
@@ -795,6 +803,7 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
 
 class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
     rst_tree_aligned_attention = False  
+    inference_mode = False
 
     # Setting up RST2
 
@@ -832,6 +841,8 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         self.max_len_key_phrase = kwargs.get('max_len_key_phrase',self.max_len_key_phrase)
         self.max_len_utt = kwargs.get('max_len_utt', self.max_len_utt)
         self.max_rst_pos = kwargs.get('max_rst_pos', self.max_rst_pos )
+        self.rst_tree_aligned_attention = kwargs.get('rst_tree_aligned_attention',self.rst_tree_aligned_attention)
+        self.inference_mode = kwargs.get('inference_mode', self.inference_mode)
 
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
@@ -1042,12 +1053,12 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         
         return tnsr_rels, tnsr_ns, tnsr_pos, diff
 
-    def encode_keyphrase(self, topics, li_kprstpos):
+    def encode_keyphrase(self, key_phrases, li_kprstpos):
         """[summary]
 
             Args:
-                topics ([type]): [list of topics (phrases or words)]
-                topics_score ([type]): [list of float scores for each topic relevancy]
+                key_phrases ([type]): [list of key_phrases (phrases or words)]
+                key_phrases_score ([type]): [list of float scores for each topic relevancy]
 
             Raises:
                 Exception: [description]
@@ -1055,28 +1066,35 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             Returns:
                 [type]: [description]
         """
-        if len(topics)!=0:
+        if len(key_phrases)!=0:
             max_len = self.max_len_key_phrase
 
-            if len(topics) >= max_len/2:
-                indexes = list(range(len(topics)))
+            if self.inference_mode == False:
+            
+                indexes = list(range(len(key_phrases)))
                 random.shuffle(indexes)
-                topics, li_kprstpos = list( zip(*[ (topics[idx] ,li_kprstpos[idx]) for idx in indexes ] ) )
+                key_phrases, li_kprstpos = list( zip(*[ (key_phrases[idx] ,li_kprstpos[idx]) for idx in indexes ] ) )
+    
+                # Randomly selecting to keep n, 0<n<kp_count, of the kps
+                kp_count = len(key_phrases)
+                kps_to_keep = random.randint(0,kp_count) 
+                key_phrases = key_phrases[:kps_to_keep]
+                li_kprstpos = li_kprstpos[:kps_to_keep]
                 
-            str_topics = '<kp> ' + '<kp> '.join(topics)
+            str_key_phrases = '<kp> ' + '<kp> '.join(key_phrases)
 
-            dict_encoding = self(str_topics, add_special_tokens=False,
+            dict_encoding = self(str_key_phrases, add_special_tokens=False,
                                 return_attention_mask=False,
                                 truncation=True,
                                 padding='do_not_pad',
                                 return_tensors='np',
                                 max_length=max_len,
                                 return_special_tokens_mask=False,
-                                return_length=True)
+                                return_length=False)
             topic_phrases = dict_encoding['input_ids'][0]
 
             # Repeating each score in the case where the score is allocated to a phrase topic which is broken down into constituent words
-            # e.g. topics - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
+            # e.g. key_phrases - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
             # have to do it after tokenization due to bytepair encoding
             # get index of where <kp> tokens occur
             kp_idxs = np.where(
@@ -1362,7 +1380,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
-                dir_tokenizer, local_files_only=True, **kwargs)
+                dir_tokenizer, local_files_only=True, **kwargs, **rst_params)
 
         else:
             additional_special_tokens = kwargs.pop(
@@ -1386,7 +1404,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()        
 
         for k, v in rst_params.items():
-            setattr(cls, k, v)
+            setattr(tokenizer, k, v)
 
         return tokenizer
 
@@ -1415,7 +1433,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
         self.workers = workers
         self.batching_style = batching_style
         self.optimizer = optimizer
-        self.RSTTokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
+        self.tokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
@@ -1456,7 +1474,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             'decoder_context_rstpos': -1
                            }
         
-        self.RSTTokenizer.pad_values = self.pad_values
+        self.tokenizer.pad_values = self.pad_values
 
         self.pad_maxlens = {
             'rst_start_token': 1,
@@ -1479,16 +1497,16 @@ class RSTBart_TrainingModule(pl.LightningModule):
             'decoder_context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase
 
         }
-        self.RSTTokenizer.pad_maxlens = self.pad_maxlens
+        self.tokenizer.pad_maxlens = self.pad_maxlens
         
-        self.model.RSTTokenizer = self.RSTTokenizer
+        self.model.tokenizer = self.tokenizer
 
         if self.mode in ['train_new', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
-            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.RSTTokenizer,
+            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
                                  batching_style=self.batching_style
@@ -1498,7 +1516,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 self.create_data_loaders(['test'])
             else:
                 self.create_data_loaders(['train', 'val', 'inference'] )
-                self.inference_samples = list(islice(self.inference_dl, 3))
+                self.tokenizer.inference_mode = True
+                self.inference_samples = list(islice(self.inference_dl, 2))
+                self.tokenizer.inference_mode = False
                 del self.inference_dl
 
         if self.mode in ['train_new', 'train_cont']:
@@ -1885,7 +1905,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 # If there file does not exists we add the true observed records
                 if not os.path.exists(fp):
 
-                    df = pd.DataFrame(columns=['epoch', 'rst_rels', 'topics', 'utterance',
+                    df = pd.DataFrame(columns=['epoch', 'rst_rels', 'key_phrases', 'utterance',
                                             'dict_pos_edu', 'li_kprstpos',
 
                                             'rst_ns',
@@ -1896,7 +1916,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     rst_ns = encoded_input.pop('orig_rst_ns')
                     rst_pos = encoded_input.pop('orig_rst_pos')
 
-                    topics = encoded_input.pop('orig_key_phrase')
+                    key_phrases = encoded_input.pop('orig_key_phrase')
                     utterance = encoded_input.pop('orig_utt')
                     dict_pos_edu = encoded_input.pop('orig_dict_pos_edu')
 
@@ -1909,7 +1929,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                         'rst_ns': ', '.join(rst_ns),
                         'rst_pos': rst_pos,
 
-                        "topics": ', '.join(topics),
+                        "key_phrases": ', '.join(key_phrases),
                         "utterance": utterance,
                         "dict_pos_edu": json.dumps(dict_pos_edu),
 
@@ -1938,7 +1958,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 datum = {
                     'epoch': self.current_epoch,
                     'rst_rels': '',
-                    'topics': '',
+                    'key_phrases': '',
                     'utterance': json.dumps(decoded_text),
                     'dict_pos_edu': '',
                     'li_kprstpos': '',

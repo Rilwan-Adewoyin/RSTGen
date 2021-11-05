@@ -2,7 +2,7 @@ import os
 
 # os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import string
 import argparse
 import copy
@@ -114,7 +114,7 @@ class RSTGPT2Pair(RSTGPT2):
         return mparams
 
     @classmethod
-    def load_model(cls, model_name="RSTGPT2Pair", model_version=None, mparams_new={}, device="cuda:0"):
+    def load_model_tokenizer(cls, model_name="RSTGPT2Pair", model_version=None, mparams_new={}, device="cuda:0"):
 
         if model_version != None:
             # load from a pretrained RSTGPT2
@@ -133,9 +133,11 @@ class RSTGPT2Pair(RSTGPT2):
             mconfig = RSTGPT2PairConfig.from_pretrained(
                 mparams['base_model_name'], **mparams)
 
+            model = RSTGPT2Pair(mconfig)
+
             # Loading Training Module
             training_module = RSTGPT2Pair_TrainingModule(
-                mconfig, mode='inference')
+                mconfig, mode='inference', model=model)
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
@@ -165,7 +167,7 @@ class RSTTokenizerPair(RSTTokenizer):
         
         self.pad_token =  self.eos_token
         self.max_len_title = kwargs.get( 'max_len_title' , self.max_len_title)
-        
+
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, title='', max_title_len=None):
        
         encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_len_rst=max_len_rst, max_len_key_phrase=max_len_key_phrase, exclude_from_output=exclude_from_output, device=device)
@@ -219,7 +221,7 @@ class RSTTokenizerPair(RSTTokenizer):
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
-                dir_tokenizer, local_files_only=True, **kwargs)
+                dir_tokenizer, local_files_only=True, **kwargs, **rst_params)
 
         else:
 
@@ -348,8 +350,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
-                                 batching_style=self.batching_style
-                                 )
+                                 batching_style=self.batching_style)
 
             if self.mode == "test":
                 self.create_data_loaders(['test'])

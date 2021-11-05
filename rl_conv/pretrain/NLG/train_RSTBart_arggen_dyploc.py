@@ -113,7 +113,7 @@ class RSTBartDyploc(RSTBart):
         return mparams
 
     @classmethod
-    def load_model(cls, model_name="RSTBartDyploc", model_version=None, mparams_new={}, device="cuda:0"):
+    def load_model_tokenizer(cls, model_name="RSTBartDyploc", model_version=None, mparams_new={}, device="cuda:0"):
 
         if model_version != None:
             # load from a pretrained RSTBart
@@ -133,12 +133,14 @@ class RSTBartDyploc(RSTBart):
                 mparams['base_model_name'], **mparams)
 
             # Loading Training Module
+            model = RSTBartDyploc(mconfig)
+
             training_module = RSTBartDyploc_TrainingModule(
-                mconfig, mode='inference')
+                mconfig, mode='inference', model=model)
             training_module.load_state_dict(checkpoint['state_dict'])
 
             model = training_module.model
-            tok = training_module.RSTTokenizer
+            tok = training_module.tokenizer
 
             # Deleting checkpoints to free up GPU space
             del checkpoint
@@ -337,7 +339,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
         self.batching_style = batching_style
         
         if tokenizer  == None:
-            self.RSTTokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
+            self.tokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
@@ -351,7 +353,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                                                                      }
                                                          )
         else:
-            self.RSTTokenizer = tokenizer
+            self.tokenizer = tokenizer
 
         if model is not None:
             self.model = model
@@ -388,7 +390,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
                             'decoder_context_rstpos': -1
                            }
         
-        self.RSTTokenizer.pad_values = self.pad_values
+        self.tokenizer.pad_values = self.pad_values
 
         self.pad_maxlens = {
             'rst_start_token': 1,
@@ -411,16 +413,16 @@ class RSTBartDyploc_TrainingModule(LightningModule):
             'decoder_edu_rstpos': mconfig.max_rst_pos // 2,
             'decoder_context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase
         }
-        self.RSTTokenizer.pad_maxlens = self.pad_maxlens
+        self.tokenizer.pad_maxlens = self.pad_maxlens
         
-        self.model.RSTTokenizer = self.RSTTokenizer
+        self.model.tokenizer = self.tokenizer
 
         if self.mode in ['finetune', 'train_cont', 'test']:
             self.dir_data = utils.get_path(dir_data)
             self.accumulate_grad_batches = accumulate_grad_batches
             self.tag = tag
 
-            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.RSTTokenizer,
+            self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
                                  batching_style=self.batching_style,
@@ -885,7 +887,7 @@ class RSTBartDyploc_TrainingModule(LightningModule):
 
                 bad_words = ["<rst>", "<kp>", "<pad>", "<cl>", "<tl>"]
         
-                bad_words_ids = [self.RSTTokenizer.encode(
+                bad_words_ids = [self.tokenizer.encode(
                     bad_word) for bad_word in bad_words]
                 bad_words_ids = bad_words_ids 
                 

@@ -1,11 +1,11 @@
 import os
 import json
-from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers
 dirname = os.path.dirname(__file__)
 from datetime import date
 
-from itertools import (combinations, combinations_with_replacement, cycle,
-                       islice, permutations)
+from itertools import (combinations, combinations_with_replacement, 
+                       cycle, islice, permutations)
 import random
 import regex as re
 import torch
@@ -29,14 +29,15 @@ import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate_err_msg_format
 from math import floor
 import regex as re
+from train_RSTGPT import RSTTokenizer
 
 pattern_punctuation_space = re.compile(r'\s([?.!";:#_](?:\s|$))')
 pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
-             "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
-                                          # but not after an acronym
-             "\w(?:\.\w)|"+               # start/middle of acronym
-             "(?<=\w\.)\w",               # end of acronym
-             )
+                "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
+                                            # but not after an acronym
+                "\w(?:\.\w)|"+               # start/middle of acronym
+                "(?<=\w\.)\w",               # end of acronym
+                )
 pattern_apostrophe = re.compile(r"\b\s+'\b")
 pattern_brackets_rm_space = re.compile('\(\s*(.*?)\s*\)')
 
@@ -77,44 +78,6 @@ def get_path(_path,_dir=False):
 
     return _path
 
-def load_pretrained_transformer( model_name='bert-base-cased', transformer=True, 
-                                    tokenizer=False):
-    _dir_transformer = os.path.join( get_path("./models"), model_name )
-    exists = os.path.isdir(_dir_transformer)
-    output = {}
-
-    if exists == False:    
-        model_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        #model = AutoModel.from_pretrained(model_name)
-        model = GPT2LMHeadModel.from_pretrained(model_name)
-
-        model_tokenizer.save_pretrained(_dir_transformer)
-        model.save_pretrained(_dir_transformer)
-
-    if tokenizer == True:
-        output['tokenizer'] = AutoTokenizer.from_pretrained(_dir_transformer)
-
-    if transformer == True:
-        output['transformer'] = GPT2LMHeadModel.from_pretrained(_dir_transformer)
-    
-    return output 
-
-def load_pretrained_tokenizer_local( model_name='NLG'):
-
-    _dir_tknzr = os.path.join( get_path("./models",_dir=True), model_name )
-    exists = os.path.isdir(_dir_tknzr)
-
-    if exists == True:    
-        if model_name == "NLG":
-            tknzr =  AutoTokenizer.from_pretrained(_dir_tknzr)
-            res = tknzr
-        else:
-            raise ValueError()
-    else:
-        res = False
-    
-    return res
-
 def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     dated_trained = date.today().strftime("%d-%m-%Y")
     
@@ -130,7 +93,6 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     json.dump( vars(m_params), open(mp_fp,"w") )
 
     return True    
-
 #endregion 
 
 #region Monkey Patches the save module
@@ -215,44 +177,355 @@ rst_rel_li = ['Attribution',
 #region RST Framework Class
 class RstModelMixin():
 
-    def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos):
+    # segmentation helpers
+    cue_phrases = ['above all',
+            'accordingly',
+            'actually',
+            'admittedly',
+            'after',
+            'after',
+            'after all',
+            'after that',
+            'afterwards',
+            'again',
+            'all in all',
+            'all the same',
+            'also',
+            'alternatively',
+            'although',
+            'always assuming that',
+            'and',
+            'and / or',
+            'anyway',
+            'as',
+            'as a consequence',
+            'as a corollary',
+            'as a result',
+            'as long as',
+            'as soon as',
+            'as well',
+            'at any rate',
+            'at first',
+            'at first blush',
+            'at first sight',
+            'at first view',
+            'at the moment when',
+            'at the outset',
+            'at the same time',
+            'because',
+            'before',
+            'before',
+            'but',
+            'by comparison',
+            'by contrast',
+            'by the same token',
+            'by the way',
+            'certainly',
+            'clearly',
+            'consequently',
+            'conversely',
+            'correspondingly',
+            'despite that',
+            'despite the fact that',
+            'earlier',
+            'either',
+            'else',
+            'equally',
+            'essentially, then',
+            'even',
+            'even so',
+            'even then',
+            'eventually',
+            'every time',
+            'except',
+            'except insofar as',
+            'finally',
+            'first',
+            'first of all',
+            'firstly',
+            'for',
+            'for a start',
+            'for example',
+            'for instance',
+            'for one thing',
+            'for the simple reason',
+            'for this reason',
+            'further',
+            'furthermore',
+            'given that',
+            'hence',
+            'however',
+            'if',
+            'if ever',
+            'if not',
+            'if only',
+            'if so',
+            'in a different vein',
+            'in actual fact',
+            'in addition',
+            'in any case',
+            'in case',
+            'in conclusion',
+            'in contrast',
+            'in fact',
+            'initially',
+            'in other words',
+            'in particular',
+            'in short',
+            'in spite of that',
+            'in sum',
+            'in that case',
+            'in the beginning',
+            'in the case of',
+            'in the end',
+            'in the first place',
+            'in the meantime',
+            'in this way',
+            'in turn',
+            'inasmuch as',
+            'incidentally',
+            'indeed',
+            'instead',
+            'it follows that',
+            'it might appear that',
+            'it might seem that',
+            'just as',
+            'last',
+            'lastly',
+            'later',
+            'let us assume',
+            'likewise',
+            'meanwhile',
+            'merely',
+            'merely because',
+            'more',
+            'moreover',
+            'most',
+            'much later',
+            'much sooner',
+            'naturally',
+            'neither is it the case',
+            'nevertheless',
+            'next',
+            'no doubt',
+            'nonetheless',
+            'not',
+            'not because',
+            'not only',
+            'not that',
+            'notably',
+            'notwithstanding that',
+            'notwithstanding that ,',
+            'now',
+            'now that',
+            'obviously',
+            'of course',
+            'on condition that',
+            'on one hand',
+            'on one side',
+            'on the assumption that',
+            'on the contrary',
+            'on the grounds that',
+            'on the one hand',
+            'on the one side',
+            'on the other hand',
+            'on the other side',
+            'once',
+            'once again',
+            'once more',
+            'or',
+            'or else',
+            'otherwise',
+            'overall',
+            'plainly',
+            'presumably because',
+            'previously',
+            'provided that',
+            'providing that',
+            'put another way',
+            'rather',
+            'reason',
+            'reciprocally',
+            'regardless of that',
+            'second',
+            'secondly',
+            'similarly',
+            'simply because',
+            'simultaneously',
+            'since',
+            'so',
+            'so that',
+            'specifically',
+            'still',
+            'subsequently',
+            'such that',
+            'summarising',
+            'summarizing',
+            'summing up',
+            'suppose',
+            'suppose that',
+            'supposing that',
+            'sure enough',
+            'surely',
+            'that is',
+            'that is to say',
+            'the fact is that',
+            'the more often',
+            'then',
+            'then again',
+            'thereafter',
+            'thereby',
+            'therefore',
+            'think',
+            'third',
+            'thirdly',
+            'this time',
+            'though',
+            'thus',
+            'to be sure',
+            'to begin with',
+            'to conclude',
+            'to start with',
+            'to sum up',
+            'to summarise',
+            'to summarize',
+            'to take an example',
+            'to the degree that',
+            'to the extent that',
+            'too',
+            'true',
+            'ultimately',
+            'undoubtedly',
+            'unless',
+            'until',
+            'we might say',
+            'what is more',
+            'when',
+            'whenever',
+            'where',
+            'whereas',
+            'wherein',
+            'wherever',
+            'while',
+            'yet']
+
+    punct_end_edu = "!),.:;?"
+    punct_start_edu = "("
+
+    def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos, prev_edu_pos=None, li_gen_text=None):
         """
         li_edu_rst_pos: the list of possible edus positions for each text in this batch
         """
         
-        # Decode the output ids to get a text
-        li_gen_text = [self.RSTTokenizer.decode(
-            ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
+        # Updating record of currently generated texts
+        if li_gen_text == None:
+            # Creating whole string for input_ids
+            li_gen_text = [self.tokenizer.decode(
+                ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
+        else:
+            # Generating the newest word for each text  and appending it to text 
+            li_new_text = [self.tokenizer.decode( 
+                            ids[-1:], skip_special_tokens=True) for ids in torch.unbind(decoder_input_ids, 0 ) ]
+            li_gen_text = [
+                gen_text+new_text for gen_text,new_text in zip(li_gen_text, li_new_text)
+            ]
+                            
+        # # Decode the output ids to get a text
+        # li_gen_text = [self.tokenizer.decode(
+        #     ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
 
-        if self.rst_segment_method == "fenghirst":
+        # Checking whether or not to use previous edu_pos or new edu_pos
+        bool_use_old_edu_pos = [ True ] *len( li_gen_text )
         
-            li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text)
-            # calculating edu of current text
-            li_edu_count = [
-                ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
+            #Punctuation check
+            # cue_phrase_check
+        for idx in range(len(li_gen_text)):
+            # If an edu end punctuation occurs we advance to next edu
+            if li_gen_text[idx][ -1:] in self.punct_end_edu:
+                bool_use_old_edu_pos[idx] = True
+                new_rst_pos_idx = edu_rstpos[idx].index( prev_edu_pos[idx] ) + 1 #finding idx of new rst_pos in edu_rstpos. simply take the next idx
 
-            # removing any padding
-            edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-                as_tuple=True)[0]] for tens in edu_rstpos][0]
+                
+            # If a edu start punctuation occurs we advance to the next edu if the previous edu is the same as the previous previous edu
+            elif li_gen_text[idx][ -1:] in self.punct_start_edu:
+                bool_use_old_edu_pos[idx] = True
+                
+                prev_edu_idx = edu_rstpos[idx].index( prev_edu_pos[idx] )      
+                prev_prev_edu_idx = max( prev_edu_idx-1, 0 )
+                
+                #Check that edu_rstpos has changed between prev two positions
+                bool_check = edu_rstpos[idx][prev_prev_edu_idx] != edu_rstpos[prev_edu_pos]
+                bool_use_old_edu_pos[idx] = not bool_check
 
-            # selecting approapriate edu value.
-            curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
-                            for edu_count in li_edu_count]
-        
-        elif self.rst_segment_method == "segbot":
-            li_segmented_text = self.segmenter.segment_li_utterances(li_gen_text)
+            # If a cue phrase occurs we advance to the next edu if??
+            elif any( ( li_gen_text[idx][ -len(word):] == "word" for word in self.cue_phrases )  ):
             
-            li_edu_count = [ len(seg_text) for seg_text in li_segmented_text ]
+                new_rst_pos_idx = 
+            
+            else:
+                continue
+            
+            #removing padding from edu_rstpos[idx]
+            edu_rstpos[idx] = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                as_tuple=True)[0]] for tens in edu_rstpos[idx:idx+1]][0][0]
+            new_rst_pos_idx = min( len(edu_rstpos[idx])-1, new_rst_pos_idx[idx] )
+                
+            prev_edu_pos[idx] = edu_rstpos[idx][new_rst_pos_idx]
+        
+        # Getting new segmentation for gen_texts that are valid for re-evaluation - using the segmenter
+        if any(bool_use_old_edu_pos):
+            if self.rst_segment_method == "fenghirst":
+                
+                idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
+                li_gen_text_filtr = [ gen_text for idx,gen_text in enumerate(li_gen_text) if idx in idxs_to_update]
+                
+                li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text_filtr)
+                # calculating edu of current text
+                li_edu_count = [
+                    ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
 
-          # removing any padding
-            edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-                as_tuple=True)[0]] for tens in edu_rstpos][0]
+                # removing any paddingo
+                edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                    as_tuple=True)[0]] for tens in edu_rstpos][0]
+
+                # selecting approapriate edu value.
+                curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
+                                for edu_count in li_edu_count]
+                
+                # Adding back to original list
+                _ = [ curr_edu_pos[idx].pop(0) if idx in idxs_to_update else prev_edu_pos[idx] for idx in range(len(li_gen_text))  ]
+                
+                # Ensuring each curr_edu_pos is at least as large as the prev_edu_pos
+                if prev_edu_pos != None:
+                    _ = [ max( [ curr_pos, prev_pos] , key=RSTTokenizer.edukp_pos_sort_function ) 
+                                    for curr_pos, prev_pos in zip(curr_edu_pos, prev_edu_pos)  ]
+                curr_edu_pos = _
+                
+            elif self.rst_segment_method == "segbot":
+
+                idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
+                li_gen_text_filtr = [ gen_text for idx,gen_text in enumerate(li_gen_text) if idx in idxs_to_update]
+                
+                li_segmented_text = self.segmenter.segment_li_utterances(li_gen_text_filtr)
+                
+                li_edu_count = [ len(seg_text) for seg_text in li_segmented_text ]
+
+                # removing any padding
+                edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                    as_tuple=True)[0]] for tens in edu_rstpos][0]
+                            
+                curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
+                                for edu_count in li_edu_count]
+
+                # Adding back to original list
+                _ = [ curr_edu_pos.pop(0) if idx in idxs_to_update else prev_edu_pos[idx] for idx in range(len(li_gen_text))  ]
+                curr_edu_pos = _
                         
-            curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
-                            for edu_count in li_edu_count]
-            
+        else:
+            curr_edu_pos =  prev_edu_pos                
 
-        return curr_edu_pos 
+        return curr_edu_pos, li_gen_text 
+
 
 #endregion
 
@@ -366,7 +639,6 @@ class RstTokenizerMixin():
             pos = RstTokenizerMixin.parent_node(pos)
         return pos
 
-
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
             """
                 Allows the user to select partiuclar rst_vectors in order to control their output
@@ -426,8 +698,10 @@ class RstTokenizerMixin():
 
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
+    
     def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
                     init_val=0.05, std=0.02):
+        
         super(EmbeddingRstPos, self).__init__()
 
         self.max_rst_index = max_rst_index
@@ -710,7 +984,7 @@ def split(sequence, sep):
     yield chunk
 
 def non_parseable_remover(li_dict_rsttext):
-    print("Start non parseable remover")
+    # print("Start non parseable remover")
     if len(li_dict_rsttext) == 0:
         return li_dict_rsttext
 
@@ -738,7 +1012,7 @@ def non_parseable_remover(li_dict_rsttext):
 
             #making dict_pos_edu and li_edus again
     
-    print("End non parseable remover")
+    # print("End non parseable remover")
     return li_dict_rsttext
 
 def position_edus(li_dict_rsttext):
