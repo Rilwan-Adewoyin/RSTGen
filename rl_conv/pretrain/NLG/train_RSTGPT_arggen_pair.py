@@ -867,7 +867,8 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
     def configure_optimizers(self):
 
         optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
-                        relative_step=True, warmup_init=True, lr=None )
+                        relative_step=True, warmup_init=True, lr=None,
+                        weight_decay=0.01)
 
         lr_scheduler = AdafactorSchedule(optimizer)
 
@@ -1046,8 +1047,8 @@ class SingleDataset(Dataset):
             file_path), f"gpt2_dict_lens.pkl")
 
         # # # resetting the cached order files
-        # if os.path.exists( fp_cached_order):
-        #     os.remove(fp_cached_order)
+        if os.path.exists( fp_cached_order):
+            os.remove(fp_cached_order)
 
     
         if os.path.exists(fp_cached_order):
@@ -1113,7 +1114,9 @@ class SingleDataset(Dataset):
 
         if self.inference == True:
 
-            utterance_prompt = ' '.join(utterance.split(' ')[:2])
+            # utterance_prompt = ' '.join(utterance.split(' '))
+            utterance_prompt = ""
+
             encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
                                                   li_kp=li_kp,
                                                   li_kprstpos=li_kprstpos,

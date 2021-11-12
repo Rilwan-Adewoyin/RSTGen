@@ -505,7 +505,7 @@ class RSTPlanner():
             cond_distr  = self.renormalize_probs(cond_distr)
         
         #reduction of feature space part 1 - removing rst relations to be ingored
-        if reduce_rel_space == True: 
+        if False and reduce_rel_space == True: 
                                             # Attribution 
                                             # Background -> Combine with 
                                             # Cause -> Combine with Explanation, 
@@ -527,9 +527,10 @@ class RSTPlanner():
             ignore_list = ['n','same-unit','Topic-Change']
             cond_distr = { k:v for k,v in cond_distr.items() if json.loads(k)['rel'] not in ignore_list }
             #source key mapped to target val. Essentially incrase the target key count
-            mapping_dict = {'Cause':"Explanation"}
-            for k in mapping_dict.keys():
-                cond_distr[mapping_dict[k]][2] += cond_distr.pop(k,0)[2] 
+            # mapping_dict = {'Cause':"Explanation"}
+            #TODO: add this in
+            # for k in mapping_dict.keys():
+            #     cond_distr[mapping_dict[k]][2] += cond_distr.pop(k,0)[2] 
                             
             cond_distr  = self.renormalize_probs(cond_distr)
             

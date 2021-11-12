@@ -1,6 +1,9 @@
 import os
 import json
-from transformers
+from torch._C import Value
+
+from transformers.generation_utils import GenerationMixin
+
 dirname = os.path.dirname(__file__)
 from datetime import date
 
@@ -12,7 +15,7 @@ import torch
 from pytorch_lightning.callbacks import Callback
 
 from torch import nn
-from typing import Optional, Callable, Union, Optional, List, Iterable, Tuple
+from typing import DefaultDict, Optional, Callable, Union, Optional, List, Iterable, Tuple
 import numpy as np
 import copy
 
@@ -29,7 +32,6 @@ import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate_err_msg_format
 from math import floor
 import regex as re
-from train_RSTGPT import RSTTokenizer
 
 pattern_punctuation_space = re.compile(r'\s([?.!";:#_](?:\s|$))')
 pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
@@ -48,6 +50,7 @@ sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
 nlp = en_core_web_sm.load()
 
 from spacy.language import Language
+from transformers.generation_logits_process import LogitsProcessor, _get_generated_ngrams
 
 try:
     nlp.add_pipe("textrank", last=True)
@@ -135,7 +138,6 @@ def mpatch_save_model(func):
         self.to_yaml()
 
     return inner
-
 
 #region RST helper
 
@@ -409,77 +411,186 @@ class RstModelMixin():
             'while',
             'yet']
 
-    punct_end_edu = "!),.:;?"
-    punct_start_edu = "("
+    li_adding = 'also, moreover, furthermore, additionally, besides, in addition'.split(', ')
+    li_comparing = 'similarly, likewise, in the same way'.split(', ')
+    li_generalizing = 'on the whole, in general, broadly speaking, as a rule, in most cases'
+    li_showing_cause_effect = 'therefore, thus, consequently, hence, as a result'
+    li_contrasting = 'however, although, whereas, despite this fact, on one hand, on the other hand, on the contrary, still, nonetheless, instead, alternatively, in contrast, but'.split(', ')
+    li_sequencing = "firstly, at first, first of all, in the first place, to begin with, in the beginning, once upon a time, secondly, thirdly, subsequently, earlier, meanwhile, later, afterwards, what's more, for a start".split(', ')
+    li_emphasizing = 'above all, specially, in particular, specifically, as a matter of fact, more importantly'.split(', ')
+    li_repeating = 'again and again, over and over, once again, as stated'.split(', ')
+    li_examples = 'for example, for instance, such as, namely, in other words'.split(', ')
+    li_concluding = 'in conclusion, finally, to sum it up, in the end, lastly, in short, eventually'.split(', ')
+    li_temporal = 'when, finally, so, instead, later, after, eventually, at last'.split(', ')
 
-    def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos, prev_edu_pos=None, li_gen_text=None):
+    discourse_markers = {'adding':li_adding,
+                        'comparing':li_comparing,
+                        'generalizing':li_generalizing,
+                        'showing_cause_effect':li_showing_cause_effect,
+                        'contrasting':li_contrasting,
+                        'sequencing':li_sequencing,
+                        'emphasizing':li_emphasizing,
+                        'repeating':li_repeating,
+                        'examples':li_examples,
+                        'concluding':li_concluding,
+                        'temporal':li_temporal
+                        }
+    punct_end_edu = []
+    punct_end_edu.extend("!),.:;?")
+    punct_start_edu = []
+    punct_start_edu.extend("(")
+
+    def get_curr_edu_pos(self, decoder_input_ids, edu_rstpos, li_gen_text=None):
         """
         li_edu_rst_pos: the list of possible edus positions for each text in this batch
         """
         
+        num_hypos = decoder_input_ids.shape[0]
+        num_beams = num_hypos // edu_rstpos.shape[0]
+             
         # Updating record of currently generated texts
         if li_gen_text == None:
             # Creating whole string for input_ids
-            li_gen_text = [self.tokenizer.decode(
-                ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
+            li_gen_text = [ self.tokenizer.decode(ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
+        
         else:
             # Generating the newest word for each text  and appending it to text 
-            li_new_text = [self.tokenizer.decode( 
-                            ids[-1:], skip_special_tokens=True) for ids in torch.unbind(decoder_input_ids, 0 ) ]
-            li_gen_text = [
-                gen_text+new_text for gen_text,new_text in zip(li_gen_text, li_new_text)
-            ]
+            li_new_text = [ self.tokenizer.decode( ids[-1:], skip_special_tokens=True) for ids in torch.unbind(decoder_input_ids, 0 ) ]
+            li_gen_text = [ gen_text+new_text for gen_text,new_text in zip(li_gen_text, li_new_text) ]
                             
-        # # Decode the output ids to get a text
-        # li_gen_text = [self.tokenizer.decode(
-        #     ids, skip_special_tokens=True) for ids in torch.unbind( decoder_input_ids,0) ]
-
         # Checking whether or not to use previous edu_pos or new edu_pos
-        bool_use_old_edu_pos = [ True ] *len( li_gen_text )
-        
-            #Punctuation check
-            # cue_phrase_check
-        for idx in range(len(li_gen_text)):
-            # If an edu end punctuation occurs we advance to next edu
-            if li_gen_text[idx][ -1:] in self.punct_end_edu:
-                bool_use_old_edu_pos[idx] = True
-                new_rst_pos_idx = edu_rstpos[idx].index( prev_edu_pos[idx] ) + 1 #finding idx of new rst_pos in edu_rstpos. simply take the next idx
+        # Initially we assume old edu_positions are used
+        # First we check if generated_text[idx] had its segmented updated in the previous round. 
+        if not hasattr(self, 'consecutive_steps_prev_edu_used'):
+            self.consecutive_steps_prev_edu_used = [0]*num_hypos
+        if not hasattr(self, 'prev_edu_pos'):
+            self.prev_edu_pos = [ decoder_input_ids.new_tensor( [] ) for idx in range(num_hypos) ]
+            curr_edu_pos = [None]* num_hypos
+        else:
+            # curr_edu_pos = [self.prev_edu_pos[idx][-1:] for idx in range(num_hypos)]
+            curr_edu_pos = [self.prev_edu_pos[idx][-1] for idx in range(num_hypos)]
 
-                
-            # If a edu start punctuation occurs we advance to the next edu if the previous edu is the same as the previous previous edu
-            elif li_gen_text[idx][ -1:] in self.punct_start_edu:
-                bool_use_old_edu_pos[idx] = True
-                
-                prev_edu_idx = edu_rstpos[idx].index( prev_edu_pos[idx] )      
-                prev_prev_edu_idx = max( prev_edu_idx-1, 0 )
-                
-                #Check that edu_rstpos has changed between prev two positions
-                bool_check = edu_rstpos[idx][prev_prev_edu_idx] != edu_rstpos[prev_edu_pos]
-                bool_use_old_edu_pos[idx] = not bool_check
+        for idx in range(num_hypos):
+            
+            # Automated Checks to Increase edu pos                                
+            #CASE: first generated token and no context utterance
+            if self.prev_edu_pos[0].numel() == 0 and decoder_input_ids.shape[1] == 1: 
+                # curr_edu_pos = [ edu_rstpos[idx//num_beams][:1]  for idx in range(num_hypos) ]
+                curr_edu_pos = [ edu_rstpos[idx//num_beams][0]  for idx in range(num_hypos) ]
+                self.consecutive_steps_prev_edu_used = [1]*num_hypos
+                break
+            
+            #CASE: first generated token and context utterance
+            elif self.prev_edu_pos[0].numel() == 0 and decoder_input_ids.shape[1] > 1: 
+                #We Segment all texts together
+                if self.rst_segment_method == "fenghirst":
+                    raise NotImplementedError
+                elif self.rst_segment_method == "segbot":
+                    # use segmenter to count up to equivalent edu
+                    li_segmented_text = self.segmenter.segment_li_utterances(li_gen_text)
+                    
+                    li_edu_count = [ len(seg_text) for seg_text in li_segmented_text ]
 
-            # If a cue phrase occurs we advance to the next edu if??
-            elif any( ( li_gen_text[idx][ -len(word):] == "word" for word in self.cue_phrases )  ):
+                    edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
+                        as_tuple=True)[0][0]] for tens in edu_rstpos]
+                                        
+                    pos = [ min(edu_rstpos[idx//num_beams].numel()-1, max(0, edu_count-1)) for idx, edu_count in enumerate(li_edu_count) ]
+
+                    # curr_edu_pos = [ edu_rstpos[idx//num_beams][ pos:pos+1 ] for idx, pos in enumerate(pos) ]
+                    curr_edu_pos = [ edu_rstpos[idx//num_beams][ pos ] for idx, pos in enumerate(pos) ]
+                else:
+                    raise ValueError
+                
+                self.consecutive_steps_prev_edu_used = [1]*num_hypos
+                break
+
+            #CASE: Check we have not use previous edu too many times
+            elif self.consecutive_steps_prev_edu_used[idx] >= 3:
+                # We do not allow segmentation checks for two consecutive rounds                
+                self.consecutive_steps_prev_edu_used[idx] = 0
+                curr_edu_pos[idx] = None
+                
+            #Case: END PUNCTUATION is previosly generated token - we advance to next EDU  
+            elif li_gen_text[idx][ -1:] in self.punct_end_edu:
+
+                # bool_use_old_edu_pos[idx] = True
+                new_rst_pos_idx = (edu_rstpos[idx//num_beams] == self.prev_edu_pos[idx][-1]).nonzero(as_tuple=True)[0][-1] + 1
+                
+                # Ensuring index is not out of edu_rstpos         
+                temp = edu_rstpos[idx//num_beams]
+                edu_rstpos_nopad = temp if not (-1 in temp) else temp[:(temp == -1).nonzero(
+                    as_tuple=True)[0][0]]
+                new_rst_pos_idx = min( len(edu_rstpos_nopad)-1, new_rst_pos_idx )
+                
+                # Preventing EDU rstpos prediction from going backwards 
+                # print(new_rst_pos_idx) 
+                # print(edu_rstpos_nopad[new_rst_pos_idx].tolist())
+                # print(self.prev_edu_pos[idx][-1].tolist())
+                new_rst_pos = max(  edu_rstpos_nopad[new_rst_pos_idx].tolist(), self.prev_edu_pos[idx][-1].tolist(), key=RstTokenizerMixin.edukp_pos_sort_function  )
+                new_rst_pos = torch.tensor( [new_rst_pos], device=edu_rstpos_nopad.device , dtype=torch.long)
+                
+                # curr_edu_pos[idx] = new_rst_pos
+                curr_edu_pos[idx] = new_rst_pos[0]
+                
+                # If EDU START PUNCTUATION occurs we advance to the next edu if the previous edu is the same as the previous previous edu
+                self.consecutive_steps_prev_edu_used[idx]+= 1
+
+            #Case: START PUNCTUATION is previosly generated token - we check  that edu_rstpos has changed between prev two tokens
+            elif li_gen_text[idx][ -1:] in self.punct_start_edu:               
+                
+                edu_correctly_changed = ( self.prev_edu_pos[idx][-1] == self.prev_edu_pos[idx][-2] )
+                
+                if edu_correctly_changed == False:
+                    
+                    # bool_use_old_edu_pos[idx] = True
+                    new_rst_pos_idx = edu_rstpos[idx//num_beams].tolist().index( self.prev_edu_pos[idx][-1] ) + 1
+
+                    # Ensuring index is not out of edu_rstpos         
+                    temp = edu_rstpos[idx//num_beams]
+                    edu_rstpos_nopad = temp if not (-1 in temp) else temp[:(temp == -1).nonzero(
+                        as_tuple=True)[0][0]]
+                    new_rst_pos_idx = min( len(edu_rstpos_nopad)-1, new_rst_pos_idx )
+                    
+                    # Preventing EDU rstpos prediction from going backwards  
+                    new_rst_pos = max( [ edu_rstpos_nopad[new_rst_pos_idx].tolist(), self.prev_edu_pos[idx][-1].tolist()  ]  , key=RstTokenizerMixin.edukp_pos_sort_function  )
+                    new_rst_pos = torch.tensor( [new_rst_pos], device=edu_rstpos_nopad.device , dtype=torch.long)
+                    
+                    # curr_edu_pos[idx] = new_rst_pos
+                    curr_edu_pos[idx] = new_rst_pos[0]
+
+                    self.consecutive_steps_prev_edu_used[idx]+= 1
+
+                else:
+                    curr_edu_pos[idx] = None
+                    self.consecutive_steps_prev_edu_used[idx] = 0
+                    
+                # Cue Phrase / Discourse marker check
+                # cp or dm can be more than one token. 
+                # for i<n, n= max cue_phrase,dm length
+                # If the previous i generated tokens match a cp,dm or length i then we will check for a new edu
             
-                new_rst_pos_idx = 
-            
+            #CASE: Check if dm marker / cue phrase occurs. If so then do segment check
             else:
-                continue
-            
-            #removing padding from edu_rstpos[idx]
-            edu_rstpos[idx] = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-                as_tuple=True)[0]] for tens in edu_rstpos[idx:idx+1]][0][0]
-            new_rst_pos_idx = min( len(edu_rstpos[idx])-1, new_rst_pos_idx[idx] )
+                #If dm marker occurs then do we set curr_edu_pos[idx] to 0. This indicates we should do a segment check
+                input_ids = decoder_input_ids[idx]
                 
-            prev_edu_pos[idx] = edu_rstpos[idx][new_rst_pos_idx]
+                for idx1 in range(1, min(len(self.dict_len_phrasetok), len(input_ids) )+1 ):
+                    if ( input_ids[-idx1:] == torch.stack(self.dict_len_phrasetok[idx1],axis=0) ).all(axis=-1).any():
+                        curr_edu_pos[idx] = None
+                    else:
+                        self.consecutive_steps_prev_edu_used[idx]+= 1
+                        
         
-        # Getting new segmentation for gen_texts that are valid for re-evaluation - using the segmenter
-        if any(bool_use_old_edu_pos):
+ 
+        # Perform Segmentation using Segmenter  on selected indexes
+        if not all(curr_edu_pos):
+
             if self.rst_segment_method == "fenghirst":
-                
+                raise NotImplementedError
                 idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
                 li_gen_text_filtr = [ gen_text for idx,gen_text in enumerate(li_gen_text) if idx in idxs_to_update]
                 
-                li_textwedutoken = self.rst_parser.parse_li_utterances(li_gen_text_filtr)
+                li_textwedutoken = self.segmenter.parse_li_utterances(li_gen_text_filtr)
                 # calculating edu of current text
                 li_edu_count = [
                     ' '.join(li_words[:-1]).count('EDU_BREAK')+1 for li_words in li_textwedutoken]
@@ -497,13 +608,15 @@ class RstModelMixin():
                 
                 # Ensuring each curr_edu_pos is at least as large as the prev_edu_pos
                 if prev_edu_pos != None:
-                    _ = [ max( [ curr_pos, prev_pos] , key=RSTTokenizer.edukp_pos_sort_function ) 
+                    _ = [ max( [ curr_pos, prev_pos] , key= RstTokenizerMixin.edukp_pos_sort_function ) 
                                     for curr_pos, prev_pos in zip(curr_edu_pos, prev_edu_pos)  ]
                 curr_edu_pos = _
                 
             elif self.rst_segment_method == "segbot":
 
-                idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
+                # idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
+                idxs_to_update = [ idx for idx,val in enumerate(curr_edu_pos) if val==None ]
+
                 li_gen_text_filtr = [ gen_text for idx,gen_text in enumerate(li_gen_text) if idx in idxs_to_update]
                 
                 li_segmented_text = self.segmenter.segment_li_utterances(li_gen_text_filtr)
@@ -512,30 +625,48 @@ class RstModelMixin():
 
                 # removing any padding
                 edu_rstpos = [tens if not (-1 in tens) else tens[: (tens == -1).nonzero(
-                    as_tuple=True)[0]] for tens in edu_rstpos][0]
+                    as_tuple=True)[0][0]] for tens in edu_rstpos]
                             
-                curr_edu_pos = [edu_rstpos[min(edu_rstpos.numel()-1, max(0, edu_count-1))]
-                                for edu_count in li_edu_count]
+                updated_curr_edu_pos = [ edu_rstpos[idx//num_beams][min(edu_rstpos[idx//num_beams].numel()-1, max(0, edu_count-1))]
+                                for idx,edu_count in enumerate(li_edu_count) ]
+                
+                # check the updated curr_edu_pos aren't going backwards
+                updated_curr_edu_pos = [  max(  edu_pos.tolist(), self.prev_edu_pos[idxs_to_update[idx]][-1].tolist() , key=RstTokenizerMixin.edukp_pos_sort_function  ) for idx, edu_pos in enumerate(updated_curr_edu_pos) ]
+                for idx in range(len(updated_curr_edu_pos)):
+                    updated_curr_edu_pos[idx] =  torch.tensor( [updated_curr_edu_pos[idx]], device=decoder_input_ids.device, dtype=torch.long)
 
                 # Adding back to original list
-                _ = [ curr_edu_pos.pop(0) if idx in idxs_to_update else prev_edu_pos[idx] for idx in range(len(li_gen_text))  ]
-                curr_edu_pos = _
-                        
-        else:
-            curr_edu_pos =  prev_edu_pos                
-
-        return curr_edu_pos, li_gen_text 
+                for i, idx in enumerate(idxs_to_update):
+                    # curr_edu_pos[idx] = updated_curr_edu_pos[i]
+                    curr_edu_pos[idx] = updated_curr_edu_pos[i][0]
 
 
+        # Appending curr_edu_pos to the self.prev_edu_pos
+        self.prev_edu_pos = [ torch.cat( [ prev, curr.reshape(1) ] ) for prev,curr in zip( self.prev_edu_pos, curr_edu_pos ) ]
+        
+        # print(curr_edu_pos)
+        
+        return curr_edu_pos, li_gen_text
+
+    def _get_logits_processor(self, *args, **kwargs ):
+        processor = GenerationMixin._get_logits_processor(self, *args, **kwargs )
+        
+        kp_logitsproc = KeyPhraseNoRepeatLogitsProcessor(self.gen_key_phrase_ids, 
+                                                         self.tokenizer.keyphrase_start_token_id[0],
+                                                         self.tokenizer.eos_token_id,
+                                                         tokenizer=self.tokenizer)
+        # nonlocal logits_processor
+        processor.append( kp_logitsproc )
+                
+        return processor
+        
 #endregion
 
 #region RST TOkenizer
-
 MAX_LONG_VALUE = torch.iinfo(torch.long).max
 
 class RstTokenizerMixin():
-  
-    
+
     @staticmethod
     @lru_cache(maxsize=4096)
     def edukp_pos_sort_function(edukp_pos: int):
@@ -559,7 +690,6 @@ class RstTokenizerMixin():
     @lru_cache(maxsize=4096)
     def node_level(node_pos):
         val = math.floor( math.log( node_pos+1 , 2 ) )
-        
         return val
 
     @staticmethod
@@ -640,61 +770,53 @@ class RstTokenizerMixin():
         return pos
 
     def rst_vectors(self, version="combinations", relations="all", **kwargs):
+        """
+            Allows the user to select partiuclar rst_vectors in order to control their output
+
+            version: rule to decide how to compose relations
+            relations: A list of the relations to utilise
             """
-                Allows the user to select partiuclar rst_vectors in order to control their output
+        count = kwargs.get('count',1)
+        assert ( count>0 and count<7 )
 
-                version: rule to decide how to compose relations
-                relations: A list of the relations to utilise
-             """
-            count = kwargs.get('count',1)
-            assert ( count>0 and count<7 )
+        #selecting sub rst relations to evaluate
+        rst_rel_li = [ rel for rel in self.rst_rel_li if ( rel in relations) or relations=="all" ]
 
-            #selecting sub rst relations to evaluate
-            rst_rel_li = [ rel for rel in self.rst_rel_li if ( rel in relations) or relations=="all" ]
-
-            if version == "independent":
-                rst_names = [[rel] for rel in rst_rel_li]
-
-                rst_rel_encoded = [ self.rst_rel_labeler.transform(rel) for rel in rst_names]
+        if version == "independent":
+            rst_names = [[rel] for rel in rst_rel_li]
+            rst_rel_encoded = [ self.rst_rel_labeler.transform(rel) for rel in rst_names]
+        
+        if version=="combinations":
             
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_comb = combinations( rst_rel_li, combination_count )
+            li_rst_comb =  list(iter_rst_comb)
+            random.shuffle(li_rst_comb)
+            li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
+            rst_names = li_rst_comb
+            rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_comb) for rst_comb in li_rst_comb] #list of list of each relation
+        
+        elif version=="permutations":
             
-            if version=="combinations":
-                
-                combination_count = kwargs.get('combinatoric_count',3)
-                iter_rst_comb = combinations( rst_rel_li, combination_count )
-                li_rst_comb =  list(iter_rst_comb)
-                random.shuffle(li_rst_comb)
-                li_rst_comb = li_rst_comb[: kwargs.get("return_count",10) ]           
-                
-                rst_names = li_rst_comb
-                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_comb) for rst_comb in li_rst_comb] #list of list of each relation
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_perm = permutations( rst_rel_li, combination_count )
+            li_rst_perm =  iter_rst_perm.tolist()
+            random.shuffle(li_rst_perm)
+            li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ] 
+            rst_names = li_rst_perm
+            rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_perm) for rst_perm in li_rst_perm] #list of list of each relation
+
+        elif version=="combinations_with_replacement":
             
-            elif version=="permutations":
-                
-                combination_count = kwargs.get('combinatoric_count',3)
-                iter_rst_perm = permutations( rst_rel_li, combination_count )
-                li_rst_perm =  iter_rst_perm.tolist()
-                random.shuffle(li_rst_perm)
+            combination_count = kwargs.get('combinatoric_count',3)
+            iter_rst_combwr = combinations_with_replacement( rst_rel_li, combination_count )
+            li_rst_combwr =  list(iter_rst_combwr)
+            random.shuffle(li_rst_combwr)
+            li_rst_combwr = li_rst_combwr[: kwargs.get("return_count",10) ]           
+            rst_names = li_rst_combwr
+            rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_combwr) for rst_combwr in li_rst_combwr] #list of list of each relation
 
-                li_rst_perm = li_rst_perm [: kwargs.get("return_count",10) ]   
-                
-                rst_names = li_rst_perm
-                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_perm) for rst_perm in li_rst_perm] #list of list of each relation
-
-            elif version=="combinations_with_replacement":
-                
-                combination_count = kwargs.get('combinatoric_count',3)
-                iter_rst_combwr = combinations_with_replacement( rst_rel_li, combination_count )
-                li_rst_combwr =  list(iter_rst_combwr)
-                random.shuffle(li_rst_combwr)
-
-                li_rst_combwr = li_rst_combwr[: kwargs.get("return_count",10) ]           
-                rst_names = li_rst_combwr
-
-                rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_combwr) for rst_combwr in li_rst_combwr] #list of list of each relation
-
-            return rst_rel_encoded, rst_names
-
+        return rst_rel_encoded, rst_names
 
 
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
@@ -722,7 +844,6 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
         while x.max() >= self.max_rst_index:
             x = torch.where( x>=self.max_rst_index, torch.ceil( (x-2)/2 ).long(), x )
    
-
         x = self.fixed_rst_encoding(x)
         x = self.ffd( x )
         x = torch.nn.functional.gelu(x)
@@ -1175,3 +1296,79 @@ def find_child_edus(pos_parentnode, li_rst_pos):
 
 #endregion
 
+#region generation
+
+class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
+    r"""
+    :class:`transformers.LogitsProcessor` that enforces no repetition of encoder input ids n-grams for the decoder ids.
+    See `ParlAI <https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/torch_generator_agent.py#L1350>`__.
+    Args:
+        encoder_ngram_size (:obj:`int`):
+            All ngrams of size :obj:`ngram_size` can only occur within the encoder input ids.
+        encoder_input_ids (:obj:`int`):
+            The encoder_input_ids that should not be repeated within the decoder ids.
+        key_phrase_ids (:list : list tensors) a list of tensors on the same device as 
+    """
+
+    def __init__(self, key_phrase_ids, key_phrase_start_id, eos_token_id,**kwargs):
+        self.batch_size = key_phrase_ids.shape[0]  
+        unbatched_key_phrase_ids = torch.unbind(key_phrase_ids, dim=0)
+        # self.tok = kwargs.get('tokenizer',None)
+        
+        unbatched_kpstart_pos = [ 
+                                  torch.cat( [
+                                                ( kps ==key_phrase_start_id ).nonzero(as_tuple=False),
+                                                ( kps ==eos_token_id ).nonzero(as_tuple=False) 
+                                             ] #key phrase may be padding with eos tokens
+                                            ).squeeze(-1)
+                                            for kps in unbatched_key_phrase_ids 
+                                ] 
+        
+        self.unbatched_key_phrase_ids  = [ [  kpids[start_idx+1:end_idx ] for start_idx,end_idx in zip( kpstart_pos, kpstart_pos[1:]) 
+                                            if not(
+                                                    kpids[start_idx]==eos_token_id and 
+                                                    kpids[end_idx] ==eos_token_id )  ] 
+                                        
+                                        for kpids, kpstart_pos in zip( unbatched_key_phrase_ids, unbatched_kpstart_pos) ]
+                # splitting on the <kp> or  <|kp|> token
+        self.max_ngram_size = max( len(ids) for ids in self.unbatched_key_phrase_ids )     
+        
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        
+        # B x num_beams
+        num_hypos = scores.shape[0]
+        num_beams = num_hypos // self.batch_size
+        cur_len = input_ids.shape[-1]
+        
+        #Here we create a temporary kp_ngrams_mentioned
+            # We only block kps if they have been mentioned in the text
+            # This should be a list of dictionaries
+            # One for each batch size
+            # each dictionary contains keys=key_phrase excl final token values=list of final tokens of key_phrases 
+
+        generated_kps_ids = []
+        for idx in range(num_hypos):
+            ngrams = collections.defaultdict(list)
+            
+            for kp_ids in self.unbatched_key_phrase_ids[idx//num_beams]:
+                
+                if any( torch.equal(kp_ids,input_ids[idx][s:s+len(kp_ids)]) for s in range(0,len(input_ids[idx])-len(kp_ids)+1) ):
+                    ngrams[ tuple(kp_ids[:-1].tolist()) ].extend( kp_ids[-1:].tolist() )
+                    
+            generated_kps_ids.append(ngrams)
+        
+        #Here we check for banned tokens for every ngram size  
+        banned_batch_tokens = [
+                sum([ 
+                        _get_generated_ngrams(generated_kps_ids[hypo_idx], input_ids[hypo_idx], ngram_size, cur_len)
+                            for ngram_size in range(1, self.max_ngram_size)]    
+                    ,[])
+                    for hypo_idx in range(num_hypos)
+                    ]
+        
+        for i, banned_tokens in enumerate(banned_batch_tokens):
+            scores[i, banned_tokens] = -float("inf")
+
+        return scores
+
+#endregion

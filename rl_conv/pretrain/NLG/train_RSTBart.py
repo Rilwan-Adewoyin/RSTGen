@@ -1549,7 +1549,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
         parser.add_argument('--max_epochs', default=8, type=int)
-        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=3, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
 
@@ -1562,7 +1562,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             type=int, help="The Experimental Versioning for this run")
         parser.add_argument('--precision', default=16, required=False,
                             type=int, help="Precision to use", choices=[16, 32])
-        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','adamw','adafactor_lr'])
+        parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','AdamW'])
         parser.add_argument('--tag', default='', required=True, type=str)
         parser.add_argument('--override', default=False,
                             type=lambda x: bool(int(x)), choices=[0, 1])
@@ -2017,30 +2017,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
         if self.optimizer == 'adafactor':
             optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
-                            relative_step=True, warmup_init=True, lr=None )
+                            relative_step=True, warmup_init=True, lr=None,
+                            weight_decay=0.01 )
 
 
             lr_scheduler = AdafactorSchedule(optimizer)
-
-        elif self.optimizer == 'adafactor_lr':
-            optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
-                            relative_step=False, warmup_init=False, lr=self.learning_rate )
-
-
-            lr_scheduler = AdafactorSchedule(optimizer)
-
-        
-        elif self.optimizer == 'adamw':
-
-            optimizer = torch.optim.AdamW( self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
-
-            lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
-                                                             num_warmup_steps=0.10*self.total_steps(),
-                                                            num_training_steps=self.total_steps(),
-                                                            num_cycles=1.5
-                                                           )
-            lr_scheduler = None
-
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
     

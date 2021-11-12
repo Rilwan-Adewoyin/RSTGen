@@ -913,30 +913,11 @@ class RSTBartPair_TrainingModule(pl.LightningModule):
 
         if self.optimizer == 'adafactor':
             optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
-                            relative_step=True, warmup_init=True, lr=None )
+                            relative_step=True, warmup_init=True, lr=None,
+                            weight_decay=0.01)
 
 
             lr_scheduler = AdafactorSchedule(optimizer)
-
-        elif self.optimizer == 'adafactor_lr':
-            optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
-                            relative_step=False, warmup_init=False, lr=self.learning_rate )
-
-
-            lr_scheduler = AdafactorSchedule(optimizer)
-
-        
-        elif self.optimizer == 'adamw':
-
-            optimizer = torch.optim.AdamW( self.model.parameters(), lr=self.learning_rate, weight_decay=0.01)
-
-            lr_scheduler = get_cosine_schedule_with_warmup(optimizer,
-                                                             num_warmup_steps=0.10*self.total_steps(),
-                                                            num_training_steps=self.total_steps(),
-                                                            num_cycles=1.5
-                                                           )
-            lr_scheduler = None
-
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
     
@@ -1032,7 +1013,8 @@ class SingleDataset(Dataset):
 
         if self.inference == True:
 
-            utterance_prompt = ' '.join(utterance.split(' ')[:2])
+            # utterance_prompt = ' '.join(utterance.split(' ')[:2])
+            utterance_prompt = ""
 
             encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
                                                   li_kp=li_kp,
