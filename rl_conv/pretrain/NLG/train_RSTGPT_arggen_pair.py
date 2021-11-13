@@ -304,6 +304,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                            'key_phrase_ids': mconfig.eos_token_id,
                            'li_kprstpos': self.model.embed_rst_pos.padding_idx,
 
+                            'position_ids_keyphrase':mconfig.n_ctx-1,
+                            'position_ids_utt':mconfig.n_ctx-1,
+
                            'position_ids_kp_utt': mconfig.n_ctx-1,
                            'position_ids_title':mconfig.n_ctx-1,
 
@@ -334,6 +337,10 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + mconfig.max_len_title,  # axis:max_length
 
             'position_ids_kp_utt': mconfig.max_len_key_phrase+mconfig.max_len_utt,
+
+            'position_ids_keyphrase':mconfig.max_len_key_phrase,
+            'position_ids_utt':mconfig.max_len_utt ,
+
             'position_ids_title':mconfig.max_len_title,
             'edu_rstpos': mconfig.max_rst_pos // 2,
             'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase }

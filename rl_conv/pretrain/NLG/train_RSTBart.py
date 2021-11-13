@@ -1847,11 +1847,11 @@ class RSTBart_TrainingModule(pl.LightningModule):
         
         if step_name == 'train':
             output["loss"] = output.loss
-            self.log( "loss", output.loss, sync_dist=True)
+            self.log( "loss", output.loss, sync_dist=False)
 
         else:
             loss_key = f"{step_name}_loss"
-            self.log( loss_key, output.loss, sync_dist=True)
+            self.log( loss_key, output.loss, sync_dist=False)
             output[loss_key]=output.loss
 
         return output
