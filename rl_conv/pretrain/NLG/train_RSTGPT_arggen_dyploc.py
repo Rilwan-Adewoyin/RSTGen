@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-
+from pytorch_lightning.callbacks.finetuning import BaseFinetuning
 import torch.distributed as dist
 import ujson
 import yaml
@@ -298,7 +298,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                  batch_size=20,
                  dir_data=None,
                  accumulate_grad_batches=1,
-                 max_epochs=25,
+                 max_epochs=5,
                  gpus=1,
                  learning_rate=1e-4,
                  warmup_proportion=0.1,
@@ -346,7 +346,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             mconfig.vocab_size = mconfig.vocab_size+4
             self.model.config.vocab_size = mconfig.vocab_size
             self.model.resize_token_embeddings(self.model.config.vocab_size)
-                    
+                            
         self.pad_values = {'rst_start_token': mconfig.eos_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
                            'rst_ns': self.model.embed_rst_ns.padding_idx,
@@ -432,6 +432,9 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             self.hparams.update({**train_params_to_save, **mparams_to_save})
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
+            
+            #Freezing RST related paremeters
+            
             
         if self.mode in ['inference']:
             self.eval()
@@ -564,6 +567,8 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                             save_top_k=2,
                                               mode='min', dirpath=dir_checkpoints,
                                               filename='{epoch:03d}_{val_loss:.5f}')
+        
+        rst_freeze = RSTFreezingCallBack()
 
         checkpoint_callback._save_model = types.MethodType(
             mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback) 
@@ -578,6 +583,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
+        callbacks.append(rst_freeze)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -941,8 +947,10 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         return steps
 
     def configure_optimizers(self):
-
-        optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
+        
+        parameters = filter( lambda p: p.requires_grad, self.model.parameters)
+        
+        optimizer = Adafactor(parameters, scale_parameter=True, 
                         relative_step=True, warmup_init=True, lr=None,
                         weight_decay=0.01)
 
@@ -1497,6 +1505,18 @@ class SingleDataset(Dataset):
         dict_pos_edu = json.loads(datum['dict_pos_edu'])   
 
         return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, claim, title
+
+class RSTFreezingCallBack(BaseFinetuning):
+    def __init__(self):
+        super().__init__()
+    
+    def freeze_before_training(self, pl_module: "pl.LightningModule"):
+        
+        self.freeze( pl_module.model.transformer )
+        self.freeze( pl_module.model.embed_rst_rels )
+        self.freeze( pl_module.model.embed_rst_ns )
+        self.freeze( pl_module.model.emebd_rst_pos )
+    
 
 def main(tparams={}, mparams={}):
 

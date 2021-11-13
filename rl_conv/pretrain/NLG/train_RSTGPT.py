@@ -886,9 +886,9 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     rst_ns_labeler.fit(rst_ns_li)
 
     # Setting up context lengths
-    max_len_rst = 28
-    max_len_key_phrase = 40
-    max_len_utt = 190
+    max_len_rst = 30
+    max_len_key_phrase = 64
+    max_len_utt = 240
     max_rst_pos = 4094
 
     special_token_count = 2
