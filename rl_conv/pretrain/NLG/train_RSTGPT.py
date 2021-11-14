@@ -1586,6 +1586,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         self.workers = workers
         self.batching_style = batching_style
         self.optimizer = optimizer
+        self.dir_checkpoints = kwargs.get('dir_checkpoints')
         
         if tokenizer == None:
             self.tokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
@@ -1703,7 +1704,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./dataset_v3_2",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=5, type=int)
+        parser.add_argument('--max_epochs', default=10, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient',
@@ -1861,24 +1862,25 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
-            # restoring callback state
-            for idx in range(len(callbacks)):
-                if type(callbacks[idx]) == EarlyStopping:
-                    callbacks[idx].on_load_checkpoint(
-                        checkpoint['callbacks'][type(callbacks[idx])])
+            # # restoring callback state
+            # for idx in range(len(callbacks)):
+            #     if type(callbacks[idx]) == EarlyStopping:
+            #         callbacks[idx].on_load_checkpoint(
+            #             checkpoint['callbacks'][type(callbacks[idx])])
 
-                elif type(callbacks[idx]) == ModelCheckpoint:
-                    callbacks[idx].on_load_checkpoint(
-                        None, None, checkpoint['callbacks'][type(callbacks[idx])])
+            #     elif type(callbacks[idx]) == ModelCheckpoint:
+            #         callbacks[idx].on_load_checkpoint(
+            #             None, None, checkpoint['callbacks'][type(callbacks[idx])])
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=0.05,
-                                                    limit_val_batches=0.25,
-                                                    reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    # val_check_interval=0.05,
+                                                    limit_val_batches=0.20,
+                                                    # reload_dataloaders_every_n_epochs=1,
+                                                    num_sanity_val_steps=0 ,
+                                                    # num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
                                                     )
@@ -1896,23 +1898,23 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                 trainer.fit_loop.global_step = checkpoint['global_step']
 
             # restore the optimizers
-            optimizer_states = checkpoint['optimizer_states']
-            for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
-                optimizer.load_state_dict(opt_state)
+            # optimizer_states = checkpoint['optimizer_states']
+            # for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
+            #     optimizer.load_state_dict(opt_state)
 
                 # move optimizer to GPU 1 weight at a time
                 # avoids OOM
-                if trainer.root_gpu is not None:
-                    for state in optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.cuda(trainer.root_gpu)
+                # if trainer.root_gpu is not None:
+                #     for state in optimizer.state.values():
+                #         for k, v in state.items():
+                #             if isinstance(v, torch.Tensor):
+                #                 state[k] = v.cuda(trainer.root_gpu)
 
             # restore the lr schedulers
-            lr_schedulers = checkpoint['lr_schedulers']
+            # lr_schedulers = checkpoint['lr_schedulers']
 
-            for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
-                scheduler['scheduler'].load_state_dict(lrs_state)
+            # for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
+            #     scheduler['scheduler'].load_state_dict(lrs_state)
 
             del checkpoint
             torch.cuda.empty_cache()
@@ -2185,6 +2187,16 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                                   weight_decay=0.01)
 
             lr_scheduler = AdafactorSchedule(optimizer)
+        
+        if self.mode == "train_cont":
+            # restore the optimizers
+            checkpoint = self.get_ckpt_file(self.dir_checkpoints)
+            optimizer_states = checkpoint['optimizer_states']
+            optimizer.load_state_dict(optimizer_states[0])
+   
+            # restore the lr schedulers
+            lr_scheduler_states = checkpoint['lr_schedulers']
+            lr_scheduler.load_state_dict(lr_scheduler_states[0])
 
         return {'optimizer': optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 

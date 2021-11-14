@@ -274,6 +274,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.batching_style = batching_style
+        self.dir_checkpoints = kwargs.get('dir_checkpoints')
 
         if tokenizer  == None:
             self.tokenizer = RSTTokenizerPair.from_pretrained(f"./tokenizers/{mconfig.model_name}",
@@ -552,16 +553,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             # restoring checkpoint
             checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
-
-            #restoring callback state
-            for idx in range(len(callbacks)):
-                if type(callbacks[idx]) == EarlyStopping:
-                    callbacks[idx].on_load_checkpoint( checkpoint['callbacks'][type(callbacks[idx])] )
-
-                elif type(callbacks[idx]) == ModelCheckpoint:
-                    callbacks[idx].on_load_checkpoint( None, None, checkpoint['callbacks'][type(callbacks[idx])] )
-
-            
+           
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
@@ -583,25 +575,6 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             except Exception:
                 trainer.fit_loop.global_step = checkpoint['global_step']
                 trainer.fit_loop.current_epoch = checkpoint['epoch']
-
-            # restore the optimizers
-            optimizer_states = checkpoint['optimizer_states']
-            for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
-                optimizer.load_state_dict(opt_state)
-
-                # move optimizer to GPU 1 weight at a time
-                # avoids OOM
-                if trainer.root_gpu is not None:
-                    for state in optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.cuda(trainer.root_gpu)
-
-            # restore the lr schedulers
-            lr_schedulers = checkpoint['lr_schedulers']
-
-            for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
-                scheduler['scheduler'].load_state_dict(lrs_state)
 
             del checkpoint
             torch.cuda.empty_cache()
@@ -879,6 +852,16 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
         lr_scheduler = AdafactorSchedule(optimizer)
 
+        if self.mode == "train_cont":
+            # restore the optimizers
+            checkpoint = self.get_ckpt_file(self.dir_checkpoints)
+            optimizer_states = checkpoint['optimizer_states']
+            optimizer.load_state_dict(optimizer_states[0])
+   
+            # restore the lr schedulers
+            lr_scheduler_states = checkpoint['lr_schedulers']
+            lr_scheduler.load_state_dict(lr_scheduler_states[0])
+            
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
     
     def return_params(self):

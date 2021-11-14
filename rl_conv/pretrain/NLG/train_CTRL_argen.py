@@ -32,7 +32,6 @@ from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
-import deepspeed
 import pickle
 
 import argparse
@@ -1195,7 +1194,9 @@ class SingleDataset(torch.utils.data.Dataset):
         title, claim, concepts, target_entities, utterance = self.getitem_extract_datum(index)
         
         if self.inference == True:
-            utterance_prompt = ' '.join(utterance.split(' ')[:2])
+            # utterance_prompt = ' '.join(utterance.split(' ')[:2])
+            utterance_prompt = ''
+            orig_utterance = copy.deepcopy(utterance)
             utterance =None 
         else:
             utterance_prompt=None
@@ -1211,9 +1212,8 @@ class SingleDataset(torch.utils.data.Dataset):
             encoded['orig_title'] = title
             encoded['orig_claim'] = claim
             encoded['orig_concepts'] = concepts
-
             encoded['orig_target_entities'] = target_entities
-            encoded['orig_utterance'] = utterance
+            encoded['orig_utterance'] = orig_utterance
      
         return encoded
 

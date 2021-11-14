@@ -317,6 +317,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         self.mode = mode
         self.workers = workers
         self.batching_style = batching_style
+        self.dir_checkpoints = kwargs.get('dir_checkpoints')
         
 
         if tokenizer  == None:
@@ -447,7 +448,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./dataset_cmv/dyploc_rst",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=8, type=int)
+        parser.add_argument('--max_epochs', default=50, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
@@ -493,8 +494,8 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)
             model.resize_token_embeddings(model.config.vocab_size)
             # set initiation value of new token to that of 
-            with torch.no_grad():
-                model.transformer.wte.weight[ -2:, : ] = model.transformer.wte.weight[ -5:-4, : ]
+            # with torch.no_grad():
+            #     model.transformer.wte.weight[ -2:, : ] = model.transformer.wte.weight[ -5:-4, : ]
 
             training_module = RSTGPT2Dyploc_TrainingModule(model.config, **tparams, model=model, tokenizer=tokenizer)
 
@@ -576,7 +577,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 6,       
+            patience = 8,       
             verbose=False,
             mode='min'
         )
@@ -615,27 +616,16 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             # restoring checkpoint
             checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
-
-            #restoring callback state
-            for idx in range(len(callbacks)):
-                if type(callbacks[idx]) == EarlyStopping:
-                    callbacks[idx].on_load_checkpoint( checkpoint['callbacks'][type(callbacks[idx])] )
-
-                elif type(callbacks[idx]) == ModelCheckpoint:
-                    callbacks[idx].on_load_checkpoint( None, None, checkpoint['callbacks'][type(callbacks[idx])] )
-
-            
-
+           
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    # val_check_interval=
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
-                                                    val_check_interval=0.5,
+                                                    val_check_interval=0.25
                                                     )
 
             # load callback states
@@ -647,25 +637,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             except Exception:
                 trainer.fit_loop.global_step = checkpoint['global_step']
                 trainer.fit_loop.current_epoch = checkpoint['epoch']
-
-            # restore the optimizers
-            optimizer_states = checkpoint['optimizer_states']
-            for optimizer, opt_state in zip(trainer.optimizers, optimizer_states):
-                optimizer.load_state_dict(opt_state)
-
-                # move optimizer to GPU 1 weight at a time
-                # avoids OOM
-                if trainer.root_gpu is not None:
-                    for state in optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.cuda(trainer.root_gpu)
-
-            # restore the lr schedulers
-            lr_schedulers = checkpoint['lr_schedulers']
-
-            for scheduler, lrs_state in zip(trainer.lr_schedulers, lr_schedulers):
-                scheduler['scheduler'].load_state_dict(lrs_state)
 
             del checkpoint
             torch.cuda.empty_cache()
@@ -955,6 +926,16 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                         weight_decay=0.01)
 
         lr_scheduler = AdafactorSchedule(optimizer)
+
+        if self.mode == "train_cont":
+            # restore the optimizers
+            checkpoint = self.get_ckpt_file(self.dir_checkpoints)
+            optimizer_states = checkpoint['optimizer_states']
+            optimizer.load_state_dict(optimizer_states[0])
+   
+            # restore the lr schedulers
+            lr_scheduler_states = checkpoint['lr_schedulers']
+            lr_scheduler.load_state_dict(lr_scheduler_states[0])
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
     
@@ -1417,7 +1398,6 @@ class SingleDataset(Dataset):
 
         if self.inference == True:
 
-            # utterance_prompt = ' '.join(utterance.split(' ')[:2])
             utterance_prompt = ""
 
             # print(self.key_phrase_len[index], self.tokenizer.max_len_key_phrase)
@@ -1512,10 +1492,10 @@ class RSTFreezingCallBack(BaseFinetuning):
     
     def freeze_before_training(self, pl_module: "pl.LightningModule"):
         
-        self.freeze( pl_module.model.transformer )
+        # self.freeze( pl_module.model.transformer )
         self.freeze( pl_module.model.embed_rst_rels )
         self.freeze( pl_module.model.embed_rst_ns )
-        self.freeze( pl_module.model.emebd_rst_pos )
+        self.freeze( pl_module.model.embed_rst_pos )
     
 
 def main(tparams={}, mparams={}):
@@ -1565,4 +1545,4 @@ if __name__ == '__main__':
 # dullduks server version 1 - No Freezing, Full RST
 
 # CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT_arggen_dyploc.py --batch_size 26 --version 1 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --learning_rate 3e-4 --finetune_version 1 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_dyploc.py --batch_size 26 --version 6 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag "RSTGPT2 with rst aligned attn" --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --finetune_version 6 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=2 python3 train_RSTGPT_arggen_dyploc.py --batch_size 14 --version 11 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --tag "RSTGPT2 Dyploc" --finetune_version 11 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
