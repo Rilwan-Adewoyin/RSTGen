@@ -1862,25 +1862,14 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
-            # # restoring callback state
-            # for idx in range(len(callbacks)):
-            #     if type(callbacks[idx]) == EarlyStopping:
-            #         callbacks[idx].on_load_checkpoint(
-            #             checkpoint['callbacks'][type(callbacks[idx])])
 
-            #     elif type(callbacks[idx]) == ModelCheckpoint:
-            #         callbacks[idx].on_load_checkpoint(
-            #             None, None, checkpoint['callbacks'][type(callbacks[idx])])
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    # val_check_interval=0.05,
-                                                    limit_val_batches=0.20,
-                                                    # reload_dataloaders_every_n_epochs=1,
+                                                    val_check_interval=0.20,
                                                     num_sanity_val_steps=0 ,
-                                                    # num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
                                                     )
