@@ -177,13 +177,16 @@ class RSTTokenizerPair(RSTTokenizer):
         #encoding title
         if title != None:
             title = title.lstrip(string.punctuation+" ")
-        title = self.title_start_token + title
-        ids_title = self.encode(title, add_special_tokens=False,
+            title = self.title_start_token + title
+            ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
                 padding= 'max_length' if max_title_len else 'do_not_pad',
                 truncation=True,
                 max_length=max_title_len if max_title_len else self.max_len_title,
                 return_tensors='pt')[0]
+        else:
+           ids_title = torch.tensor([],dtype=torch.long)
+           
         title_pad = (ids_title == self.pad_token_id).sum(dim=0)
                 
         encoded['ids_title'] = ids_title
