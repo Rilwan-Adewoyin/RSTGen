@@ -185,17 +185,18 @@ class RSTTokenizerDyploc(RSTTokenizer):
        #encoding claim
        #TODO: make it work without this over 50 restriction
         if len( claim.split(' ') ) >45:
-           claim = "" 
+           claim = ""  
+           ids_claim = torch.tensor([],dtype=torch.long)
         else:
             claim = self.claim_start_token + claim
             
+            ids_claim = self.encode(claim, add_special_tokens=False,
+                    return_attention_mask=False,
+                    padding= 'max_length' if max_claim_len else 'do_not_pad',
+                    truncation=True,
+                    max_length=max_claim_len if max_claim_len else self.max_len_claim,
+                    return_tensors='pt')[0]
             
-        ids_claim = self.encode(claim, add_special_tokens=False,
-                return_attention_mask=False,
-                padding= 'max_length' if max_claim_len else 'do_not_pad',
-                truncation=True,
-                max_length=max_claim_len if max_claim_len else self.max_len_claim,
-                return_tensors='pt')[0]
         # ids_claim = torch.full((max_claim_len,),100, dtype=torch.long)
         claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
         
@@ -203,14 +204,18 @@ class RSTTokenizerDyploc(RSTTokenizer):
         #encoding title
         if title != None:
             title = title.lstrip(string.punctuation+" ")
-        title = self.title_start_token + title
-        ids_title = self.encode(title, add_special_tokens=False,
+            title = self.title_start_token + title
+            ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
                 padding= 'max_length' if max_title_len else 'do_not_pad',
                 truncation=True,
                 max_length=max_title_len if max_title_len else self.max_len_title,
                 return_tensors='pt')[0]
-        ids_title = torch.full((max_title_len,),100, dtype=torch.long)
+        else:
+           ids_title = torch.tensor([],dtype=torch.long)
+                 
+            
+        # ids_title = torch.full((max_title_len,),100, dtype=torch.long)
         title_pad = (ids_title == self.pad_token_id).sum(dim=0)
         
  
@@ -1035,9 +1040,9 @@ class DataLoaderGenerator():
             inference = True
 
         if 'custom_dset_class' in kwargs:
-            ds = kwargs.get('custom_dset_class')(fn, self.tokenizer,inference)
+            ds = kwargs.get('custom_dset_class')(fn, copy.deepcopy( self.tokenizer) ,inference)
         else:
-            ds = SingleDataset(fn, self.tokenizer, inference )
+            ds = SingleDataset(fn, copy.deepcopy(self.tokenizer), inference )
             
         sampler = SizedOrdered_Sampler(ds, bs, shuffle) if sampler else sampler
 

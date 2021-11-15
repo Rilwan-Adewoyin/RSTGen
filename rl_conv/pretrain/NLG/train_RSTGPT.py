@@ -2679,69 +2679,7 @@ class SizedOrdered_DistributedSampler(Sampler[T_co]):
             [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
 
         self.num_samples = math.ceil(len(self.data_source) / self.num_replicas)
-
-        # # Indices are sorted in order of the text lens of records in the datasets
-        # # random_idxs = np.random.random( np_txt_lens.size )
-        # g = torch.Generator()
-        # g.manual_seed(self.seed+self.epoch)
-        # if self.shuffle:
-        #     random_idxs = torch.randperm( self.np_txt_lens.size, generator=g ).tolist()
-        #     np_ordered_lens = np.lexsort(
-        #         (random_idxs, self.np_rst_lens, self.np_key_phrase_lens, self.np_txt_lens))
-        # else:
-        #     np_ordered_lens = np.lexsort(
-        #         (self.np_rst_lens, self.np_key_phrase_lens, self.np_txt_lens))
-
-        # # We Randomly re-arrange them in batches of batch size
-        # li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-        #                    for idx in range(0, np_ordered_lens.size-batch_size, batch_size)]
-
-        # # Divide into n sublists,
-        # # Each sublist at index i, contains the indices for process at rank i
-        # # Each sublist at index i, is a list non flatten indices. Each index represents items in the dataset
-        # li_li_chunked_lens = [
-        #     [li_chunked_lens[(self.num_replicas*idx)+_rank]
-        #      for idx in range(len(li_chunked_lens)//self.num_replicas)]
-        #     for _rank in range(self.num_replicas)]
-
-        # # shuffle each processes subllist in the same order to optimize paralel training
-        # if self.shuffle:
-        #     _ = list(zip(*li_li_chunked_lens))
-        #     random.Random(self.seed+self.epoch).shuffle(_)
-        #     # unpacking into worker size length list
-        #     li_li_chunked_lens = list(zip(*_))
-
-        # # Getting max sizes for rst and key_phrase in each chunk
-        # li_li_chunk_rst_len = [[np.take(self.np_rst_lens, idxs).max() for idxs in li_chunked_lens]
-        #                             for li_chunked_lens in li_li_chunked_lens]
-        # li_li_chunk_key_phrase_len = [[
-        #     np.take(self.np_key_phrase_lens, idxs).max()
-        #     for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens]
-
-        # li_li_chunked_ordered_lens = [np.concatenate(
-        #     li_chunked_lens).tolist() for li_chunked_lens in li_li_chunked_lens]
-
-        # #Updating the max_len_rst and max_len_keyphrase 
-        # for (li_chunked_lens, li_chunk_rst_len, li_chunk_key_phrase_len) in zip(li_li_chunked_lens, li_li_chunk_rst_len, li_li_chunk_key_phrase_len):
-        #     # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-
-        #     for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-        #         rst_len = li_chunk_rst_len[chunk_idx]
-        #         key_phrase_len = li_chunk_key_phrase_len[chunk_idx]
-
-        #         for data_idx in data_idxs:
-        #             dataset_idx = bisect.bisect_right(
-        #                 self.data_source.cumulative_sizes, data_idx)
-
-        #             if dataset_idx == 0:
-        #                 sample_idx = data_idx
-        #             else:
-        #                 sample_idx = data_idx - \
-        #                     self.data_source.cumulative_sizes[dataset_idx - 1]
-
-        #             self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
-        #             self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
-
+        
     def __iter__(self) -> Iterator[T_co]:
         # subli = copy.deepcopy( li_li_chunked_ordered_lens[self.rank] )
         subli = self.prepare_ds()
