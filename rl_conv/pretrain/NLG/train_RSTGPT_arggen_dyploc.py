@@ -203,7 +203,6 @@ class RSTTokenizerDyploc(RSTTokenizer):
             # ids_claim = torch.full((max_claim_len,),100, dtype=torch.long)
             claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
         
-        
         #encoding title
         if title != None and title!="":
             title = title.lstrip(string.punctuation+" ")
@@ -1338,9 +1337,9 @@ class SingleDataset(Dataset):
         fp_cached_order = os.path.join(os.path.dirname(
             file_path), f"gpt2_dict_lens.pkl")
 
-        # # # resetting the cached order files
-        # if os.path.exists( fp_cached_order):
-        #     os.remove(fp_cached_order)
+        # # resetting the cached order files
+        if os.path.exists( fp_cached_order):
+            os.remove(fp_cached_order)
 
     
         if os.path.exists(fp_cached_order):
@@ -1349,19 +1348,7 @@ class SingleDataset(Dataset):
             self.np_rstlens = dict_cached_order['np_rstlens']
             self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
             self.np_title_lens = dict_cached_order['np_title_lens']
-            try:
-                self.li_claim_lens = dict_cached_order['li_claim_lens']
-            except KeyError as e:
-                li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
-                li_claims = [ [ f"<|cl|>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
-                
-                self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
-                                                add_special_tokens=False, 
-                                                truncation=False,
-                                                padding = 'do_not_pad',
-                                                return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
-                dict_cached_order['li_claim_lens'] = self.li_claim_lens
-                pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
+            self.li_claim_lens = dict_cached_order['li_claim_lens']
 
                 
         else:
@@ -1386,8 +1373,8 @@ class SingleDataset(Dataset):
                                         padding = 'do_not_pad',
                                         return_tensors=None).__len__() for kp in li_kp ] )
             
-
-            li_title = [ f"<|tl|>{ujson.loads(title)}" for title in self.data.prompt.tolist() ]
+            _ = [ ujson.loads(title).lstrip(string.punctuation+" ") for title in self.data.prompt.tolist() ]
+            li_title = [ f"<|tl|>{title}" for title in _ ]
             
             self.np_title_lens = np.array( [self.tokenizer.encode(title,
                                             truncation=False,
