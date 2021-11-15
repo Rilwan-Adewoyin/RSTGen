@@ -1,7 +1,7 @@
 import os
 
-# os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-os.environ['TOKENIZERS_PARALLELISM'] = "true"
+os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
+os.environ['TOKENIZERS_PARALLELISM'] = "false"
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import string
 import argparse
@@ -177,6 +177,7 @@ class RSTTokenizerPair(RSTTokenizer):
         #encoding title
         if title != None:
             title = title.lstrip(string.punctuation+" ")
+            title = ' '.join( title.split(' ')[:self.max_len_title] )
             title = self.title_start_token + title
             ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,

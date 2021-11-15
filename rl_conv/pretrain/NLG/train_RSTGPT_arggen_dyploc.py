@@ -1,7 +1,7 @@
 import os
 
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-os.environ['TOKENIZERS_PARALLELISM'] = "true"
+os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 import string
 import argparse
@@ -184,12 +184,14 @@ class RSTTokenizerDyploc(RSTTokenizer):
         
        #encoding claim
        #TODO: make it work without this over 50 restriction
-        if len( claim.split(' ') ) >45:
+        if len( claim.split(' ') ) >45 or claim=="":
            claim = ""  
            ids_claim = torch.tensor([],dtype=torch.long)
+           claim_pad= 0
         else:
             claim = self.claim_start_token + claim
-            
+            claim = ' '.join( claim.split(' ')[:self.max_len_claim] )
+
             ids_claim = self.encode(claim, add_special_tokens=False,
                     return_attention_mask=False,
                     padding= 'max_length' if max_claim_len else 'do_not_pad',
@@ -197,13 +199,14 @@ class RSTTokenizerDyploc(RSTTokenizer):
                     max_length=max_claim_len if max_claim_len else self.max_len_claim,
                     return_tensors='pt')[0]
             
-        # ids_claim = torch.full((max_claim_len,),100, dtype=torch.long)
-        claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
+            # ids_claim = torch.full((max_claim_len,),100, dtype=torch.long)
+            claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
         
         
         #encoding title
-        if title != None:
+        if title != None and title!="":
             title = title.lstrip(string.punctuation+" ")
+            title = ' '.join( title.split(' ')[:self.max_len_title] )
             title = self.title_start_token + title
             ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
@@ -576,7 +579,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                               mode='min', dirpath=dir_checkpoints,
                                               filename='{epoch:03d}_{val_loss:.5f}')
         
-        rst_freeze = RSTFreezingCallBack()
+        # rst_freeze = RSTFreezingCallBack()
 
         checkpoint_callback._save_model = types.MethodType(
             mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback) 
@@ -1017,6 +1020,7 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             sampler = True
+            sample_kps = True
 
         elif split_name == 'val':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"val","*") ))
@@ -1024,6 +1028,8 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             sampler = True
+            sample_kps = False
+    
 
         elif split_name == 'test':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"test","*") ))
@@ -1031,6 +1037,8 @@ class DataLoaderGenerator():
             bs = self.batch_size
             inference = False
             sampler = True
+            sample_kps = False
+
 
         elif split_name == 'inference':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"test","*") ))
@@ -1038,13 +1046,16 @@ class DataLoaderGenerator():
             bs = 1
             sampler = None
             inference = True
+            sample_kps = False
+
 
         if 'custom_dset_class' in kwargs:
-            ds = kwargs.get('custom_dset_class')(fn, copy.deepcopy( self.tokenizer) ,inference)
+            ds = kwargs.get('custom_dset_class')(fn, copy.deepcopy( self.tokenizer) ,inference, sample_kps=sample_kps)
         else:
-            ds = SingleDataset(fn, copy.deepcopy(self.tokenizer), inference )
-            
-        sampler = SizedOrdered_Sampler(ds, bs, shuffle) if sampler else sampler
+            ds = SingleDataset(fn, copy.deepcopy(self.tokenizer), inference, sample_kps=sample_kps )
+        
+        if split_name not in ['inference', 'test']:
+            sampler = SizedOrdered_Sampler(ds, bs, shuffle)
 
         def collate_fn(
                 batch): return self.tokenizer.default_collate_pad(batch)
@@ -1124,7 +1135,7 @@ class SizedOrdered_Sampler(Sampler[int]):
                 self.data_source.title_len[data_idx] = title_len
                 
     def __iter__(self):
-        return iter(self.li_chunked_ordered_lens)
+        return iter( copy.deepcopy( self.li_chunked_ordered_lens ) )
 
     def __len__(self) -> int:
         return len(self.data_source)
@@ -1320,14 +1331,15 @@ class SingleDataset(Dataset):
         self.tokenizer = tokenizer
         self.inference = inference
         self.data = pd.read_csv(self.fp, sep=',', header=0 )
+        self.tokenizer.sample_kps = kwargs.get('sample_kps',False)
 
         
         fp_cached_order = os.path.join(os.path.dirname(
             file_path), f"gpt2_dict_lens.pkl")
 
         # # # resetting the cached order files
-        if os.path.exists( fp_cached_order):
-            os.remove(fp_cached_order)
+        # if os.path.exists( fp_cached_order):
+        #     os.remove(fp_cached_order)
 
     
         if os.path.exists(fp_cached_order):
