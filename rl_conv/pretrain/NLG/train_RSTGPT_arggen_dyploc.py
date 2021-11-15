@@ -3,6 +3,7 @@ import os
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
+from utils_nlg_v3 import mpatch_save_model
 import string
 import argparse
 import copy
@@ -37,7 +38,6 @@ from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
 import bisect
 import utils_nlg_v3 as utils
-from utils_nlg_v3 import mpatch_save_model
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 from torch.nn.modules.batchnorm import _BatchNorm
 
@@ -188,6 +188,7 @@ class RSTTokenizerDyploc(RSTTokenizer):
            claim = ""  
            ids_claim = torch.tensor([],dtype=torch.long)
            claim_pad= 0
+           
         else:
             claim = self.claim_start_token + claim
             claim = ' '.join( claim.split(' ')[:self.max_len_claim] )
@@ -924,7 +925,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     def test_dataloader(self):
         return self.test_dl
 
-    @lru_cache()
+    # @lru_cache()
     def total_steps(self):
 
         ds_size = len(self.train_dl) // self.gpus
@@ -1445,7 +1446,7 @@ class SingleDataset(Dataset):
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu,
-                                                  max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
+                                                  max_len_rst= self.rst_len[index] ,
                                                   max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
                                                     claim=claim, title=title,
                                                     max_claim_len=min( self.claim_len[index], self.tokenizer.max_len_claim),

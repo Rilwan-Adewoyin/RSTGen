@@ -944,6 +944,8 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             sampler = True
+            sample_kps = True
+            
 
         elif split_name == 'val':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"val","*") ))
@@ -951,6 +953,8 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             sampler = True
+            sample_kps = False
+            
 
         elif split_name == 'test':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"test","*") ))
@@ -958,6 +962,8 @@ class DataLoaderGenerator():
             bs = self.batch_size
             inference = False
             sampler = True
+            sample_kps = False
+            
 
         elif split_name == 'inference':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"test","*") ))
@@ -965,11 +971,13 @@ class DataLoaderGenerator():
             bs = 1
             sampler = None
             inference = True
+            sample_kps = False
+            
 
         if 'custom_dset_class' in kwargs:
-            ds = kwargs.get('custom_dset_class')(fn, self.tokenizer,inference)
+            ds = kwargs.get('custom_dset_class')(fn, self.tokenizer,inference, sample_kps=sample_kps)
         else:
-            ds = SingleDataset(fn, self.tokenizer,inference )
+            ds = SingleDataset(fn, self.tokenizer,inference, sample_kps=sample_kps )
         sampler = SizedOrdered_Sampler(ds, bs, shuffle) if sampler else sampler
 
 
@@ -1057,7 +1065,7 @@ class SingleDataset(Dataset):
         self.fp = file_path
         self.tokenizer = tokenizer
         self.inference = inference
-
+        self.tokenizer.sample_kps = kwargs.get('sample_kps',False)
         self.data = pd.read_csv(self.fp, sep=',', header=0 )
 
         fp_cached_order = os.path.join(os.path.dirname(
