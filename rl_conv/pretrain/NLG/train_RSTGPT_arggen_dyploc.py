@@ -1,6 +1,6 @@
 import os
 
-# os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
+os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
 
 import string
@@ -39,6 +39,7 @@ import bisect
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
+from torch.nn.modules.batchnorm import _BatchNorm
 
 
 T_co = TypeVar('T_co', covariant=True)
@@ -63,7 +64,7 @@ logger = logging.get_logger(__name__)
   
 class RSTGPT2DyplocConfig(RSTGPT2_Config):
     
-    def __init__(self, max_len_title=22, max_len_claim=22, **kwargs):
+    def __init__(self, max_len_title=40, max_len_claim=40, **kwargs):
         kwargs['model_name'] = "RSTGPT2Dyploc"
         
         super().__init__(**kwargs)
@@ -77,10 +78,11 @@ class RSTGPT2Dyploc(RSTGPT2):
     def __init__(self, config: RSTGPT2DyplocConfig):
         
         super().__init__(config)
+               
+
+    def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt,position_ids_keyphrase, position_ids_utt, **kwargs ):
         
-    def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_kp_utt, **kwargs ):
-        
-        inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_kp_utt)
+        inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_keyphrase, position_ids_utt)
 
         #appending claim and position token embed
         claim_embeds = self.transformer.wte(kwargs.get('ids_claim'))
@@ -182,7 +184,7 @@ class RSTTokenizerDyploc(RSTTokenizer):
         
        #encoding claim
        #TODO: make it work without this over 50 restriction
-        if len( claim.split(' ') ) >50:
+        if len( claim.split(' ') ) >45:
            claim = "" 
         else:
             claim = self.claim_start_token + claim
@@ -584,7 +586,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
         callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
-        callbacks.append(rst_freeze)
+        # callbacks.append(rst_freeze)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -602,9 +604,10 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     default_root_dir=tparams['dir_checkpoints'],
                                                     logger=tb_logger,
+                                                    reload_dataloaders_every_n_epochs=1,
+                                                    
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
                                                     val_check_interval=0.25,
@@ -731,17 +734,20 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     #region
     def step(self, batch, step_name):
 
-        output = self.forward(batch)
+        model_output = self.forward(batch)
         output = {}
         
         if step_name == 'train':
-            output["loss"] = output.loss
-            self.log( "loss", output.loss, sync_dist=True)
+            output["loss"] = model_output.loss
+            # self.log( "loss", model_output.loss, sync_dist=True)
+            self.log( "loss", model_output.loss, sync_dist=False)
+
 
         else:
             loss_key = f"{step_name}_loss"
-            self.log( loss_key, output.loss, sync_dist=True)
-            output[loss_key]=output.loss
+            # self.log( loss_key, model_output.loss, sync_dist=True)
+            self.log( loss_key, model_output.loss, sync_dist=False)
+            output[loss_key]= model_output.loss
 
         return output
     
@@ -776,7 +782,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         else:
             loss = torch.stack([x[f"{step_name}_loss"]for x in outputs]).mean()
             
-            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
+            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True)
         
         if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
@@ -919,7 +925,10 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         
-        parameters = filter( lambda p: p.requires_grad, self.model.parameters)
+        
+        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
+
+        parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
         
         optimizer = Adafactor(parameters, scale_parameter=True, 
                         relative_step=True, warmup_init=True, lr=None,
@@ -938,6 +947,19 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             lr_scheduler.load_state_dict(lr_scheduler_states[0])
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
+    
+    def freeze_specific_modules(self, modules, train_bn=True):
+
+        modules = BaseFinetuning.flatten_modules(modules)
+
+        for mod in modules:
+            if isinstance(mod, _BatchNorm) and train_bn:
+                BaseFinetuning.make_trainable(mod)
+            else:
+                # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
+                for param in mod.parameters(recurse=False):
+                    param.requires_grad = False
+        
     
     def return_params(self):
         params = {}
@@ -1026,10 +1048,9 @@ class DataLoaderGenerator():
                                                 batch_size= bs ,
                                                  num_workers=self.workers, 
                                                  sampler = sampler,
-                                                 pin_memory=False,
+                                                 pin_memory=True,
                                                 #  collate_fn=self.tokenizer.default_collate_pad,
-                                                 collate_fn=collate_fn,
-                                                 multiprocessing_context = kwargs.get('multiprocessing_context', None) )
+                                                 collate_fn=collate_fn)
                                                 #  timeout=30
                                                 
 
@@ -1435,8 +1456,8 @@ class SingleDataset(Dataset):
                 max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
                 max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
                 claim=claim, title=title,
-                    max_claim_len=min( self.claim_len[index], self.tokenizer.max_len_claim),
-                    max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
+                max_claim_len=min( self.claim_len[index], self.tokenizer.max_len_claim),
+                max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
 
         return encoded
 
@@ -1545,4 +1566,6 @@ if __name__ == '__main__':
 # dullduks server version 1 - No Freezing, Full RST
 
 # CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT_arggen_dyploc.py --batch_size 26 --version 1 --precision 16 --mode finetune --workers 6 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 28 --max_len_key_phrase 40 --tag RSTGPT2 --learning_rate 3e-4 --finetune_version 1 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
-# CUDA_VISIBLE_DEVICES=2 python3 train_RSTGPT_arggen_dyploc.py --batch_size 14 --version 11 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --tag "RSTGPT2 Dyploc" --finetune_version 11 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_dyploc.py --batch_size 12 --version 11 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 11 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_dyploc.py --batch_size 12 --version 12 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with non rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 12 --max_len_claim 40 --max_len_key_phrase 40 --rst_aligned_attention 0 --rst_segment_method segbot

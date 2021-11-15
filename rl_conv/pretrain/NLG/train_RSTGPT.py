@@ -998,8 +998,8 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         if self.rst_tree_aligned_attention:
             # output['context_rstpos'] = torch.cat(
             #     [rst_pos[0:1], rst_pos, li_kprstpos])
-            output['context_rst_rstpos'] =torch.cat([rst_pos[0:1], rst_pos] )
-            output['context_kp_rstpos'] = li_kprstpos
+            output['context_rst_rstpos'] = torch.cat([rst_pos[0:1], rst_pos] )
+            output['context_kp_rstpos']  = li_kprstpos
             dec_rst_pos = [self.clamp_values(np.array(int(key)), utils.MAX_LONG_VALUE).item(
                 0) for key in dict_pos_edu.keys()]
 

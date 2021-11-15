@@ -33,6 +33,7 @@ from pytorch_lightning.utilities.distributed import _get_rank
 from torch.utils.data import Sampler 
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.sampler import Sampler
+from pytorch_lightning.callbacks.finetuning import BaseFinetuning
 
 from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
@@ -41,6 +42,7 @@ import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 
+from torch.nn.modules.batchnorm import _BatchNorm
 
 T_co = TypeVar('T_co', covariant=True)
 
@@ -79,10 +81,10 @@ class RSTGPT2Pair(RSTGPT2):
         # #Freeze all weights except for prefix weight,
         # for name, param in self.model.named_parameters(): 
         #     param.requires_grad = False
+            
+    def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt,position_ids_keyphrase, position_ids_utt, **kwargs ):
         
-    def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_kp_utt, **kwargs ):
-        
-        inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_kp_utt)
+        inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_keyphrase, position_ids_utt)
 
         #appending title token embed
         title_embeds = self.transformer.wte(kwargs.get('ids_title'))
@@ -544,6 +546,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
+                                                    num_sanity_val_steps=0,
                                                     val_check_interval=0.25,
                                                     **trainer_vars,
                                                     )
@@ -669,17 +672,20 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
     #region
     def step(self, batch, step_name):
 
-        output = self.forward(batch)
+        model_output = self.forward(batch)
         output = {}
         
         if step_name == 'train':
-            output["loss"] = output.loss
-            self.log( "loss", output.loss, sync_dist=True)
+            output["loss"] = model_output.loss
+            # self.log( "loss", model_output.loss, sync_dist=True)
+            self.log( "loss", model_output.loss, sync_dist=False)
+
 
         else:
             loss_key = f"{step_name}_loss"
-            self.log( loss_key, output.loss, sync_dist=True)
-            output[loss_key]=output.loss
+            # self.log( loss_key, model_output.loss, sync_dist=True)
+            self.log( loss_key, model_output.loss, sync_dist=False)
+            output[loss_key]= model_output.loss
 
         return output
     
@@ -846,7 +852,12 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        optimizer = Adafactor(self.model.parameters(), scale_parameter=True, 
+        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
+
+        
+        parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
+        
+        optimizer = Adafactor(parameters, scale_parameter=True, 
                         relative_step=True, warmup_init=True, lr=None,
                         weight_decay=0.01)
 
@@ -863,7 +874,19 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             lr_scheduler.load_state_dict(lr_scheduler_states[0])
             
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
-    
+
+    def freeze_specific_modules(self, modules, train_bn=True):
+
+        modules = BaseFinetuning.flatten_modules(modules)
+
+        for mod in modules:
+            if isinstance(mod, _BatchNorm) and train_bn:
+                BaseFinetuning.make_trainable(mod)
+            else:
+                # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
+                for param in mod.parameters(recurse=False):
+                    param.requires_grad = False
+                    
     def return_params(self):
         params = {}
         keys = ['batch_size', 'accumulate_grad_batches', 'learning_rate', 'max_epochs', 'dir_data'
@@ -1230,5 +1253,5 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# dullduks server version 1 - No Freezing, Full RST
-# CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT2.py --batch_size 60 --version 2 --precision 16 --mode finetune --workers 13 --scale_grad_by_freq 1 --max_epochs 50 --gpus 1 --tag RSTGPT2 --max_len_utt 180 --max_len_rst 20 --max_len_key_phrase 38 --tag RSTGPT2 --learning_rate 3e-4 
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 11 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 11 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 12 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with non rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 12 --max_len_key_phrase 40 --rst_aligned_attention 0 --rst_segment_method segbot
