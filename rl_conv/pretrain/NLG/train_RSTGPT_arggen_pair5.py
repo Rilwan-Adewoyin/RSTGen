@@ -1,7 +1,15 @@
+#Train on two datasets
+#Input title information through cross attention
+
 import os
+from torch.optim import lr_scheduler
+import transformers
 
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-os.environ['TOKENIZERS_PARALLELISM'] = "false"
+os.environ['TOKENIZERS_PARALLELISM'] = "true"
+os.environ['NCCL_P2P_DISABLE'] = "0"
+os.environ['NCCL_P2P_LEVEL'] = "5"
+os.environ['NCCL_SHM_DISABLE'] = "1"
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import string
 import argparse
@@ -81,18 +89,45 @@ class RSTGPT2Pair(RSTGPT2):
         # #Freeze all weights except for prefix weight,
         # for name, param in self.model.named_parameters(): 
         #     param.requires_grad = False
+
+        self.title_embedding = copy.deepcopy( self.transformer.h[0] )
+    
+    def init_title_embedding(self):
+        #self.title_embedding = copy.deepcopy( self.transformer.h[0])
+        pass
+
             
+
     def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt,position_ids_keyphrase, position_ids_utt, **kwargs ):
         
         inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_keyphrase, position_ids_utt)
 
         #appending title token embed
         title_embeds = self.transformer.wte(kwargs.get('ids_title'))
-        inputs_embed = torch.cat( [title_embeds, inputs_embed], axis=-2 )
-        
         #appending title position embedding
         position_embed_title = self.transformer.wpe( kwargs.get('position_ids_title') )
-        position_embed = torch.cat( [position_embed_title, position_embed] , axis=1 )
+        title_embeds = title_embeds+ position_embed_title
+
+        #attention mask causal 
+        _dim0 = title_embeds.shape[0]
+        _dim1 = title_embeds.shape[1]
+        am = torch.stack( [ torch.tril( title_embeds.new_ones( ( _dim1, _dim1 ),dtype=torch.long ) ) for x in range(_dim0) ] ,dim=0 )
+        padding_pos = [ torch.where( id_title==self.config.eos_token_id )[0] for id_title in kwargs.get('ids_title') ]
+        for idx,pos in enumerate(padding_pos):
+            if pos.numel()>0:
+                am[idx][pos[0]:, :] = 0
+                am[idx][:, pos[0]:] = 0
+        attention_mask = am[:, None, : , :]
+        attention_mask = attention_mask.to(dtype=title_embeds.dtype)  # fp16 compatibility
+        attention_mask = (1.0 - attention_mask) * -10000.0
+
+        #title new embedding
+        title_embeds = self.title_embedding(title_embeds, attention_mask=attention_mask )[0] 
+        inputs_embed = torch.cat( [title_embeds, inputs_embed], axis=-2 )
+        
+
+        # Position embeds added before so just add zero here
+        position_embed = torch.cat( [ torch.zeros_like( position_embed_title ) , position_embed] , axis=1 )
         
         return inputs_embed, position_embed
 
@@ -178,7 +213,7 @@ class RSTTokenizerPair(RSTTokenizer):
         if title != None:
             title = title.lstrip(string.punctuation+" ")
             title = ' '.join( title.split(' ')[:self.max_len_title] )
-            title = self.title_start_token + title
+            # title = self.title_start_token + title #NEW
             ids_title = self.encode(title, add_special_tokens=False,
                 return_attention_mask=False,
                 padding= 'max_length' if max_title_len else 'do_not_pad',
@@ -397,7 +432,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./dataset_cmv/dyploc_pair_rst",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=8, type=int)
+        parser.add_argument('--max_epochs', default=12, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
@@ -438,14 +473,15 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             model = RSTGPT2Pair(mconfig)
             model.config.vocab_size += 1
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
-            model.load_state_dict( pytorch_state_dict )
+            model.load_state_dict( pytorch_state_dict,strict=False )
+            model.init_title_embedding()
             
                 
             tokenizer = RSTTokenizerPair.from_pretrained(**mparams)
             model.resize_token_embeddings(model.config.vocab_size)
             # set initiation value of new token to that of 
-            # with torch.no_grad():
-            #     model.transformer.wte.weight[ -1:, : ] = model.transformer.wte.weight[ -4:-3, : ]
+            with torch.no_grad():
+                model.transformer.wte.weight[ -1:, : ] = model.transformer.wte.weight[ -4:-3, : ]
 
             training_module = RSTGPT2Pair_TrainingModule(model.config, **tparams, model=model, tokenizer=tokenizer)
 
@@ -520,15 +556,14 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback) 
 
         early_stop_callback = EarlyStopping(
-            monitor='val_loss',
+            monitor='val_loss', 
             min_delta=0.00,
-            patience = 16,       
+            patience = 12,       
             verbose=False,
             mode='min'
         )
-
-        callbacks.append(checkpoint_callback)
         callbacks.append(early_stop_callback)
+        callbacks.append(checkpoint_callback)
 
         if tparams['gpus'] in [0, 1]:
             trainer_vars = {}
@@ -550,8 +585,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
-                                                    num_sanity_val_steps=0,
-                                                    val_check_interval=0.33,
+                                                    # val_check_interval=1.0,
                                                     **trainer_vars,
                                                     )
 
@@ -566,7 +600,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=0.5,
+                                                    val_check_interval=0.25 ,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
@@ -687,9 +721,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
         else:
             loss_key = f"{step_name}_loss"
-            # self.log( loss_key, model_output.loss, sync_dist=True)
-            self.log( loss_key, model_output.loss, sync_dist=False)
             output[loss_key]= model_output.loss
+            # self.log( loss_key, model_output.loss, sync_dist=True)
+            self.log( loss_key, model_output.loss, sync_dist=False )
 
         return output
     
@@ -700,7 +734,10 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         output = self.step(batch, "val")
+        # self.log("val_loss", output['val_loss'])
+        self.log_dict({'val_loss': output['val_loss']} )
         return output
+            
 
     def test_step(self, batch, batch_idx):
         output = self.step(batch, "test")
@@ -714,17 +751,19 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def test_epoch_end(self, outputs: List[dict]):
         self.epoch_end_log(outputs, "test")
-    #endregion
     
     def epoch_end_log(self, outputs, step_name):
 
         if step_name == "train":
             pass
         else:
+            key = "{step_name}_loss"
             loss = torch.stack([x[f"{step_name}_loss"]for x in outputs]).mean()
             
-            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
-        
+            self.log(f"{step_name}_loss", loss ) 
+
+            return { key:loss  }
+
         if False and step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
@@ -814,7 +853,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         
         else:
             pass
+    #endregion
         
+            
     def create_data_loaders(self, modes ):
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
@@ -840,14 +881,12 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             return self.train_dl
 
     def val_dataloader(self):
-        # return self.dg.prepare_dataloader(
-        #         split_name='val')
         return self.val_dl 
 
     def test_dataloader(self):
         return self.test_dl
 
-    @lru_cache()
+    # @lru_cache()
     def total_steps(self):
 
         ds_size = len(self.train_dl) // self.gpus
@@ -856,14 +895,16 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
-
+        self.freeze_specific_modules( self )
+        self.freeze_specific_modules( self.model.title_embedding, unfreeze=True )
         
         parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
-        
+
         optimizer = Adafactor(parameters, scale_parameter=True, 
                         relative_step=True, warmup_init=True, lr=None,
-                        weight_decay=0.01)
+                        weight_decay=0.01, clip_threshold=1.0,
+                        # decay_rate=-0.5
+                         )
 
         lr_scheduler = AdafactorSchedule(optimizer)
 
@@ -879,7 +920,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
-    def freeze_specific_modules(self, modules, train_bn=True):
+    def freeze_specific_modules(self, modules, train_bn=True, unfreeze=False):
 
         modules = BaseFinetuning.flatten_modules(modules)
 
@@ -889,7 +930,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             else:
                 # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
                 for param in mod.parameters(recurse=False):
-                    param.requires_grad = False
+                    param.requires_grad = unfreeze
                     
     def return_params(self):
         params = {}
@@ -1024,7 +1065,7 @@ class SizedOrdered_Sampler(Sampler[int]):
         if shuffle:
             random.shuffle(self.li_chunked_lens)
 
-        # Getting max sizes for rst in each chunk
+        # Getting max sizes for rst in each chunk                       
         self.li_chunk_rst_len = [
             np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_lens]
 

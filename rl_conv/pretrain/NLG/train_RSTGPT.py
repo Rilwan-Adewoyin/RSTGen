@@ -1,4 +1,5 @@
 import os
+import transformers
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 # os.environ['NCCL_SOCKET_IFNAME'] = 'enp226s0f0'
 # os.environ['NCCL_SOCKET_IFNAME'] = 'enp226s0f1'
@@ -8,7 +9,6 @@ os.environ['TOKENIZERS_PARALLELISM'] = "true"
 os.environ['NCCL_P2P_DISABLE'] = "0"
 os.environ['NCCL_P2P_LEVEL'] = "5"
 os.environ['NCCL_SHM_DISABLE'] = "1"
-
 
 from transformers.utils import logging
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
@@ -84,6 +84,51 @@ from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
 logger = logging.get_logger(__name__)
 
+from torch import nn
+from transformers.modeling_utils import Conv1D
+
+def __bias_patched_init__(self, config, is_cross_attention=False, layer_idx=None):
+    super(transformers.models.gpt2.modeling_gpt2.GPT2Attention, self).__init__()
+
+    max_positions = config.max_position_embeddings
+    self.register_buffer(
+        "bias",
+        torch.ones((max_positions, max_positions), dtype=torch.uint8).view(
+            1, 1, max_positions, max_positions
+        ),
+    )
+    self.register_buffer("masked_bias", torch.tensor(-1e4))
+
+    self.embed_dim = config.hidden_size
+    self.num_heads = config.num_attention_heads
+    self.head_dim = self.embed_dim // self.num_heads
+    self.split_size = self.embed_dim
+    if self.head_dim * self.num_heads != self.embed_dim:
+        raise ValueError(
+            f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
+        )
+
+    self.scale_attn_weights = config.scale_attn_weights
+    self.is_cross_attention = is_cross_attention
+
+    # Layer-wise attention scaling, reordering, and upcasting
+    self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
+    self.layer_idx = layer_idx
+    self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
+
+    if self.is_cross_attention:
+        self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+        self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+    else:
+        self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+    self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+
+    self.attn_dropout = nn.Dropout(config.attn_pdrop)
+    self.resid_dropout = nn.Dropout(config.resid_pdrop)
+
+    self.pruned_heads = set()
+
+transformers.models.gpt2.modeling_gpt2.GPT2Attention.__init__ = __bias_patched_init__
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype):
     """
@@ -526,7 +571,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
         position_ids_keyphrase,
         position_ids_utt,
         **kwargs
-    ):
+     ):
         # RST context embedding
         rst_start_token_embed = self.transformer.wte(rst_start_token_id)
         rst_rel_embed = self.embed_rst_rels(rst_rel)
@@ -866,6 +911,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
                             default='None', choices=['None', 'fenghirst', 'segbot'])
         mparams = parser.parse_known_args()[0]
         return mparams
+       
 
 class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerMixin):
     rst_tree_aligned_attention = False
@@ -1704,7 +1750,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--dir_data', default="./dataset_v3_2",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=10, type=int)
+        parser.add_argument('--max_epochs', default=20, type=int)
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient',
@@ -1982,8 +2028,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                 json.dump(existing_results, outfile)
 
     def forward(self, input_):
-        with torch.cuda.amp.autocast(enabled=True):
-            return self.model(**input_, return_dict=True)
+        # with torch.cuda.amp.autocast(enabled=True):
+        return self.model(**input_, return_dict=True)
 
     def step(self, batch, step_name):
 
@@ -2032,8 +2078,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         else:
             loss = torch.stack([x[f"{step_name}_loss"]for x in outputs]).mean()
 
-            self.log(f"{step_name}_loss", loss, logger=True,
-                     prog_bar=True, sync_dist=True, on_step=False)
+            self.log(f"{step_name}_loss", loss, prog_bar=True, sync_dist=True)
 
         # if step_name == "val" and _get_rank() == 0:
         if False and step_name == "val" and self.global_rank == 0:
@@ -2526,6 +2571,7 @@ class SizedOrdered_Sampler(Sampler[int]):
     def __init__(self, data_source, batch_size, shuffle, batching_style='effecient') -> None:
         self.data_source = data_source
         self.batch_size = batch_size
+        self.shuffle = shuffle
 
         # v1
         if batching_style == 'standard':
@@ -2561,8 +2607,8 @@ class SizedOrdered_Sampler(Sampler[int]):
             self.li_chunk_key_phrase_len = [
                 np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_lens]
 
-            self.li_chunked_ordered_lens = np.concatenate(
-                self.li_chunked_lens).tolist()
+            # self.li_chunked_ordered_lens = np.concatenate(
+            #     self.li_chunked_lens).tolist()
 
             # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
             for chunk_idx, data_idxs in enumerate(self.li_chunked_lens):
@@ -2583,7 +2629,14 @@ class SizedOrdered_Sampler(Sampler[int]):
                     self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
 
     def __iter__(self):
-        return iter(self.li_chunked_ordered_lens)
+
+        if self.shuffle:
+            random.shuffle(self.li_chunked_lens)
+
+        li_chunked_ordered_lens = np.concatenate(
+            self.li_chunked_lens).tolist()
+
+        return iter(li_chunked_ordered_lens)
 
     def __len__(self) -> int:
         return len(self.data_source)

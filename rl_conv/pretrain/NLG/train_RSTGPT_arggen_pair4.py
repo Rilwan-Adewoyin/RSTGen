@@ -1,8 +1,12 @@
+#Uses changemyview dataset from pre-training and the dyploc cmv dataset in sync to finetune
+#The title is simply passed as part of the context
 import os
-
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-os.environ['TOKENIZERS_PARALLELISM'] = "false"
+os.environ['TOKENIZERS_PARALLELISM'] = "true"
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
+import train_RSTGPT
+
 import string
 import argparse
 import copy
@@ -21,7 +25,6 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-
 import torch.distributed as dist
 import ujson
 import yaml
@@ -58,7 +61,6 @@ for path_ in modules_paths:
     if path_ not in sys.path:
         sys.path.append(path_)
 from torch.nn.utils.rnn import pad_sequence
-from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
@@ -106,7 +108,7 @@ class RSTGPT2Pair(RSTGPT2):
         parser.add_argument('--max_len_utt', type=int, default=140)
         parser.add_argument('--max_len_rst', type=int, default=30)
         parser.add_argument('--max_len_key_phrase', type=int, default=40)
-        parser.add_argument('--max_len_title', type=int, default=30)
+        parser.add_argument('--max_len_title', type=int, default=40)
         
         parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -548,10 +550,10 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
                                                     val_check_interval=0.33,
+                                                    multiple_trainloader_mode="min_size",
                                                     **trainer_vars,
                                                     )
 
@@ -567,9 +569,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
                                                     val_check_interval=0.5,
-                                                    reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
+                                                    multiple_trainloader_mode="min_size",
                                                     **trainer_vars,
                                                     )
 
@@ -670,24 +672,36 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             raise NotImplementedError
 
     def forward(self, input_):
-        with torch.cuda.amp.autocast(enabled=True):
+        # with torch.cuda.amp.autocast(enabled=True):
+        # with torch.autocast():
             return self.model(**input_, return_dict=True)
 
     #region
     def step(self, batch, step_name):
 
-        model_output = self.forward(batch)
         output = {}
         
         if step_name == 'train':
-            output["loss"] = model_output.loss
-            # self.log( "loss", model_output.loss, sync_dist=True)
-            self.log( "loss", model_output.loss, sync_dist=False)
+            model_output_dyploc = self.forward(batch['dyploc_dset'])
+            model_output_reg = self.forward(batch['regularization'])
+
+            loss = model_output_dyploc.loss + model_output_reg.loss
+
+            with torch.no_grad():
+                loss *= 0.5
+            
+            output["loss"]  = loss
+            output["loss/dyploc"] = model_output_dyploc.loss.detach()
+            output["loss/reg"] = model_output_reg.loss.detach()
+
+            self.log( "loss", output["loss"], sync_dist=False)
+            self.log( "loss/dyploc", output["loss/dyploc"], sync_dist=False)
+            self.log( "loss/reg", output["loss/reg"], sync_dist=False)
 
 
         else:
+            model_output = self.forward(batch)
             loss_key = f"{step_name}_loss"
-            # self.log( loss_key, model_output.loss, sync_dist=True)
             self.log( loss_key, model_output.loss, sync_dist=False)
             output[loss_key]= model_output.loss
 
@@ -858,7 +872,6 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
         self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
 
-        
         parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
         
         optimizer = Adafactor(parameters, scale_parameter=True, 
@@ -945,6 +958,19 @@ class DataLoaderGenerator():
             bs = self.batch_size
             sampler = True
             sample_kps = True
+
+            ds_regularization = train_RSTGPT.SingleDataset( "./dataset_v3_2/changemyview/0000511465",
+                                    copy.deepcopy(self.tokenizer),0,int(511465*0.6),inference=False, sample_kps=True  )
+            
+            sampler_regularization = SizedOrderedSamplerRegularizer(
+                ds_regularization, bs, shuffle=shuffle )
+
+            dl_regularization = torch.utils.data.DataLoader( ds_regularization,
+                                                             bs,
+                                                             num_workers=self.workers//2,
+                                                             sampler=sampler_regularization,
+                                                             pin_memory=True,
+                                                             collate_fn = self.tokenizer.default_collate_pad )
             
 
         elif split_name == 'val':
@@ -983,15 +1009,20 @@ class DataLoaderGenerator():
 
         dataloader = torch.utils.data.DataLoader(ds, 
                                                 batch_size= bs ,
-                                                 num_workers=self.workers if sampler else 1, 
+                                                 num_workers=self.workers//2 if sampler else 1, 
                                                  sampler = sampler,
                                                  pin_memory=True,
                                                  collate_fn=self.tokenizer.default_collate_pad,
                                                 #  timeout=30
                                                 )
 
-                                                 
-        return dataloader
+        
+        if split_name == "train":
+
+            return { 'dyploc_dset':dataloader , 'regularization':dl_regularization }
+
+        else:
+            return dataloader
 
 class SizedOrdered_Sampler(Sampler[int]):
     r"""Samples elements sequentially, always in the same order.
@@ -1097,7 +1128,6 @@ class SingleDataset(Dataset):
             # len of keyphrase
             li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
             li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            #TODO: This was corrected so need to remake dict_cache_records
             li_kp = [ '<|kp|> ' + '<|kp|> '.join(li_kp) for li_kp in li_li_kp  ]
             
             self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
@@ -1221,6 +1251,73 @@ class SingleDataset(Dataset):
 
         return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title
 
+class SizedOrderedSamplerRegularizer(Sampler[int]):
+    r"""Samples elements sequentially, always in the same order.
+    #TODO; add this to pytorch. Sampler to sort nlp datasets by size
+    Args:
+        data_source (Dataset): dataset to sample from
+    """
+
+    def __init__(self, data_source, batch_size, shuffle) -> None:
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+
+        np_txt_lens = self.data_source.np_textlens
+        np_rst_lens = self.data_source.np_rstlens
+        np_key_phrase_lens = self.data_source.np_keyphrase_lens
+
+        # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
+        
+        random_idxs = np.random.random( np_txt_lens.size )
+        np_ordered_lens = np.lexsort(
+            (random_idxs, np_rst_lens, np_key_phrase_lens, np_txt_lens))
+        # We Randomly re-arrange them in batches of batch size
+
+        self.li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
+                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
+
+        if shuffle:
+            random.shuffle(self.li_chunked_lens)
+
+        # Getting max sizes for rst in each chunk
+        self.li_chunk_rst_len = [
+            np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_lens]
+
+        self.li_chunk_key_phrase_len = [
+            np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_lens]
+        
+        # self.li_chunked_ordered_lens = np.concatenate(
+        #         self.li_chunked_lens).tolist()
+
+        # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
+        for chunk_idx, data_idxs in enumerate(self.li_chunked_lens):
+            
+            rst_len = self.li_chunk_rst_len[chunk_idx]
+            key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
+            
+            for data_idx in data_idxs:
+                self.data_source.rst_len[data_idx] = rst_len
+                self.data_source.key_phrase_len[data_idx] = key_phrase_len
+
+                
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.li_chunked_lens)
+
+        li_chunked_ordered_lens = np.concatenate(
+                self.li_chunked_lens).tolist()
+
+        return iter(li_chunked_ordered_lens)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+    
+
+
+
+
 def main(tparams={}, mparams={}):
 
     # Defining Logger
@@ -1265,5 +1362,5 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 11 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 11 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 12 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with non rst aligned attn" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 12 --max_len_key_phrase 40 --rst_aligned_attention 0 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 115 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc , new data and old data together" --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 11 --max_len_key_phrase 40 --rst_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTGPT_arggen_pair.py --batch_size 12 --version 125 --workers 6 --scale_grad_by_freq 1 --tag "RSTGPT2 Dyploc with non rst aligned attn" --max_len_title 40 --max_len_utt 240 --max_len_rst 36 --max_len_key_phrase 64 --finetune_version 12 --max_len_key_phrase 40 --rst_aligned_attention 0 --rst_segment_method segbot

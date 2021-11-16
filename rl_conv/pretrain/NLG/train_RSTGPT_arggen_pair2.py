@@ -81,18 +81,44 @@ class RSTGPT2Pair(RSTGPT2):
         # #Freeze all weights except for prefix weight,
         # for name, param in self.model.named_parameters(): 
         #     param.requires_grad = False
+
+        self.title_embedding = copy.deepcopy( self.transformer.h[0] )
+    
+    def init_title_embedding(self):
+        self.title_embedding = copy.deepcopy( self.transformer.h[0])
+
             
+
     def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt,position_ids_keyphrase, position_ids_utt, **kwargs ):
         
         inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_keyphrase, position_ids_utt)
 
         #appending title token embed
         title_embeds = self.transformer.wte(kwargs.get('ids_title'))
-        inputs_embed = torch.cat( [title_embeds, inputs_embed], axis=-2 )
-        
         #appending title position embedding
         position_embed_title = self.transformer.wpe( kwargs.get('position_ids_title') )
-        position_embed = torch.cat( [position_embed_title, position_embed] , axis=1 )
+        title_embeds = title_embeds+ position_embed_title
+
+        #attention mask causal 
+        _dim0 = title_embeds.shape[0]
+        _dim1 = title_embeds.shape[1]
+        am = torch.stack( [ torch.tril( title_embeds.new_ones( ( _dim1, _dim1 ),dtype=torch.long ) ) for x in range(_dim0) ] ,dim=0 )
+        padding_pos = [ torch.where( id_title==self.config.eos_token_id )[0] for id_title in kwargs.get('ids_title') ]
+        for idx,pos in enumerate(padding_pos):
+            if pos.numel()>0:
+                am[idx][pos[0]:, :] = 0
+                am[idx][:, pos[0]:] = 0
+        attention_mask = am[:, None, : , :]
+        attention_mask = attention_mask.to(dtype=title_embeds.dtype)  # fp16 compatibility
+        attention_mask = (1.0 - attention_mask) * -10000.0
+
+        #title new embedding
+        title_embeds = self.title_embedding(title_embeds, attention_mask=attention_mask )[0] 
+        inputs_embed = torch.cat( [title_embeds, inputs_embed], axis=-2 )
+        
+
+        # Position embeds added before so just add zero here
+        position_embed = torch.cat( [ torch.zeros_like( position_embed_title ) , position_embed] , axis=1 )
         
         return inputs_embed, position_embed
 
@@ -438,14 +464,15 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             model = RSTGPT2Pair(mconfig)
             model.config.vocab_size += 1
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
-            model.load_state_dict( pytorch_state_dict )
+            model.load_state_dict( pytorch_state_dict,strict=False )
+            model.init_title_embedding()
             
                 
             tokenizer = RSTTokenizerPair.from_pretrained(**mparams)
             model.resize_token_embeddings(model.config.vocab_size)
             # set initiation value of new token to that of 
-            # with torch.no_grad():
-            #     model.transformer.wte.weight[ -1:, : ] = model.transformer.wte.weight[ -4:-3, : ]
+            with torch.no_grad():
+                model.transformer.wte.weight[ -1:, : ] = model.transformer.wte.weight[ -4:-3, : ]
 
             training_module = RSTGPT2Pair_TrainingModule(model.config, **tparams, model=model, tokenizer=tokenizer)
 
@@ -522,7 +549,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 16,       
+            patience = 90,       
             verbose=False,
             mode='min'
         )
@@ -551,7 +578,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    val_check_interval=0.33,
+                                                    val_check_interval=0.25,
                                                     **trainer_vars,
                                                     )
 
@@ -566,7 +593,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=0.5,
+                                                    val_check_interval=0.25 ,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=2,
                                                     replace_sampler_ddp=False,
@@ -856,8 +883,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
-
+        self.freeze_specific_modules( self )
+        self.freeze_specific_modules( self.model.title_embedding, unfreeze=True )
+        
         
         parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
         
@@ -879,7 +907,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
-    def freeze_specific_modules(self, modules, train_bn=True):
+    def freeze_specific_modules(self, modules, train_bn=True, unfreeze=False):
 
         modules = BaseFinetuning.flatten_modules(modules)
 
@@ -889,7 +917,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             else:
                 # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
                 for param in mod.parameters(recurse=False):
-                    param.requires_grad = False
+                    param.requires_grad = unfreeze
                     
     def return_params(self):
         params = {}
