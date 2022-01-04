@@ -1,16 +1,14 @@
 import os
 
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-os.environ['TOKENIZERS_PARALLELISM'] = "false"
-# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ['TOKENIZERS_PARALLELISM'] = "true"
 import string
 import argparse
 import copy
 import glob
 import inspect
 import json
-import pickle
-import random
+from train_RSTGPT_arggen_pair4 import SingleDataset, SizedOrderedBatchSampler, RSTGPT2_Config, SizedOrderedDistributedBatchSampler, RSTTokenizerPair, RSTGPT2Pair
 import traceback
 import types
 from functools import lru_cache
@@ -62,198 +60,7 @@ from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_Training
 
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
-
-class RSTGPT2PairConfig(RSTGPT2_Config):
-    
-    def __init__(self, max_len_title=22, **kwargs):
-        kwargs['model_name'] = "RSTGPT2Pair"
         
-        super().__init__(**kwargs)
-        self.extra_pair_tokens = 1
-        self.vocab_size = self.vocab_size + self.extra_pair_tokens
-        self.max_len_title = max_len_title
-        
-class RSTGPT2Pair(RSTGPT2):
-    
-    def __init__(self, config: RSTGPT2PairConfig):
-        
-        super().__init__(config)
-        # #Freeze all weights except for prefix weight,
-        # for name, param in self.model.named_parameters(): 
-        #     param.requires_grad = False
-            
-    def embed(self, rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt,position_ids_keyphrase, position_ids_utt, **kwargs ):
-        
-        inputs_embed, position_embed = super().embed(rst_start_token_id, rst_rel, rst_ns, rst_pos, key_phrase_ids, li_kprstpos, input_ids_utt, position_ids_keyphrase, position_ids_utt)
-
-        #appending title token embed
-        title_embeds = self.transformer.wte(kwargs.get('ids_title'))
-        inputs_embed = torch.cat( [title_embeds, inputs_embed], axis=-2 )
-        
-        #appending title position embedding
-        position_embed_title = self.transformer.wpe( kwargs.get('position_ids_title') )
-        position_embed = torch.cat( [position_embed_title, position_embed] , axis=1 )
-        
-        return inputs_embed, position_embed
-
-    @staticmethod
-    def parse_model_specific_args(parent_parser):
-        parser = argparse.ArgumentParser(
-            parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--base_model_name',
-                            default='gpt2', required=False)
-        parser.add_argument('--model_name', default='RSTGPT2Pair', required=False)
-        parser.add_argument('--max_len_utt', type=int, default=140)
-        parser.add_argument('--max_len_rst', type=int, default=30)
-        parser.add_argument('--max_len_key_phrase', type=int, default=40)
-        parser.add_argument('--max_len_title', type=int, default=30)
-        
-        parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
-                            help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
-        parser.add_argument('--rst_tree_aligned_attention',
-                            type=lambda x: bool(int(x)), default=False)
-        mparams = parser.parse_known_args()[0]
-        return mparams
-
-    @classmethod
-    def load_model_tokenizer(cls, model_name="RSTGPT2Pair", model_version=None, mparams_new={}, device="cuda:0"):
-
-        if model_version != None:
-            # load from a pretrained RSTGPT2
-            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
-                f'./models/{model_name}/version_{model_version}/checkpoints')
-
-            mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name', 'model_name', 'max_len_key_phrase',
-                'max_len_rst', 'max_len_utt','max_len_title',
-                'scale_grad_by_freq', 'rst_tree_aligned_attention']}
-
-            # overriding with new keys
-            for key, value in mparams_new.items():
-                mparams[key] = value
-
-            mconfig = RSTGPT2PairConfig.from_pretrained(
-                mparams['base_model_name'], **mparams)
-
-            model = RSTGPT2Pair(mconfig)
-
-            # Loading Training Module
-            training_module = RSTGPT2Pair_TrainingModule(
-                mconfig, mode='inference', model=model)
-            training_module.load_state_dict(checkpoint['state_dict'])
-
-            model = training_module.model
-            tok = training_module.tokenizer
-
-            # Deleting checkpoints to free up GPU space
-            del checkpoint
-            torch.cuda.empty_cache()
-
-            # if torch.cuda.is_available():
-            if device != 'cpu' and torch.cuda.is_available():
-                model = model.to(device)
-
-            return model, tok
-
-        else:
-            raise ValueError(
-                "At least one of model_version or mconfig must not be None ")
-class RSTTokenizerPair(RSTTokenizer):
-
-    title_start_token = "<|tl|>"
-    max_len_title = 20
-    
-    def __init__(self, *args, **kwargs):
-        
-        super().__init__(*args, **kwargs)
-        
-        self.pad_token =  self.eos_token
-        self.max_len_title = kwargs.get( 'max_len_title' , self.max_len_title)
-
-    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, title='', max_title_len=None):
-       
-        encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_len_rst=max_len_rst, max_len_key_phrase=max_len_key_phrase, exclude_from_output=exclude_from_output, device=device)
-
-        #encoding title
-        if title != None:
-            title = title.lstrip(string.punctuation+" ")
-            title = ' '.join( title.split(' ')[:self.max_len_title] )
-            title = self.title_start_token + title
-            ids_title = self.encode(title, add_special_tokens=False,
-                return_attention_mask=False,
-                padding= 'max_length' if max_title_len else 'do_not_pad',
-                truncation=True,
-                max_length=max_title_len if max_title_len else self.max_len_title,
-                return_tensors='pt')[0]
-        else:
-           ids_title = torch.tensor([],dtype=torch.long)
-           
-        title_pad = (ids_title == self.pad_token_id).sum(dim=0)
-                
-        encoded['ids_title'] = ids_title
-        
-        # chaining positions
-        positions_ids_title= torch.arange(0, ids_title.shape[0], dtype=torch.long)
-       
-        encoded['position_ids_title'] = positions_ids_title
-        
-        title_len = ids_title.shape[0]
-       
-        #changing labels
-        if encoded.get('labels') is not None:
-            new_labels = positions_ids_title.new_full( [title_len] , -100 )
-            encoded['labels'] = torch.cat( [new_labels, encoded['labels'] ] )
-        
-        # changing attn
-        encoded['attention_mask'] = torch.nn.functional.pad( encoded['attention_mask'],
-                                                                (title_len,0,title_len,0), value=0)
-            #causal over two new sections
-        encoded['attention_mask'][ :title_len , :title_len ] = torch.tril( torch.ones_like(encoded['attention_mask'][ :title_len , :title_len ]) )
-            #allowing text to attend two title
-        encoded['attention_mask'][ -encoded['input_ids_utt'].shape[0]: , :title_len] = 1
-            
-            #handling padding
-        encoded['attention_mask'][ title_len-title_pad:title_len, : ] = 0
-        encoded['attention_mask'][ :, title_len-title_pad:title_len ] = 0
-        
-        return encoded 
-
-    @classmethod
-    def from_pretrained(cls,
-                        dir_tokenizer="./tokenizers/RSTGPT2Pair",
-                        base_tokenizer_name="gpt2",
-                        rst_params={},
-                        **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
-
-        if os.path.exists(dir_tokenizer):
-            tokenizer = super(RSTTokenizer, cls).from_pretrained(
-                dir_tokenizer, local_files_only=True, **kwargs, **rst_params)
-
-        else:
-
-            at_title_start = AddedToken(cls.title_start_token, lstrip=False, rstrip=False) if isinstance(
-                cls.title_start_token, str) else cls.title_start_token
-            additional_special_tokens = [at_title_start]
-
-            cls = super(RSTTokenizerPair, cls).from_pretrained(
-                                                                dir_tokenizer=dir_tokenizer,
-                                                                base_tokenizer_name="gpt2",
-                                                                additional_special_tokens=additional_special_tokens)
-
-            cls.save_pretrained(dir_tokenizer)
-            tokenizer = cls
-
-
-        tokenizer.title_start_token_id = torch.full( (1,), 50259 , dtype=torch.long )
-        tokenizer.rst_start_token_id = torch.full( (1,), 50257 , dtype=torch.long )
-        tokenizer.keyphrase_start_token_id = torch.full( (1,), 50258 , dtype=torch.long )        
-        tokenizer.keyphrase_start_token_id_np = tokenizer.keyphrase_start_token_id.numpy()
-
-        for k, v in kwargs.items():
-            setattr(tokenizer, k, v)
-
-        return tokenizer
-    
 class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def __init__(self,
@@ -439,6 +246,8 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             model.config.vocab_size += 1
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict )
+            model.correct_attn_bias()
+
             
                 
             tokenizer = RSTTokenizerPair.from_pretrained(**mparams)
@@ -471,6 +280,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
             model = RSTGPT2Pair(mconfig)
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict )
+            model.correct_attn_bias()
             tokenizer = RSTTokenizerPair.from_pretrained(**mparams)            
             training_module = RSTGPT2Pair_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
 
@@ -548,10 +358,9 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    reload_dataloaders_every_n_epochs=1,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    val_check_interval=0.33,
+                                                    val_check_interval=0.9999,
                                                     **trainer_vars,
                                                     )
 
@@ -566,9 +375,10 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks, 
-                                                    val_check_interval=0.5,
                                                     reload_dataloaders_every_n_epochs=1,
-                                                    num_sanity_val_steps=2,
+                                                    num_sanity_val_steps=0,
+                                                    val_check_interval=0.9999,
+
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars,
                                                     )
@@ -673,7 +483,7 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         with torch.cuda.amp.autocast(enabled=True):
             return self.model(**input_, return_dict=True)
 
-    #region
+    
     def step(self, batch, step_name):
 
         model_output = self.forward(batch)
@@ -973,253 +783,27 @@ class DataLoaderGenerator():
             inference = True
             sample_kps = False
             
+        ds = SingleDataset(fn, copy.deepcopy( self.tokenizer), inference, sample_kps=sample_kps )
 
-        if 'custom_dset_class' in kwargs:
-            ds = kwargs.get('custom_dset_class')(fn, self.tokenizer,inference, sample_kps=sample_kps)
+        if self.gpus <= 1 and split_name not in ['inference', 'test']:
+            sampler = SizedOrderedBatchSampler(ds, bs, True, shuffle=True) if sampler else sampler
+            bs = None
+        
         else:
-            ds = SingleDataset(fn, self.tokenizer,inference, sample_kps=sample_kps )
-        sampler = SizedOrdered_Sampler(ds, bs, shuffle) if sampler else sampler
+            sampler = SizedOrderedDistributedBatchSampler(ds, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus)
+            bs = None
 
 
         dataloader = torch.utils.data.DataLoader(ds, 
-                                                batch_size= bs ,
-                                                 num_workers=self.workers if sampler else 1, 
-                                                 sampler = sampler,
+                                                 batch_size=bs,
+                                                 num_workers=self.workers//2 if sampler else 1, 
+                                                 batch_sampler = sampler,
                                                  pin_memory=True,
                                                  collate_fn=self.tokenizer.default_collate_pad,
-                                                #  timeout=30
                                                 )
 
                                                  
         return dataloader
-
-class SizedOrdered_Sampler(Sampler[int]):
-    r"""Samples elements sequentially, always in the same order.
-    #TODO; add this to pytorch. Sampler to sort nlp datasets by size
-    Args:
-        data_source (Dataset): dataset to sample from
-    """
-
-    def __init__(self, data_source, batch_size, shuffle) -> None:
-        self.data_source = data_source
-        self.batch_size = batch_size
-
-
-        np_txt_lens = self.data_source.np_textlens
-        np_rst_lens = self.data_source.np_rstlens
-        np_key_phrase_lens = self.data_source.np_keyphrase_lens
-        np_title_lens = self.data_source.np_title_lens
-
-        # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
-        
-        random_idxs = np.random.random( np_txt_lens.size )
-        np_ordered_lens = np.lexsort(
-            (random_idxs, np_rst_lens, np_key_phrase_lens, np_title_lens, np_txt_lens))
-        # We Randomly re-arrange them in batches of batch size
-
-        self.li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
-        self.li_chunked_lens.reverse()
-
-        if shuffle:
-            random.shuffle(self.li_chunked_lens)
-
-        # Getting max sizes for rst in each chunk
-        self.li_chunk_rst_len = [
-            np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_lens]
-
-        self.li_chunk_key_phrase_len = [
-            np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_lens]
-        
-        self.li_chunk_title_len = [
-            np.take(np_title_lens, idxs).max() for idxs in self.li_chunked_lens]
-
-        self.li_chunked_ordered_lens = np.concatenate(
-                self.li_chunked_lens).tolist()
-
-        # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-        for chunk_idx, data_idxs in enumerate(self.li_chunked_lens):
-            
-            rst_len = self.li_chunk_rst_len[chunk_idx]
-            key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
-            title_len = self.li_chunk_title_len[chunk_idx]
-            
-            for data_idx in data_idxs:
-                
-                self.data_source.rst_len[data_idx] = rst_len
-                self.data_source.key_phrase_len[data_idx] = key_phrase_len
-                self.data_source.title_len[data_idx] = title_len
-                
-    def __iter__(self):
-        return iter(self.li_chunked_ordered_lens)
-
-    def __len__(self) -> int:
-        return len(self.data_source)
-    
-class SingleDataset(Dataset):
-    """creates a dataloader given a directory of text files each containing a conversation
-
-        create a custom index which sorts the entries by their length
-    """
-    def __init__(self, file_path, tokenizer, inference,**kwargs):
-        self.fp = file_path
-        self.tokenizer = tokenizer
-        self.inference = inference
-        self.tokenizer.sample_kps = kwargs.get('sample_kps',False)
-        self.data = pd.read_csv(self.fp, sep=',', header=0 )
-
-        fp_cached_order = os.path.join(os.path.dirname(
-            file_path), f"gpt2_dict_lens.pkl")
-
-        # # # resetting the cached order files
-        # if os.path.exists( fp_cached_order):
-        #     os.remove(fp_cached_order)
-
-    
-        if os.path.exists(fp_cached_order):
-            dict_cached_order = pickle.load(open(fp_cached_order, "rb"))
-            self.np_textlens = dict_cached_order['np_textlens']
-            self.np_rstlens = dict_cached_order['np_rstlens']
-            self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
-            self.np_title_lens = dict_cached_order['np_title_lens']
-            
-
-        else:
-            # len of text
-
-            self.np_textlens = np.stack(
-                [self.tokenizer.encode(ujson.loads(txt), return_tensors='np', add_special_tokens=False,
-                                    truncation=False, padding='do_not_pad').size for txt in self.data.txt_preproc.values.tolist()])
-            # len of rst
-            self.np_rstlens = np.array(
-                [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
-
-            # len of keyphrase
-            li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
-            li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            #TODO: This was corrected so need to remake dict_cache_records
-            li_kp = [ '<|kp|> ' + '<|kp|> '.join(li_kp) for li_kp in li_li_kp  ]
-            
-            self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
-                                        add_special_tokens=False, 
-                                        truncation=False,
-                                        padding = 'do_not_pad',
-                                        return_tensors=None).__len__() for kp in li_kp ] )
-            
-
-            li_title = [ f"<|tl|>{ujson.loads(title)}" for title in self.data.prompt.tolist() ]
-            
-            self.np_title_lens = np.array( [self.tokenizer.encode(title,
-                                            truncation=False,
-                                            padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for title in li_title] )
-
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens,
-                                'np_title_lens':self.np_title_lens}
-
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-                              
-        #v2 We initialize the rst/kp lengths as the actual length of each entry
-        # In the Sampler, we change the max length to that of its pre-prescribed batch
-        self.rst_len = copy.deepcopy( self.np_rstlens )
-        self.key_phrase_len = copy.deepcopy( self.np_keyphrase_lens )
-        self.title_len = copy.deepcopy(self.np_title_lens)
-
-        self.data = self.data.to_dict('records')
-
-    def __len__(self):
-        return len( self.data )
-
-    def __getitem__(self, index):
-
-        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title = self.getitem_extract_datum(
-            index)
-
-        if self.inference == True:
-
-            # utterance_prompt = ' '.join(utterance.split(' '))
-            utterance_prompt = ""
-
-            encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
-                                                  li_kp=li_kp,
-                                                  li_kprstpos=li_kprstpos,
-                                                  utterance_prompt=utterance_prompt,
-                                                  dict_pos_edu=dict_pos_edu,
-                                                  max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
-                                                  max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
-                                                    title=title,
-                                                    max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
-
-            encoded['orig_rst_rels'] = rst_rels
-            encoded['orig_rst_ns'] = rst_ns
-            encoded['orig_rst_pos'] = rst_pos
-
-            encoded['orig_utt'] = utterance
-            encoded['orig_key_phrase'] = li_kp
-
-            encoded['orig_dict_pos_edu'] = dict_pos_edu
-            encoded['orig_li_kprstpos'] = li_kprstpos
-            encoded['orig_title'] = title
-
-
-        elif self.inference==False:
-            encoded = self.tokenizer.encode_input(
-                rst_rels, rst_ns, rst_pos,
-                li_kp=li_kp,
-                li_kprstpos=li_kprstpos,
-                utterance=utterance,
-                dict_pos_edu=dict_pos_edu,
-                max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
-                max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
-                title=title,
-                max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
-
-
-        return encoded
-
-    def getitem_extract_datum(self, index):
-
-        datum = self.data[index]
-
-        # region RST
-        li_rst = json.loads(datum['rst'])
-        # list of dictionaries
-        rst_rels = [_dict['rel'] for _dict in li_rst]
-        rst_ns = [_dict['ns'] for _dict in li_rst]
-        rst_pos = [_dict['pos'] for _dict in li_rst]
-
-        # sorting the order to be left to right in binary tree
-        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: (
-            RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]), 
-            ) ]
-
-        rst_rels = [rst_rels[idx] for idx in sorted_order]
-        rst_ns = [rst_ns[idx] for idx in sorted_order]
-        rst_pos = [rst_pos[idx] for idx in sorted_order]
-        # endregion
-
-        # Key phrase scores
-        li_pos_kp = json.loads(datum['li_pos_kp'] )
-        if len(li_pos_kp)>0:
-            li_pos_kp = sorted( li_pos_kp, key=lambda pos_kp: RSTTokenizer.edukp_pos_sort_function(int(pos_kp[0])) )
-            li_kprstpos, li_kp = zip(*li_pos_kp)
-            li_kprstpos = tuple(int(pos) for pos in li_kprstpos)
-        else:
-            li_kp = []
-            li_kprstpos = []
-
-        # Utterance
-        utterance = ujson.loads(datum['txt_preproc'])
-        
-        #title        
-        title = ujson.loads(datum['prompt']).lstrip( string.punctuation )
-        
-        #pos and edus
-        dict_pos_edu = json.loads(datum['dict_pos_edu'])   
-
-        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title
 
 def main(tparams={}, mparams={}):
 

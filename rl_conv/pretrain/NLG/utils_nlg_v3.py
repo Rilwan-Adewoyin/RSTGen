@@ -659,7 +659,32 @@ class RstModelMixin():
         processor.append( kp_logitsproc )
                 
         return processor
+    
+    def discrete_embedding_dropout(self, input_token, emb_tbl, dropoute, scale=None):
         
+        # discrete input dropout
+        # 1. generate binary mark
+        # 2. mask embedding matrix
+        # 3. perform normal lookup of embeddings (some of which are dropped out)
+        if dropoute and emb_tbl.weight.requires_grad and self.training :
+            # 1. generate binary mark
+            mask = emb_tbl.weight.data.new(emb_tbl.weight.size(0), 1).bernoulli_(1 - dropoute).bool()
+            # 2. mask embedding matrix
+            masked_embed_weight = mask * emb_tbl.weight * (1.0/(1 - dropoute))
+            # I think this is important so you do not divide by 0 during normalization?
+            masked_embed_weight.masked_fill_(mask.eq(0), 1e-12)
+        else:
+            masked_embed_weight = emb_tbl.weight
+
+        if scale:
+            masked_embed_weight = scale.expand_as(masked_embed_weight) * masked_embed_weight
+
+        # 3. perform normal lookup of embeddings (some of which are dropped out)
+        X = torch.nn.functional.embedding(input_token, masked_embed_weight,
+                emb_tbl.padding_idx, emb_tbl.max_norm, emb_tbl.norm_type,
+                emb_tbl.scale_grad_by_freq, emb_tbl.sparse)
+        return X
+
 #endregion
 
 #region RST TOkenizer
@@ -883,7 +908,6 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
 #endregion
 
 #region dataloading
-
 class EffeciencyMixin():
     
     def compress_padding( self,
@@ -961,25 +985,20 @@ class EffeciencyMixin():
             dict_output = {}
             for key in elem:
                 li_ = [d[key] for d in batch if d[key]!=None]
+
                 if len(li_)<=1:
                     continue
-                if len(li_)>1:
+                elif len(li_)>1:
                     elem_size = len(li_[0])
-                else:
-                    elem_size = 0
-                
-                if key != 'decoder_cross_attention_mask':
-                    bool_size_check = all(len(elem_) == elem_size for elem_ in li_) 
-                else: 
-                    bool_size_check = all( len(elem_) == elem_size for elem_ in li_) and all( elem_.shape[1] == li_[0].shape[1] for elem_ in li_) 
+
+                bool_size_check = all(len(elem_) == elem_size for elem_ in li_)
+                if key == 'decoder_cross_attention_mask':
+                    bool_size_check = bool_size_check and all( elem_.shape[1] == li_[0].shape[1] for elem_ in li_)
                 
                 if not bool_size_check :
-                    # raise RuntimeError('each element in list of batch should be of equal size')
-                    # it = iter(batch)
                     largest_seq = max( len(elem_) for elem_ in li_ )
                     
                     try:
-                        
                         if li_[0].dim() == 1:
                             
                             if largest_seq>pad_maxlens.get(key):
@@ -996,7 +1015,7 @@ class EffeciencyMixin():
                             
                             for idx in range(len(li_)):
                                 elem_ = li_[idx]
-                                
+                                                                
                                 if key != 'decoder_cross_attention_mask':
 
                                     missing_dims = min( largest_seq, pad_maxlens.get(key) )  - len(elem_)
@@ -1004,9 +1023,7 @@ class EffeciencyMixin():
                                     if missing_dims > 0:
                                         # adding missing_dims paddings to dim 1 which reflects masking the new padding tokens
                                         # adding paddings value 0 - to dim 0 which reflects the 
-
-                                        elem_ = torch.nn.functional.pad( elem_, (0, missing_dims, 0, missing_dims), 
-                                            mode='constant', value=0.0 )
+                                        elem_ = torch.nn.functional.pad( elem_, (0, missing_dims, 0, missing_dims), mode='constant', value=0.0 )
                                                             
                                     elif missing_dims < 0:
                                         elem_ = elem_[ :missing_dims, :missing_dims ]
@@ -1038,15 +1055,19 @@ class EffeciencyMixin():
                                         elem_ = elem_[ :, :missing_dims2 ]
 
                                 li_[idx] = elem_
+                                a = 1
                     
                     except Exception as e:
                         print(key)
-                        raise e 
+                        raise e
                     
                 dict_output[key] = self.default_collate_pad( li_ )    
+                
             return dict_output
-        elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-            return elem_type(*(self.default_collate_pad(samples) for samples in zip(*batch)))        
+
+        elif isinstance(elem, tuple) and hasattr(elem, '_fields'): # namedtuple
+            return elem_type(*(self.default_collate_pad(samples) for samples in zip(*batch))) 
+
         elif isinstance(elem, collections.abc.Sequence):
             # check to make sure that the elements in batch have consistent size
             it = iter(batch)
@@ -1060,7 +1081,6 @@ class EffeciencyMixin():
 #endregion
 
 #region data making
-
 def edu_fixer(li_textwedutoken, li_text):
         
     li_li_edus = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]

@@ -5,7 +5,6 @@ import pickle
 import numpy as np
 
 import torch
-from torch._C import set_flush_denormal
 from models.SegBot.solver import TrainSolver
 from models import SegBot
 

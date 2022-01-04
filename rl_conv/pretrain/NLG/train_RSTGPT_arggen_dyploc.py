@@ -59,6 +59,8 @@ from torch.nn.utils.rnn import pad_sequence
 
 from transformers.utils import logging
 from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
+from train_RSTGPT_arggen_dyploc4 import SingleDataset
+from train_RSTGPT_arggen_pair4 import SizedOrderedBatchSampler, SizedOrderedDistributedBatchSampler
 logger = logging.get_logger(__name__)
 
   
@@ -147,6 +149,7 @@ class RSTGPT2Dyploc(RSTGPT2):
 
             model = training_module.model
             tok = training_module.tokenizer
+            model.correct_attn_bias()
 
             # Deleting checkpoints to free up GPU space
             del checkpoint
@@ -500,6 +503,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             model.config.vocab_size += 2 
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict )
+            model.correct_attn_bias()
             
                 
             tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)
@@ -535,6 +539,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             model = RSTGPT2Dyploc(mconfig)
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict )
+            model.correct_attn_bias()
             tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)            
             training_module = RSTGPT2Dyploc_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
             
@@ -737,8 +742,8 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             raise NotImplementedError
 
     def forward(self, input_):
-        with torch.cuda.amp.autocast(enabled=True):
-            return self.model(**input_, return_dict=True)
+        # with torch.cuda.amp.autocast(enabled=True):
+        return self.model(**input_, return_dict=True)
 
     #region
     def step(self, batch, step_name):
@@ -898,17 +903,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     def create_data_loaders(self, modes ):
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
-                split_name='train', custom_dset_class= SingleDataset)
+                split_name='train',)
             self.train_dl_used = False
         if 'val' in modes:
             self.val_dl = self.dg.prepare_dataloader(
-                split_name='val', custom_dset_class= SingleDataset)
+                split_name='val')
         if 'test' in modes:
             self.test_dl = self.dg.prepare_dataloader(
-                split_name='test',  custom_dset_class= SingleDataset)
+                split_name='test')
         if 'inference' in modes:
             self.inference_dl = self.dg.prepare_dataloader(
-                split_name='inference',  custom_dset_class= SingleDataset)
+                split_name='inference')
 
     def train_dataloader(self):
         # return self.train_dl
@@ -1050,493 +1055,27 @@ class DataLoaderGenerator():
             sample_kps = False
 
 
-        if 'custom_dset_class' in kwargs:
-            ds = kwargs.get('custom_dset_class')(fn, copy.deepcopy( self.tokenizer) ,inference, sample_kps=sample_kps)
-        else:
-            ds = SingleDataset(fn, copy.deepcopy(self.tokenizer), inference, sample_kps=sample_kps )
+        ds = SingleDataset(fn, copy.deepcopy( self.tokenizer), inference, sample_kps=sample_kps )
         
-        if split_name not in ['inference', 'test']:
-            sampler = SizedOrdered_Sampler(ds, bs, shuffle)
+        if self.gpus <= 1 and split_name not in ['inference', 'test']:
+            sampler = SizedOrderedBatchSampler(ds, int( bs  ), True, shuffle=True) if sampler else sampler
+            bs = 1
+        else:
+            sampler = SizedOrderedDistributedBatchSampler(ds, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus)
+            bs = 1
 
-        def collate_fn(
-                batch): return self.tokenizer.default_collate_pad(batch)
-                    
+
         dataloader = torch.utils.data.DataLoader(ds, 
-                                                batch_size= bs ,
-                                                 num_workers=self.workers, 
-                                                 sampler = sampler,
+                                                 num_workers=self.workers if sampler else 1, 
+                                                 batch_size=bs,
+                                                 batch_sampler = sampler,
                                                  pin_memory=True,
-                                                #  collate_fn=self.tokenizer.default_collate_pad,
-                                                 collate_fn=collate_fn)
-                                                #  timeout=30
+                                                 collate_fn=self.tokenizer.default_collate_pad,
+                                                )
                                                 
 
                                                  
         return dataloader
-
-class SizedOrdered_Sampler(Sampler[int]):
-    r"""Samples elements sequentially, always in the same order.
-    #TODO; add this to pytorch. Sampler to sort nlp datasets by size
-    Args:
-        data_source (Dataset): dataset to sample from
-    """
-
-    def __init__(self, data_source, batch_size, shuffle) -> None:
-        self.data_source = data_source
-        self.batch_size = batch_size
-
-
-        np_txt_lens = self.data_source.np_textlens
-        np_rst_lens = self.data_source.np_rstlens
-        np_key_phrase_lens = self.data_source.np_keyphrase_lens
-        np_claim_lens = self.data_source.np_claim_lens
-        np_title_lens = self.data_source.np_title_lens
-
-        # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
-        random_idxs = np.random.random( np_txt_lens.size )
-        
-        np_ordered_lens = np.lexsort(
-            (random_idxs, np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens, np_txt_lens))
-        # We Randomly re-arrange them in batches of batch size
-
-        li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
-
-        if shuffle:
-            random.shuffle(li_chunked_lens)
-
-        # Getting max sizes for rst in each chunk
-        self.li_chunk_rst_len = [
-            np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
-
-        self.li_chunk_key_phrase_len = [
-            np.take(np_key_phrase_lens, idxs).max() for idxs in li_chunked_lens]
-        
-        self.li_chunk_claim_len = [
-            np.take(np_claim_lens, idxs).max() for idxs in li_chunked_lens]
-
-        self.li_chunk_title_len = [
-            np.take(np_title_lens, idxs).max() for idxs in li_chunked_lens]
-
-        self.li_chunked_ordered_lens = np.concatenate(
-                li_chunked_lens).tolist()
-
-        # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-        for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-            
-            rst_len = self.li_chunk_rst_len[chunk_idx]
-            key_phrase_len = self.li_chunk_key_phrase_len[chunk_idx]
-            claim_len = self.li_chunk_claim_len[chunk_idx]
-            title_len = self.li_chunk_title_len[chunk_idx]
-            
-            for data_idx in data_idxs:
-                self.data_source.rst_len[data_idx] = rst_len
-                self.data_source.key_phrase_len[data_idx] = key_phrase_len
-                self.data_source.claim_len[data_idx] = claim_len
-                self.data_source.title_len[data_idx] = title_len
-                
-    def __iter__(self):
-        return iter( copy.deepcopy( self.li_chunked_ordered_lens ) )
-
-    def __len__(self) -> int:
-        return len(self.data_source)
-    
-class SizedOrdered_DistributedSampler(Sampler[T_co]):
-    r"""
-        Adapted so that each process takes sequential indices as opposed to strides across indices
-    """
-    r"""Sampler that restricts data loading to a subset of the dataset.
-        It is especially useful in conjunction with
-        :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
-        process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
-        :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
-        original dataset that is exclusive to it.
-        .. note::
-            Dataset is assumed to be of constant size.
-        Args:
-            dataset: Dataset used for sampling.
-            num_replicas (int, optional): Number of processes participating in
-                distributed training. By default, :attr:`world_size` is retrieved from the
-                current distributed group.
-            rank (int, optional): Rank of the current process within :attr:`num_replicas`.
-                By default, :attr:`rank` is retrieved from the current distributed
-                group.
-            shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
-                indices.
-            seed (int, optional): random seed used to shuffle the sampler if
-                :attr:`shuffle=True`. This number should be identical across all
-                processes in the distributed group. Default: ``0``.
-            drop_last (bool, optional): if ``True``, then the sampler will drop the
-                tail of the data to make it evenly divisible across the number of
-                replicas. If ``False``, the sampler will add extra indices to make
-                the data evenly divisible across the replicas. Default: ``False``.
-        .. warning::
-            In distributed mode, calling the :meth:`set_epoch` method at
-            the beginning of each epoch **before** creating the :class:`DataLoader` iterator
-            is necessary to make shuffling work properly across multiple epochs. Otherwise,
-            the same ordering will be always used.
-        Example::
-            >>> sampler = DistributedSampler(dataset) if is_distributed else None
-            >>> loader = DataLoader(dataset, shuffle=(sampler is None),
-            ...                     sampler=sampler)
-            >>> for epoch in rDange(start_epoch, n_epochs):
-            ...     if is_distributed:
-            ...         sampler.set_epoch(epoch)
-            ...     train(loader)
-        """
-
-    def __init__(self, dataset: Dataset, batch_size: int,
-                 num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None,
-                 seed: int = 0,
-                 shuffle: bool = False,
-                 gpus: int = 2) -> None:
-
-        self.batch_size = batch_size
-
-        if num_replicas is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            #num_replicas = dist.get_world_size()
-            num_replicas = gpus
-        if rank is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            #rank = dist.get_rank()
-            rank = _get_rank()
-        if rank >= num_replicas or rank < 0:
-            raise ValueError(
-                "Invalid rank {}, rank should be in the interval"
-                " [0, {}]".format(rank, num_replicas - 1))
-
-        # normal code
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.epoch = 0
-
-        # self.num_samples
-        #self.total_size = self.num_samples * self.num_replicas
-        self.seed = seed
-
-        # new code
-        #self.dataset = dataset
-        self.data_source = dataset
-        np_txt_lens = np.concatenate(
-            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-        np_rst_lens = np.concatenate(
-            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-        np_key_phrase_lens = np.concatenate(
-            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
-        np_claim_lens = np.concatenate(
-            [ds.np_claim_lens for ds in self.data_source.datasets]).flatten()
-        np_title_lens = np.concatenate(
-            [ds.np_title_lens for ds in self.data_source.datasets]).flatten()
-        
-        # Indices are sorted in order of the text lens of records in the datasets
-        random_idxs = np.random.random( np_title_lens.size )
-        np_ordered_lens = np.lexsort(
-            (random_idxs, np_rst_lens, np_key_phrase_lens, np_claim_lens+np_title_lens , np_txt_lens))
-
-        # We Randomly re-arrange them in batches of batch size
-        li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                           for idx in range(0, np_ordered_lens.size-batch_size, batch_size)]
-
-        # Divide into n sublists,
-        # Each sublist at index i, contains the indices for process at rank i
-        # Each sublist at index i, is a list non flatten indices. Each index represents items in the dataset
-
-        li_li_chunked_lens = [
-            [li_chunked_lens[(self.num_replicas*idx)+_rank]
-             for idx in range(len(li_chunked_lens)//self.num_replicas)]
-            for _rank in range(self.num_replicas)]
-
-        # shuffle each processes subllist in the same order to optimize paralel training
-        _ = list(zip(*li_li_chunked_lens))
-
-        if shuffle:
-            random.shuffle(_)
-
-        # unpacking into worker size length list
-        li_li_chunked_lens = list(zip(*_))
-
-        # Getting max sizes for rst and key_phrase in each chunk
-        self.li_li_chunk_rst_len = [[np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
-                                    for li_chunked_lens in li_li_chunked_lens]
-        self.li_li_chunk_key_phrase_len = [[np.take(np_key_phrase_lens, idxs).max()
-            for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens]
-
-        self.li_li_chunk_claim_len = [[np.take(np_claim_lens, idxs).max()
-            for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens]
-
-        self.li_li_chunk_title_len = [[np.take(np_title_lens, idxs).max()
-            for idxs in li_chunked_lens] for li_chunked_lens in li_li_chunked_lens]
-
-        self.li_li_chunked_ordered_lens = [np.concatenate(
-            li_chunked_lens).tolist() for li_chunked_lens in li_li_chunked_lens]
-        
-
-        for (li_chunked_lens, li_chunk_rst_len, li_chunk_key_phrase_len, li_chunk_claim_len, li_chunk_title_len) in zip(li_li_chunked_lens, self.li_li_chunk_rst_len, self.li_li_chunk_key_phrase_len, self.li_li_chunk_claim_len, self.li_li_chunk_title_len ):
-            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-
-            for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-                
-                rst_len = li_chunk_rst_len[chunk_idx]
-                key_phrase_len = li_chunk_key_phrase_len[chunk_idx]
-                claim_len = self.li_chunk_claim_len[chunk_idx]
-                title_len = self.li_chunk_title_len[chunk_idx]
-            
-                for data_idx in data_idxs:
-                    dataset_idx = bisect.bisect_right(
-                        self.data_source.cumulative_sizes, data_idx)
-
-                    if dataset_idx == 0:
-                        sample_idx = data_idx
-                    else:
-                        sample_idx = data_idx - \
-                            self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
-                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = key_phrase_len
-                    self.data_source.datasets[dataset_idx].claim_len[sample_idx] = claim_len
-                    self.data_source.datasets[dataset_idx].title_len[sample_idx] = title_len
-
-    def __iter__(self) -> Iterator[T_co]:
-
-        return iter(self.li_li_chunked_ordered_lens[self.rank])
-
-    def __len__(self) -> int:
-        if self.batch_size != -1:
-            return len(self.data_source)
-        else:
-            return len(self.li_li_chunked_ordered_lens[0])
-
-    def set_epoch(self, epoch: int) -> None:
-        r"""
-        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
-        use a different random ordering for each epoch. Otherwise, the next iteration of this
-        sampler will yield the same ordering.
-        Args:
-            epoch (int): Epoch number.
-        """
-        self.epoch = epoch
-    
-class SingleDataset(Dataset):
-    """creates a dataloader given a directory of text files each containing a conversation
-
-        create a custom index which sorts the entries by their length
-    """
-    def __init__(self, file_path, tokenizer, inference,**kwargs):
-        self.fp = file_path
-        self.tokenizer = tokenizer
-        self.inference = inference
-        self.data = pd.read_csv(self.fp, sep=',', header=0 )
-        self.tokenizer.sample_kps = kwargs.get('sample_kps',False)
-
-        
-        fp_cached_order = os.path.join(os.path.dirname(
-            file_path), f"gpt2_dict_lens.pkl")
-
-        # # # resetting the cached order files
-        # if os.path.exists( fp_cached_order):
-        #     os.remove(fp_cached_order)
-
-    
-        if os.path.exists(fp_cached_order):
-            dict_cached_order = pickle.load(open(fp_cached_order, "rb"))
-            self.np_textlens = dict_cached_order['np_textlens']
-            self.np_rstlens = dict_cached_order['np_rstlens']
-            self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
-            self.np_title_lens = dict_cached_order['np_title_lens']
-            try:
-                self.li_claim_lens = dict_cached_order['li_claim_lens']
-            except KeyError as e:
-                li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
-                li_claims = [ [ f"<|cl|>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
-                
-                self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
-                                                add_special_tokens=False, 
-                                                truncation=False,
-                                                padding = 'do_not_pad',
-                                                return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
-                dict_cached_order['li_claim_lens'] = self.li_claim_lens
-                pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-
-                
-        else:
-            # len of text
-
-            self.np_textlens = np.stack(
-                [self.tokenizer.encode(ujson.loads(txt), return_tensors='np', add_special_tokens=False,
-                                    truncation=False, padding='do_not_pad').size for txt in self.data.txt_preproc.values.tolist()])
-            # len of rst
-            self.np_rstlens = np.array(
-                [1 + len(json.loads(rst)) for rst in self.data.rst.values.tolist()])
-
-            # len of keyphrase
-            li_li_pos_kp = [ json.loads(li_pos_kp) for li_pos_kp  in self.data.li_pos_kp.values.tolist() ]
-            li_li_kp = [ [ kp for pos,kp in li_pos_kp]  for li_pos_kp in li_li_pos_kp ]
-            #TODO: this was corrected so need to redo dict cache records
-            li_kp = [ '<|kp|> ' + '<|kp|> '.join(li_kp) for li_kp in li_li_kp  ]
-            
-            self.np_keyphrase_lens = np.array( [ self.tokenizer.encode(kp, 
-                                        add_special_tokens=False, 
-                                        truncation=False,
-                                        padding = 'do_not_pad',
-                                        return_tensors=None).__len__() for kp in li_kp ] )
-            
-
-            li_title = [ f"<|tl|>{ujson.loads(title)}" for title in self.data.prompt.tolist() ]
-            
-            self.np_title_lens = np.array( [self.tokenizer.encode(title,
-                                            truncation=False,
-                                            padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for title in li_title] )
-
-            #encoding length of all claims for each datum
-            li_claims = list( map( ujson.loads , self.data.li_claim.tolist()) )
-            li_claims = [ [ f"<|cl|>{claim}"  for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
-            
-            self.li_claim_lens =  [ [ self.tokenizer.encode(claim,
-                                            add_special_tokens=False, 
-                                            truncation=False,
-                                            padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for claim in claims ] for claims in li_claims ] 
-            
-            
-            dict_cached_order = {'np_textlens': self.np_textlens,
-                                'np_rstlens': self.np_rstlens,
-                                'np_keyphrase_lens': self.np_keyphrase_lens,
-                                'np_title_lens':self.np_title_lens,
-                                'li_claim_lens':self.li_claim_lens }
-
-            pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-        
-        
-        #randomly choosing a claim
-        self.li_claim_idxs = [ random.randint(0,len(claim_lens)-1) if len(claim_lens)!=0 else -1 for claim_lens in self.li_claim_lens ] 
-        self.np_claim_lens = np.array( [ self.li_claim_lens[datum_idx][claim_idx] if claim_idx>-1 else 0 for datum_idx, claim_idx in enumerate(self.li_claim_idxs) ] )
-
-        #v2 We initialize the rst/kp lengths as the actual length of each entry
-        # In the Sampler, we change the max length to that of its pre-prescribed batch
-        self.rst_len = copy.deepcopy( self.np_rstlens )
-        self.key_phrase_len = copy.deepcopy( self.np_keyphrase_lens )
-        self.claim_len = copy.deepcopy(self.np_claim_lens)
-        self.title_len = copy.deepcopy(self.np_title_lens)
-
-        self.data = self.data.to_dict('records')
-
-    def __len__(self):
-        return len( self.data )
-
-    def __getitem__(self, index):
-
-        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, claim, title = self.getitem_extract_datum(
-            index)
-
-        if self.inference == True:
-
-            utterance_prompt = ""
-
-            # print(self.key_phrase_len[index], self.tokenizer.max_len_key_phrase)
-            
-            encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
-                                                  li_kp=li_kp,
-                                                  li_kprstpos=li_kprstpos,
-                                                  utterance_prompt=utterance_prompt,
-                                                  dict_pos_edu=dict_pos_edu,
-                                                  max_len_rst= self.rst_len[index] ,
-                                                  max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
-                                                    claim=claim, title=title,
-                                                    max_claim_len=min( self.claim_len[index], self.tokenizer.max_len_claim),
-                                                    max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
-
-            encoded['orig_rst_rels'] = rst_rels
-            encoded['orig_rst_ns'] = rst_ns
-            encoded['orig_rst_pos'] = rst_pos
-
-            encoded['orig_utt'] = utterance
-            encoded['orig_key_phrase'] = li_kp
-
-            encoded['orig_dict_pos_edu'] = dict_pos_edu
-            encoded['orig_li_kprstpos'] = li_kprstpos
-            encoded['orig_claim'] = claim
-            encoded['orig_title'] = title
-
-        elif self.inference == False:
-            encoded = self.tokenizer.encode_input(
-                rst_rels, rst_ns, rst_pos,
-                li_kp=li_kp,
-                li_kprstpos=li_kprstpos,
-                utterance=utterance,
-                dict_pos_edu=dict_pos_edu,
-                max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
-                max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
-                claim=claim, title=title,
-                max_claim_len=min( self.claim_len[index], self.tokenizer.max_len_claim),
-                max_title_len=min( self.title_len[index], self.tokenizer.max_len_title) )
-
-        return encoded
-
-    def getitem_extract_datum(self, index):
-
-        datum = self.data[index]
-
-        # region RST
-        li_rst = json.loads(datum['rst'])
-        # list of dictionaries
-        rst_rels = [_dict['rel'] for _dict in li_rst]
-        rst_ns = [_dict['ns'] for _dict in li_rst]
-        rst_pos = [_dict['pos'] for _dict in li_rst]
-
-        # sorting the order to be left to right in binary tree
-        sorted_order = [i[0] for i in sorted(enumerate(rst_pos), key=lambda x: (
-            RSTTokenizer.edukp_pos_sort_function(x[1]), x[1]), 
-            ) ]
-
-        rst_rels = [rst_rels[idx] for idx in sorted_order]
-        rst_ns = [rst_ns[idx] for idx in sorted_order]
-        rst_pos = [rst_pos[idx] for idx in sorted_order]
-        # endregion
-
-        # Key phrase scores
-        li_pos_kp = json.loads(datum['li_pos_kp'] )
-        if len(li_pos_kp)>0:
-            # top 3 important prhases from utterance
-            li_pos_kp = sorted( li_pos_kp, key=lambda pos_kp: RSTTokenizer.edukp_pos_sort_function(int(pos_kp[0])) )
-
-            li_kprstpos, li_kp = zip(*li_pos_kp)
-            li_kprstpos = [ int(pos) for pos in li_kprstpos ]
-        else:
-            li_kp = []
-            li_kprstpos = []
-
-        # Utterance
-        utterance = ujson.loads(datum['txt_preproc'])
-
-        # claim
-        claim = ujson.loads(datum['li_claim'])[self.li_claim_idxs[index]] if self.li_claim_idxs[index] != -1 else ""
-        
-        title = ujson.loads(datum['prompt']).lstrip( string.punctuation )
-        
-        #pos and edus
-        dict_pos_edu = json.loads(datum['dict_pos_edu'])   
-
-        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, claim, title
-
-class RSTFreezingCallBack(BaseFinetuning):
-    def __init__(self):
-        super().__init__()
-    
-    def freeze_before_training(self, pl_module: "pl.LightningModule"):
-        
-        # self.freeze( pl_module.model.transformer )
-        self.freeze( pl_module.model.embed_rst_rels )
-        self.freeze( pl_module.model.embed_rst_ns )
-        self.freeze( pl_module.model.embed_rst_pos )
-    
-
 def main(tparams={}, mparams={}):
 
     # Defining Logger
