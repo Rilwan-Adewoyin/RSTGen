@@ -2892,3 +2892,4 @@ if __name__ == '__main__':
         print(traceback.format_exc())
 
 # CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 1 --workers 12 --gpus 2 --tag "RSTGPT with aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_key_phrase 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 2 --workers 12 --gpus 2 --tag "RSTGPT without aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_key_phrase 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot
