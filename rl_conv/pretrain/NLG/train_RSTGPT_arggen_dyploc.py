@@ -206,7 +206,6 @@ class RSTTokenizerDyploc(RSTTokenizer):
             # ids_claim = torch.full((max_claim_len,),100, dtype=torch.long)
             claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
         
-        
         #encoding title
         if title != None and title!="":
             title = title.lstrip(string.punctuation+" ")
@@ -1072,10 +1071,9 @@ class DataLoaderGenerator():
                                                  pin_memory=True,
                                                  collate_fn=self.tokenizer.default_collate_pad,
                                                 )
-                                                
-
-                                                 
+                                   
         return dataloader
+        
 def main(tparams={}, mparams={}):
 
     # Defining Logger
