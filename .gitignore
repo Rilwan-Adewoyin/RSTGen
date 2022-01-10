@@ -32,6 +32,7 @@ rl_conv/pretrain/Dyploc/*
 rl_conv/pretrain/GRUEN/*
 rl_conv/pretrain/pair-emnlp2020/*
 
+rl_conv/pretrain/NLG/Archived
 
 rl_conv/pretrain/.ipynb_checkpoints
 *bash.exe.stackdump

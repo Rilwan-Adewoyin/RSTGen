@@ -1,4 +1,4 @@
-#Uses changemyview dataset from pre-training and the dyploc cmv dataset in sync to finetune
+#Uses dyploc cmv dataset in sync to finetune
 import os
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
@@ -37,9 +37,10 @@ from pytorch_lightning.utilities.distributed import _get_rank
 from torch.utils.data import Sampler 
 from torch.utils.data.dataset import Dataset
 from pytorch_lightning.callbacks.finetuning import BaseFinetuning
-import transformers
+
 from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
+import transformers
 
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
@@ -141,16 +142,14 @@ class RSTGPT2Dyploc(RSTGPT2):
         ):
             # RST context embedding
             rst_start_token_embed = self.discrete_embedding_dropout( rst_start_token_id, self.transformer.wte, self.config.embd_index_pdrop )
-            
             rst_rel_embed   = self.embed_rst_rels(rst_rel)
             rst_ns_embed    = self.embed_rst_ns(rst_ns)
-            # rst_rel_embed   = self.discrete_embedding_dropout( rst_rel, self.embed_rst_rels, self.config.embd_index_pdrop )
-            # rst_ns_embed    = self.discrete_embedding_dropout( rst_ns, self.embed_rst_ns, self.config.embd_index_pdrop )
             rst_pos_embed   = self.embed_rst_pos(rst_pos)
 
             rst_embed = (rst_rel_embed + rst_ns_embed + rst_pos_embed)
 
             # Key Phrase context embedding
+            # keyphrase_phrase_embed = self.transformer.wte( key_phrase_ids)
             keyphrase_phrase_embed = self.discrete_embedding_dropout(key_phrase_ids, self.transformer.wte, self.config.embd_index_pdrop)
             keyphrase_rst_pos_embed = self.embed_rst_pos(li_kprstpos)
             keyphrase_embed = keyphrase_rst_pos_embed + keyphrase_phrase_embed
@@ -172,8 +171,6 @@ class RSTGPT2Dyploc(RSTGPT2):
             # Position Embedding
             position_embed_kp = self.transformer.wpe(position_ids_keyphrase)
             position_embed_utt = self.transformer.wpe(position_ids_utt)
-            # position_embed_title = self.transformer.wpe( kwargs.get('position_ids_title') )
-            # position_embed_claim = self.transformer.wpe( kwargs.get('position_ids_claim') )
             position_embed_title = self.wpe_title( kwargs.get('position_ids_title') )
             position_embed_claim = self.wpe_claim( kwargs.get('position_ids_claim') )
 
@@ -343,6 +340,9 @@ class RSTTokenizerDyploc(RSTTokenizer):
                 new_labels = positions_ids_title.new_full( [title_len] , -100 )
                 utt_len = encoded['position_ids_utt'].shape[0]
                 encoded['labels'] = torch.cat( [ encoded['labels'][:-utt_len] ,new_labels, encoded['labels'][-utt_len:] ] )
+            else:
+                utt_len = encoded['position_ids_utt'].shape[0]
+
 
             # changing attn
                 # Plan Make new empty attention matrix template
@@ -379,7 +379,9 @@ class RSTTokenizerDyploc(RSTTokenizer):
                 new_labels = positions_ids_claim.new_full( [claim_len] , -100 )
                 utt_len = encoded['position_ids_utt'].shape[0]
                 encoded['labels'] = torch.cat( [ encoded['labels'][:-utt_len] ,new_labels, encoded['labels'][-utt_len:] ] )
-
+            else:
+                utt_len = self.max_len_utt
+                
             # changing attn
                 # Plan Make new empty attention matrix template
                 # Fill in the context attn span
@@ -421,6 +423,8 @@ class RSTTokenizerDyploc(RSTTokenizer):
                 dir_tokenizer, local_files_only=True, **kwargs, **rst_params)
 
         else:
+            additional_special_tokens = kwargs.pop(
+                'additional_special_tokens', [])
 
             at_title_start = AddedToken(cls.title_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.title_start_token, str) else cls.title_start_token
@@ -748,6 +752,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             trainer_vars = {    'accelerator': 'ddp',
                             'plugins' : DDPPlugin(find_unused_parameters=False),
                             'num_nodes':tparams['num_nodes']
+
                             }
 
         if tparams['mode'] in ["finetune"]:
@@ -759,7 +764,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    multiple_trainloader_mode="min_size", #edit
                                                     **trainer_vars,
                                                     )
                                                 
@@ -777,7 +781,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks, 
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-                                                    multiple_trainloader_mode="min_size", #edit
                                                     **trainer_vars,
                                                     )
 
@@ -879,28 +882,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
         output = {}
         #edit
+        model_output = self.forward(batch)
+
         if step_name == 'train':
-            model_output_dyploc = self.forward(batch['dyploc_dset'])
-            model_output_reg = self.forward(batch['regularization'])
-
-            loss = model_output_dyploc.loss 
-            loss =  loss + model_output_reg.loss
-
-            with torch.no_grad():
-                loss *= 0.5
-
             
+            loss = model_output.loss 
+
             output["loss"]  = loss
-            output["loss/dyploc"] = model_output_dyploc.loss.detach()
-            output["loss/reg"] = model_output_reg.loss.detach()
 
             self.log( "loss", output["loss"], sync_dist=False)
-            self.log( "loss/dyploc", output["loss/dyploc"], sync_dist=False)
-            self.log( "loss/reg", output["loss/reg"], sync_dist=False)
-
 
         else:
-            model_output = self.forward(batch)
             loss_key = f"{step_name}_loss"
             self.log( loss_key, model_output.loss, sync_dist=False)
             output[loss_key]= model_output.loss
@@ -1069,21 +1061,27 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
+        self.freeze_specific_modules( [ self.model ] )
+        self.freeze_specific_modules( self.model.transformer.h, freeze=False )
+        self.freeze_specific_modules( [ self.model.wte_title, self.model.wpe_title], freeze=False )
 
         parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
-        
 
-        optimizer = Adafactor(parameters,
-                             scale_parameter=False, 
-                             relative_step=False,
-                             warmup_init=False,
-                             lr=self.learning_rate )
+        optimizer = Adafactor(parameters, scale_parameter=False, 
+                        relative_step=True, warmup_init=True, lr=None,
+                        weight_decay=0.01
+                        )
 
-        lr_scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 
-                                        num_warmup_steps=  int( (3.0*self.total_steps())/self.max_epochs) ,
-                                        num_training_steps=self.total_steps(),
-                                        last_epoch=-1 )
+        # optimizer = Adafactor(parameters,
+        #                      scale_parameter=False, 
+        #                      relative_step=False,
+        #                      warmup_init=False,
+        #                      lr=self.learning_rate )
+
+        # lr_scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 
+        #                                 num_warmup_steps=  int( (3.0*self.total_steps())/self.max_epochs) ,
+        #                                 num_training_steps=self.total_steps(),
+        #                                 last_epoch=-1 )
 
         if self.mode == "train_cont":
             # restore the optimizers
@@ -1097,7 +1095,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
-    def freeze_specific_modules(self, modules, train_bn=True):
+    def freeze_specific_modules(self, modules, train_bn=True, freeze=True):
 
         modules = BaseFinetuning.flatten_modules(modules)
 
@@ -1107,7 +1105,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             else:
                 # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
                 for param in mod.parameters(recurse=False):
-                    param.requires_grad = False
+                    param.requires_grad = not freeze
                     
     def return_params(self):
         params = {}
@@ -1163,20 +1161,6 @@ class DataLoaderGenerator():
             sampler = True
             sample_kps = True
 
-            ds_regularization = train_RSTGPT.SingleDataset( "./dataset_v3_2/changemyview/0000511465",
-                                    copy.deepcopy(self.tokenizer),0,int(511465*0.6),inference=False, sample_kps=True  )
-            if self.gpus <= 1:
-                sampler_regularization = SizedOrderedBatchSampler(ds_regularization,bs, drop_last=True,shuffle=True)
-            
-            elif self.gpus > 1 and split_name not in ['inference', 'test']:
-                sampler_regularization = SizedOrderedDistributedBatchSampler(
-                    ds_regularization,bs, drop_last=True,shuffle=True, gpus=self.gpus )
-
-            dl_regularization = torch.utils.data.DataLoader( ds_regularization,
-                                                             num_workers=self.workers//2,
-                                                             batch_sampler =sampler_regularization,
-                                                             pin_memory=True,
-                                                             collate_fn = self.tokenizer.default_collate_pad )
         elif split_name == 'val':
             fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"val","*") ))
             shuffle = False
@@ -1225,7 +1209,7 @@ class DataLoaderGenerator():
 
         if split_name == "train":
 
-            return { 'dyploc_dset':dataloader , 'regularization':dl_regularization }
+            return dataloader 
 
         else:
             return dataloader
@@ -1769,5 +1753,4 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-
-# python3 train_RSTGPT_arggen_dyploc2.py --batch_size 16 --version 22 --finetune_version 2 --precision 16 --mode finetune --workers 8 --gpus --tag debugging --max_len_utt 270 --max_len_rst 64 --max_len_title 30 --max_len_claim 20 --max_len_key_phrase 64 --tag "ArgGen. With regularisation loss" --rst_tree_aligned_attention 0 --rst_segment_method segbot
+# python3 train_RSTGPT_arggen_dyploc1.py --batch_size 16 --version 21 --finetune_version 2 --precision 16 --mode finetune --workers 8 --gpus --tag debugging --max_len_utt 270 --max_len_rst 64 --max_len_title 30 --max_len_claim 20 --max_len_key_phrase 64 --tag "ArgGen. Normal Loss" --rst_tree_aligned_attention 0 --rst_segment_method segbot

@@ -1,4 +1,4 @@
-#Uses changemyview dataset from pre-training and the dyploc cmv dataset in sync to finetune
+#Uses changemyview dataset from pre-training to debug the case of rising validation loss in normal arggen experiments
 import os
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
@@ -11,7 +11,6 @@ import argparse
 import copy
 import glob
 import inspect
-import math
 import json
 import pickle
 import random
@@ -37,9 +36,11 @@ from pytorch_lightning.utilities.distributed import _get_rank
 from torch.utils.data import Sampler 
 from torch.utils.data.dataset import Dataset
 from pytorch_lightning.callbacks.finetuning import BaseFinetuning
+
 import transformers
 from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
+from collections import defaultdict, abc as container_abcs
 
 import utils_nlg_v3 as utils
 from utils_nlg_v3 import mpatch_save_model
@@ -65,11 +66,111 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
-class RSTGPT2DyplocConfig(RSTGPT2_Config):
+#Monkey Patch load_state_dict for optimizer
+from itertools import chain
+def load_state_dict_optim(self, state_dict, strict=True):
+    r"""Loads the optimizer state.
+    Arguments:
+        state_dict (dict): optimizer state. Should be an object returned
+            from a call to :meth:`state_dict`.
+        strict (bool, optional): whether to strictly enforce that the keys
+            in :attr:`state_dict` match the keys returned by this optimizers'
+            :meth:`~torch.optim.Optimizer.state_dict` function. Default: ``True``
+    """
+    # deepcopy, to be consistent with module API
+    state_dict = copy.deepcopy(state_dict)
+    # Validate the state_dict
+    groups = self.param_groups
+    saved_groups = state_dict["param_groups"]
+
+    if strict:
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                "loaded state dict has a different number of " "parameter groups"
+            )
+        param_lens = (len(g["params"]) for g in groups)
+        saved_lens = (len(g["params"]) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError(
+                "loaded state dict contains a parameter group "
+                "that doesn't match the size of optimizer's group"
+            )
+
+    # Update the state
+    id_map = {
+        old_id: p
+        for old_id, p in zip(
+            chain(*(g["params"] for g in saved_groups)),
+            chain(*(g["params"] for g in groups)),
+        )
+    }
+
+    def cast(param, value):
+        r"""Make a deep copy of value, casting all tensors to device of param."""
+        if isinstance(value, torch.Tensor):
+            # Floating-point types are a bit special here. They are the only ones
+            # that are assumed to always match the type of params.
+            if param.is_floating_point():
+                value = value.to(param.dtype)
+            value = value.to(param.device)
+            return value
+        elif isinstance(value, dict):
+            return {k: cast(param, v) for k, v in value.items()}
+        elif isinstance(value, container_abcs.Iterable):
+            return type(value)(cast(param, v) for v in value)
+        else:
+            return value
+
+    # Copy state assigned to params (and cast tensors to appropriate types).
+    # State that is not assigned to params is copied as is (needed for
+    # backward compatibility).
+    state = defaultdict(dict)
+    for k, v in state_dict['state'].items():
+        if k in id_map:
+            param = id_map[k]
+            state[param] = cast(param, v)
+        else:
+            state[k] = v
+
+    # Update parameter groups, setting their 'params' value
+    def update_group(group, new_group):
+        new_group['params'] = group['params']
+        return new_group
+    param_groups = [
+        update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+    self.__setstate__({'state': state, 'param_groups': param_groups})
+
+def load_state_dict_lrscheduler(self, state_dict, strict=True):
+
+    """Loads the schedulers state.
+
+    When saving or loading the scheduler, please make sure to also save or load the state of the optimizer.
+
+    Args:
+        state_dict (dict): scheduler state. Should be an object returned
+            from a call to :meth:`state_dict`.
+    """
+
+    lr_lambdas = state_dict.pop('lr_lambdas')
+    self.__dict__.update(state_dict)
+    # Restore state_dict keys in order to prevent side effects
+    # https://github.com/pytorch/pytorch/issues/32756
+    
+    state_dict['lr_lambdas'] = lr_lambdas
+
+    for idx, fn in enumerate(lr_lambdas):
+        if fn is not None:
+            self.lr_lambdas[idx].__dict__.update(fn)
+
+# torch.optim.Optimizer.load_state_dict = load_state_dict_optim
+# torch.optim.lr_scheduler.LambdaLR.load_state_dict = load_state_dict_lrscheduler
+
+
+class RSTGPT2PairConfig(RSTGPT2_Config):
     
     def __init__(self, 
                      base_model_name='gpt2',
-                 model_name="RSTGPT2Dyploc",
+                 model_name="RSTGPT2Pair",
                  scale_grad_by_freq=True,
                  max_len_rst=36,
                  max_len_key_phrase=64,
@@ -78,14 +179,13 @@ class RSTGPT2DyplocConfig(RSTGPT2_Config):
                  rst_segment_method='None',
                  max_rst_pos=4094,
                 max_len_title=40, 
-                max_len_claim=30,
                 embd_index_pdrop=0.1,
                 embd_pdrop=0.1,
                 attn_pdrop=0.1,
                 resid_pdrop=0.1,
                 **kwargs):
 
-        model_name= "RSTGPT2Dyploc"
+        model_name= "RSTGPT2Pair"
         
         super().__init__(base_model_name=base_model_name,
                  model_name=model_name,
@@ -103,28 +203,23 @@ class RSTGPT2DyplocConfig(RSTGPT2_Config):
                 resid_pdrop=resid_pdrop,
                  **kwargs)
 
-        self.extra_dyploc_tokens = 2
-        self.vocab_size = self.vocab_size + self.extra_dyploc_tokens
+        self.extra_pair_tokens = 1
+        self.vocab_size = self.vocab_size + self.extra_pair_tokens
         self.max_len_title = max_len_title
-        self.max_len_claim = max_len_claim
 
 
-class RSTGPT2Dyploc(RSTGPT2):
+class RSTGPT2Pair(RSTGPT2):
     
-    def __init__(self, config: RSTGPT2DyplocConfig):
+    def __init__(self, config: RSTGPT2PairConfig):
         
         super().__init__(config)
-        # #Freeze all weights except for prefix weight,
-        # for name, param in self.model.named_parameters(): 
-        #     param.requires_grad = False
+
 
         with torch.no_grad():
             # Need to ensure the wte's below are not linked to the output embedding
             self.wte_title = copy.deepcopy( self.transformer.wte )
-            self.wte_claim = copy.deepcopy( self.transformer.wte )
 
             self.wpe_title = copy.deepcopy( self.transformer.wpe )
-            self.wpe_claim = copy.deepcopy( self.transformer.wpe )
             
     def embed(
             self,
@@ -141,9 +236,8 @@ class RSTGPT2Dyploc(RSTGPT2):
         ):
             # RST context embedding
             rst_start_token_embed = self.discrete_embedding_dropout( rst_start_token_id, self.transformer.wte, self.config.embd_index_pdrop )
-            
-            rst_rel_embed   = self.embed_rst_rels(rst_rel)
-            rst_ns_embed    = self.embed_rst_ns(rst_ns)
+            rst_rel_embed = self.embed_rst_rels(rst_rel)
+            rst_ns_embed = self.embed_rst_ns(rst_ns)
             # rst_rel_embed   = self.discrete_embedding_dropout( rst_rel, self.embed_rst_rels, self.config.embd_index_pdrop )
             # rst_ns_embed    = self.discrete_embedding_dropout( rst_ns, self.embed_rst_ns, self.config.embd_index_pdrop )
             rst_pos_embed   = self.embed_rst_pos(rst_pos)
@@ -151,6 +245,7 @@ class RSTGPT2Dyploc(RSTGPT2):
             rst_embed = (rst_rel_embed + rst_ns_embed + rst_pos_embed)
 
             # Key Phrase context embedding
+            # keyphrase_phrase_embed = self.transformer.wte( key_phrase_ids)
             keyphrase_phrase_embed = self.discrete_embedding_dropout(key_phrase_ids, self.transformer.wte, self.config.embd_index_pdrop)
             keyphrase_rst_pos_embed = self.embed_rst_pos(li_kprstpos)
             keyphrase_embed = keyphrase_rst_pos_embed + keyphrase_phrase_embed
@@ -159,30 +254,24 @@ class RSTGPT2Dyploc(RSTGPT2):
             utt_inputs_embeds = self.discrete_embedding_dropout(input_ids_utt, self.transformer.wte, self.config.embd_index_pdrop)
 
             title_embed = self.discrete_embedding_dropout(kwargs.get('ids_title'), self.wte_title, self.config.embd_index_pdrop)
-            claim_embed = self.discrete_embedding_dropout(kwargs.get('ids_claim'), self.wte_claim, self.config.embd_index_pdrop )
 
             inputs_embed = torch.cat([
                 rst_start_token_embed,
                 rst_embed,
                 keyphrase_embed,
                 title_embed,
-                claim_embed,
                 utt_inputs_embeds], axis=-2)
 
             # Position Embedding
             position_embed_kp = self.transformer.wpe(position_ids_keyphrase)
             position_embed_utt = self.transformer.wpe(position_ids_utt)
-            # position_embed_title = self.transformer.wpe( kwargs.get('position_ids_title') )
-            # position_embed_claim = self.transformer.wpe( kwargs.get('position_ids_claim') )
             position_embed_title = self.wpe_title( kwargs.get('position_ids_title') )
-            position_embed_claim = self.wpe_claim( kwargs.get('position_ids_claim') )
 
             _ = position_embed_kp.shape
             position_embed_rst = position_embed_kp.new_zeros( [_[0], 1+rst_rel_embed.shape[1], _[2]] )
             position_embed = torch.cat( [position_embed_rst,
                                             position_embed_kp, 
                                             position_embed_title, 
-                                            position_embed_claim,
                                             position_embed_utt], axis=1)
             
             return inputs_embed, position_embed
@@ -192,12 +281,11 @@ class RSTGPT2Dyploc(RSTGPT2):
         parser = argparse.ArgumentParser(
             parents=[parent_parser], add_help=True, allow_abbrev=False)
         parser.add_argument('--base_model_name', default='gpt2', required=False)
-        parser.add_argument('--model_name', default='RSTGPT2Dyploc', required=False)
+        parser.add_argument('--model_name', default='RSTGPT2Pair', required=False)
         parser.add_argument('--max_len_utt', type=int, default=270)
         parser.add_argument('--max_len_rst', type=int, default=36)
         parser.add_argument('--max_len_key_phrase', type=int, default=64)
         parser.add_argument('--max_len_title', type=int, default=30)
-        parser.add_argument('--max_len_claim', type=int, default=30)
         
         parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=True,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -217,11 +305,11 @@ class RSTGPT2Dyploc(RSTGPT2):
         return mparams    
 
     @classmethod
-    def load_model_tokenizer(cls, model_name="RSTGPT2Dyploc", model_version=None, mparams_new={}, device="cuda:0"):
+    def load_model_tokenizer(cls, model_name="RSTGPT2Pair", model_version=None, mparams_new={}, device="cuda:0"):
 
         if model_version != None:
             # load from a pretrained RSTGPT2
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
                 f'./models/{model_name}/version_{model_version}/checkpoints')
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
@@ -233,13 +321,13 @@ class RSTGPT2Dyploc(RSTGPT2):
             for key, value in mparams_new.items():
                 mparams[key] = value
 
-            mconfig = RSTGPT2DyplocConfig.from_pretrained(
+            mconfig = RSTGPT2PairConfig.from_pretrained(
                 mparams['base_model_name'], **mparams)
 
-            model = RSTGPT2Dyploc(mconfig)
+            model = RSTGPT2Pair(mconfig)
 
             # Loading Training Module
-            training_module = RSTGPT2Dyploc_TrainingModule(
+            training_module = RSTGPT2Pair_TrainingModule(
                 mconfig, mode='inference', model=model)
             training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -265,28 +353,21 @@ class RSTGPT2Dyploc(RSTGPT2):
         with torch.no_grad():
             # Need to ensure the wte's below are not linked to the output embedding
             self.wte_title = copy.deepcopy( self.transformer.wte )
-            self.wte_claim = copy.deepcopy( self.transformer.wte )
 
             self.wpe_title = copy.deepcopy( self.transformer.wpe )
-            self.wpe_claim = copy.deepcopy( self.transformer.wpe )
 
-
-class RSTTokenizerDyploc(RSTTokenizer):
+class RSTTokenizerPair(RSTTokenizer):
 
     title_start_token = "<|tl|>"
-    claim_start_token = "<|cl|>"
 
     max_len_title = 30
-    max_len_claim = 30
     
     def __init__(self, *args, **kwargs):
         self.max_len_title = kwargs.get( 'max_len_title' , self.max_len_title)
-        self.max_len_claim = kwargs.get( 'max_len_claim', self.max_len_claim )
 
         super().__init__(*args, **kwargs)
-        self.pad_token =  self.eos_token
         
-    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, title='', claim='' , max_len_title=None, max_len_claim=None):
+    def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=None, utterance_prompt=None, dict_pos_edu=None, max_len_rst=None, max_len_key_phrase=None, exclude_from_output=[], device=None, title='', max_len_title=None):
        
         encoded = super().encode_input(rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos, utterance=utterance, utterance_prompt=utterance_prompt, dict_pos_edu=dict_pos_edu, max_len_rst=max_len_rst, max_len_key_phrase=max_len_key_phrase, exclude_from_output=exclude_from_output, device=device)
 
@@ -303,44 +384,25 @@ class RSTTokenizerDyploc(RSTTokenizer):
                 return_tensors='pt')[0]
         else:
             ids_title = [self.pad_token_id]*max_len_title if max_len_title else [self.pad_token_id]*self.max_len_title
-            ids_title = torch.tensor(ids_title,dtype=torch.long)
+            ids_title = torch.tensor(ids_title, dtype=torch.long)
         
-
-        if claim!=None and len( claim.split(' ') )<40 and claim!="" and len(claim)!=0:  
-            claim = self.claim_start_token + claim
-            claim = ' '.join( claim.split(' ')[:self.max_len_claim] )
-            ids_claim = self.encode(claim, add_special_tokens=False,
-                    return_attention_mask=False,
-                    padding= 'max_length' if max_len_claim else 'do_not_pad',
-                    truncation=True,
-                    max_length=max_len_claim if max_len_claim else self.max_len_claim,
-                    return_tensors='pt')[0]
-            
-        else:
-            ids_claim = [self.pad_token_id]*max_len_claim if max_len_claim else [self.pad_token_id]*self.max_len_claim
-            ids_claim = torch.tensor(ids_claim,dtype=torch.long)
 
         title_pad = (ids_title == self.pad_token_id).sum(dim=0)
-        claim_pad = (ids_claim == self.pad_token_id).sum(dim=0)
         
         encoded['ids_title'] = ids_title
-        encoded['ids_claim'] = ids_claim
 
         title_len = ids_title.shape[0]
-        claim_len = ids_claim.shape[0]
 
         # chaining positions
         positions_ids_title= torch.arange(0, title_len, dtype=torch.long)
-        positions_ids_claim= torch.arange(0, claim_len, dtype=torch.long)
 
         encoded['position_ids_title'] = positions_ids_title
-        encoded['position_ids_claim'] = positions_ids_claim
         encoded['position_ids_utt'] = encoded['position_ids_utt']
         
         if title_len >0:
             #changing labels
             if encoded.get('labels') is not None:
-                new_labels = positions_ids_title.new_full( [title_len] , -100 )
+                new_labels = positions_ids_title.new_full( [title_len], -100, requires_grad=False)
                 utt_len = encoded['position_ids_utt'].shape[0]
                 encoded['labels'] = torch.cat( [ encoded['labels'][:-utt_len] ,new_labels, encoded['labels'][-utt_len:] ] )
 
@@ -353,7 +415,7 @@ class RSTTokenizerDyploc(RSTTokenizer):
                 # New title does not attentd to any of the utterance
 
             context_len = encoded['attention_mask'].shape[0]-utt_len
-            _ = title_len + utt_len + context_len
+            _ = context_len + title_len + utt_len
             new_attn_mask = encoded['attention_mask'].new_zeros( (_,_) )
 
             # Context attn
@@ -362,7 +424,7 @@ class RSTTokenizerDyploc(RSTTokenizer):
             # utterance attn
             new_attn_mask[ -utt_len: , -utt_len: ] = encoded ['attention_mask'][ -utt_len: , -utt_len: ] 
             new_attn_mask[ -utt_len:, :context_len] = encoded['attention_mask'][ -utt_len:, :context_len ]
-            new_attn_mask[ -utt_len:, context_len:context_len+title_len-title_pad] = new_attn_mask.new_ones( ( utt_len, title_len-title_pad)  )
+            new_attn_mask[ -utt_len:, context_len:context_len+title_len-title_pad] = new_attn_mask.new_ones( ( utt_len, title_len-title_pad) )
 
 
             # title attn
@@ -372,46 +434,11 @@ class RSTTokenizerDyploc(RSTTokenizer):
             del encoded['attention_mask']
             encoded['attention_mask'] = new_attn_mask
 
-        # Adding claim information
-        if claim_len >0:
-            #changing labels
-            if encoded.get('labels') is not None:
-                new_labels = positions_ids_claim.new_full( [claim_len] , -100 )
-                utt_len = encoded['position_ids_utt'].shape[0]
-                encoded['labels'] = torch.cat( [ encoded['labels'][:-utt_len] ,new_labels, encoded['labels'][-utt_len:] ] )
-
-            # changing attn
-                # Plan Make new empty attention matrix template
-                # Fill in the context attn span
-                # Fill in the utterance attn span
-                # New title has torch trill attn to itself
-                # New title does not attend to any of the context
-                # New title does not attentd to any of the utterance
-            pre_utt_len = encoded['attention_mask'].shape[0]-utt_len
-            _ = pre_utt_len + claim_len + utt_len
-            new_attn_mask = encoded['attention_mask'].new_zeros( (_,_) )
-
-            # Context attn
-            new_attn_mask[ :pre_utt_len, :pre_utt_len ] = encoded['attention_mask'][ :pre_utt_len, :pre_utt_len ]
-
-            # utterance attn
-            new_attn_mask[ -utt_len: , -utt_len: ] = encoded ['attention_mask'][ -utt_len: , -utt_len: ] 
-            new_attn_mask[ -utt_len:, :pre_utt_len] = encoded['attention_mask'][ -utt_len:, :pre_utt_len ]
-            new_attn_mask[ -utt_len:, pre_utt_len:pre_utt_len+claim_len-claim_pad] = new_attn_mask.new_ones( ( utt_len, claim_len-claim_pad)  )
-
-
-            # claim attn
-            new_attn_mask[ pre_utt_len:pre_utt_len+claim_len-claim_pad , pre_utt_len:pre_utt_len+claim_len-claim_pad  ] = \
-                torch.tril( new_attn_mask.new_ones( (claim_len-claim_pad , claim_len-claim_pad) ) )
-
-            del encoded['attention_mask']
-            encoded['attention_mask'] = new_attn_mask
-
         return encoded 
 
     @classmethod
     def from_pretrained(cls,
-                        dir_tokenizer="./tokenizers/RSTGPT2Dyploc",
+                        dir_tokenizer="./tokenizers/RSTGPT2Pair",
                         base_tokenizer_name="gpt2",
                         rst_params={},
                         **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
@@ -424,12 +451,10 @@ class RSTTokenizerDyploc(RSTTokenizer):
 
             at_title_start = AddedToken(cls.title_start_token, lstrip=False, rstrip=False) if isinstance(
                 cls.title_start_token, str) else cls.title_start_token
-            at_claim_start = AddedToken(cls.claim_start_token, lstrip=False, rstrip=False) if isinstance(
-                cls.claim_start_token, str) else cls.claim_start_token
 
-            additional_special_tokens = [at_title_start,at_claim_start]
+            additional_special_tokens = [at_title_start]
 
-            cls = super(RSTTokenizerDyploc, cls).from_pretrained(
+            cls = super(RSTTokenizerPair, cls).from_pretrained(
                                                                 dir_tokenizer=dir_tokenizer,
                                                                 base_tokenizer_name="gpt2",
                                                                 additional_special_tokens=additional_special_tokens)
@@ -437,7 +462,6 @@ class RSTTokenizerDyploc(RSTTokenizer):
             cls.save_pretrained(dir_tokenizer)
             tokenizer = cls
 
-        tokenizer.claim_start_token_id = torch.full( (1,), 50260 , dtype=torch.long )
         tokenizer.title_start_token_id = torch.full( (1,),      50259 , dtype=torch.long )
         tokenizer.rst_start_token_id = torch.full( (1,),        50257 , dtype=torch.long )
         tokenizer.keyphrase_start_token_id = torch.full( (1,),  50258 , dtype=torch.long )        
@@ -448,14 +472,14 @@ class RSTTokenizerDyploc(RSTTokenizer):
 
         return tokenizer
     
-class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
+class RSTGPT2Pair_TrainingModule(pl.LightningModule):
 
     def __init__(self,
                  mconfig,
                  batch_size=20,
                  dir_data=None,
                  accumulate_grad_batches=1,
-                 max_epochs=100,
+                 max_epochs=30,
                  gpus=1,
                  learning_rate=1e-4,
                  warmup_proportion=0.1,
@@ -475,18 +499,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         self.workers = workers
         self.batching_style = batching_style
         self.dir_checkpoints = kwargs.get('dir_checkpoints')
+        self.finetune_version = kwargs.get('finetune_version',None)
 
         if tokenizer  == None:
-            self.tokenizer = RSTTokenizerDyploc.from_pretrained(f"./tokenizers/{mconfig.model_name}",
+            self.tokenizer = RSTTokenizerPair.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
                                                                                                                'max_len_key_phrase',
                                                                                                                'max_rst_depth',
                                                                                                                'max_len_utt', 
                                                                                                                'max_rst_pos',
-                                                                                                               'max_rst_pos',
                                                                                                                'max_len_title',
-                                                                                                               'max_len_claim',
                                                                                                                'rst_tree_aligned_attention'] if hasattr(mconfig, name)
                                                                      }
                                                          )
@@ -506,25 +529,23 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                            'key_phrase_ids': mconfig.eos_token_id,
                            'li_kprstpos': self.model.embed_rst_pos.padding_idx,
 
-                            'position_ids_keyphrase':mconfig.n_ctx-1,
-                            'position_ids_utt':mconfig.n_ctx-1,
+                           'position_ids_keyphrase':mconfig.n_ctx-1,
+                           'position_ids_utt':mconfig.n_ctx-1,
 
                            'position_ids_kp_utt': mconfig.n_ctx-1,
                            'position_ids_title':mconfig.n_ctx-1,
-                           'position_ids_claim':mconfig.n_ctx-1,
 
 
                            'input_ids_utt': mconfig.eos_token_id,
-                            'ids_title':mconfig.eos_token_id,
-                            'ids_claim':mconfig.eos_token_id,
+                           'ids_title':mconfig.eos_token_id,
                            'attention_mask': 0.0,
 
                            'labels': self.model.loss_fct.ignore_index,
-                            'edu_rstpos': -1,
-                            'context_rstpos': -1,
+                           'edu_rstpos': -1,
+                           'context_rstpos': -1,
 
                            'context_rst_rstpos':-1,
-                           'context_kp_rstpos':-1
+                           'context_kp_rstpos':-1,
                            }
         
         self.tokenizer.pad_values = self.pad_values
@@ -540,25 +561,22 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
             'input_ids_utt': mconfig.max_len_utt,
             'ids_title': mconfig.max_len_title,
-            'ids_claim':mconfig.max_len_claim,
 
 
-            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + mconfig.max_len_title + mconfig.max_len_claim,
+            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + mconfig.max_len_title,
 
-            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + mconfig.max_len_title + mconfig.max_len_claim,  # axis:max_length
+            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt + mconfig.max_len_title ,  # axis:max_length
 
             'position_ids_keyphrase':mconfig.max_len_key_phrase,
             'position_ids_utt':mconfig.max_len_utt ,
             'position_ids_title':mconfig.max_len_title,
-            'position_ids_claim':mconfig.max_len_claim,
 
 
             'edu_rstpos': mconfig.max_rst_pos // 2,
             'context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase,
 
             'context_rst_rstpos':mconfig.max_len_rst,
-            'context_kp_rstpos':mconfig.max_len_key_phrase
-                            }
+            'context_kp_rstpos':mconfig.max_len_key_phrase}
 
         self.tokenizer.pad_maxlens = self.pad_maxlens
         
@@ -589,12 +607,13 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
             train_params_to_save = self.return_params()
             mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
-                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTGPT2DyplocConfig.__init__).parameters.keys()) ))}
+                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTGPT2PairConfig.__init__).parameters.keys()) ))}
 
             self.hparams.update({**train_params_to_save, **mparams_to_save})
             pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
                 kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
-            
+            # self.logger.log_hyperparams( self.hparams )
+
         if self.mode in ['inference']:
             self.eval()
             self.freeze()
@@ -603,17 +622,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
     def parse_train_specific_args(parent_parser):
         parser = argparse.ArgumentParser(
             parents=[parent_parser], add_help=True, allow_abbrev=False)
-        parser.add_argument('--dir_data', default="./dataset_cmv/dyploc_rst",
+        parser.add_argument('--dir_data', default="./dataset_cmv/dyploc_pair_rst",
                             help="Relative directory path for datafiles")
         parser.add_argument('--model_dir', default="./models/")
-        parser.add_argument('--max_epochs', default=100, type=int)
-        parser.add_argument('--accumulate_grad_batches', default=1, type=int)
+        parser.add_argument('--max_epochs', default=30, type=int)
+        parser.add_argument('--accumulate_grad_batches', default=4, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
         parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
         parser.add_argument('--finetune_version', type=int, default=6 )
         parser.add_argument('--num_nodes',default=1, type=int )
         parser.add_argument('--learning_rate', default=1e-4, type=float)
-        parser.add_argument('--workers', default=16, type=int)  # TODO: change to 6
+        parser.add_argument('--workers', default=8, type=int)  # TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode', default='finetune', type=str,
                             choices=['finetune', 'train_cont', 'test', 'inference'])
@@ -642,24 +661,25 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                 'base_model_name', 'scale_grad_by_freq','rst_tree_aligned_attention' ]})
             
-            mconfig = RSTGPT2DyplocConfig.from_pretrained(mparams['base_model_name'], **mparams)
-            mconfig.vocab_size = mconfig.vocab_size-2
-            model = RSTGPT2Dyploc(mconfig)
-            model.config.vocab_size += 2
+            mconfig = RSTGPT2PairConfig.from_pretrained(mparams['base_model_name'], **mparams)
+            mconfig.vocab_size = mconfig.vocab_size-1
+            model = RSTGPT2Pair(mconfig)
+            model.config.vocab_size += 1
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict,strict=False )
             model.correct_attn_bias()
                 
-            tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)
+            tokenizer = RSTTokenizerPair.from_pretrained(**mparams)
             model.resize_token_embeddings(model.config.vocab_size)
             model.copy_embedding_weights()
 
-            training_module = RSTGPT2Dyploc_TrainingModule(model.config, **tparams, model=model, tokenizer=tokenizer)
+            training_module = RSTGPT2Pair_TrainingModule(model.config, **tparams, model=model, tokenizer=tokenizer)
 
         elif tparams['mode'] in ["train_cont", "inference"]:
-
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
-                tparams['dir_checkpoints'])
+            
+            mode = 'last' if tparams['mode'] == "train_cont" else 'best'
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
+                tparams['dir_checkpoints'], mode=mode )
 
             # restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
@@ -668,26 +688,26 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase',
-                    'max_len_title','max_len_claim','scale_grad_by_freq','rst_tree_aligned_attention',
+                    'max_len_title','scale_grad_by_freq','rst_tree_aligned_attention',
                     'embd_pdrop','attn_pdrop','resid_drop','embd_index_pdrop' ]})
 
             else:
                 print("param files not found utilsing default or user entered params\n")
 
-            mconfig = RSTGPT2DyplocConfig( **mparams)
+            mconfig = RSTGPT2PairConfig( **mparams)
 
-            model = RSTGPT2Dyploc(mconfig)
+            model = RSTGPT2Pair(mconfig)
             pytorch_state_dict = { k[k.find('.')+1:]:v for k,v in checkpoint['state_dict'].items() }
             model.load_state_dict( pytorch_state_dict )
             model.correct_attn_bias()
-            tokenizer = RSTTokenizerDyploc.from_pretrained(**mparams)            
-            training_module = RSTGPT2Dyploc_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
+            tokenizer = RSTTokenizerPair.from_pretrained(**mparams)            
+            training_module = RSTGPT2Pair_TrainingModule(mconfig, **tparams, model=model, tokenizer=tokenizer)
 
 
         elif tparams['mode'] in ["test"]:
 
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
-                tparams['dir_checkpoints'])
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
+                tparams['dir_checkpoints'], 'best')
 
             # restore/update param files from the checkpoint
             try:
@@ -696,12 +716,12 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt','max_len_rst',
-                    'max_len_key_phrase','max_len_title','max_len_claim']})
+                    'max_len_key_phrase','max_len_title']})
             except KeyError:
                 pass
 
             # Restore/update Training Module   
-            training_module = RSTGPT2Dyploc_TrainingModule(
+            training_module = RSTGPT2Pair_TrainingModule(
                 **tparams, mparams=mparams)
             training_module.load_state_dict(checkpoint['state_dict'])
 
@@ -724,8 +744,8 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         checkpoint_callback = ModelCheckpoint(monitor='val_loss', 
                                             save_top_k=2,
                                             save_last =True,
-                                              mode='min', dirpath=dir_checkpoints,
-                                              filename='{epoch:03d}_{val_loss:.5f}')
+                                            mode='min', dirpath=dir_checkpoints,
+                                            filename='{epoch:03d}_{val_loss:.5f}')
 
         checkpoint_callback._save_model = types.MethodType(
             mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback) 
@@ -746,6 +766,9 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         else:
 
             trainer_vars = {    'accelerator': 'ddp',
+                            # 'plugins': DeepSpeedPlugin(stage=1, 
+                            #                             contiguous_gradients=True,
+                            #                              ) 
                             'plugins' : DDPPlugin(find_unused_parameters=False),
                             'num_nodes':tparams['num_nodes']
                             }
@@ -759,16 +782,17 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=0,
-                                                    multiple_trainloader_mode="min_size", #edit
+                                                    # val_check_interval=0.5,
                                                     **trainer_vars,
                                                     )
+            trainer.logger.log_hyperparams(training_module.hparams)
                                                 
 
         elif tparams['mode'] in ["train_cont", "inference"]:
 
             # restoring checkpoint
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
-                tparams['dir_checkpoints'])
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
+                tparams['dir_checkpoints'], 'last')
            
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
@@ -777,10 +801,11 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                                                     callbacks=callbacks, 
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
-                                                    multiple_trainloader_mode="min_size", #edit
+                                                    # val_check_interval=0.5,
                                                     **trainer_vars,
                                                     )
-
+            trainer.logger.log_hyperparams(training_module.hparams)
+            
             # load callback states
             trainer.on_load_checkpoint(checkpoint)
             
@@ -797,7 +822,7 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
         elif tparams['mode'] in ["test"]:
 
             # restoring checkpoint
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
                 tparams['dir_checkpoints'])
 
             training_module.load_state_dict(checkpoint['state_dict'])
@@ -829,9 +854,13 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
                 best_ckpt_path = os.path.join(
                     root_dir._str, best_ckpt_path[best_ckpt_path.index('mastering-conversation'):])
 
-            
             checkpoint = torch.load(best_ckpt_path, map_location='cpu')
         
+        elif mode == 'last':
+            best_ckpt_path = os.path.join(_dir_checkpoint, "last.ckpt")
+            checkpoint = torch.load(best_ckpt_path, map_location='cpu')
+
+
         else:
             raise NotImplementedError
 
@@ -845,8 +874,8 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
         if tparams['mode'] in ["test"]:
 
-            checkpoint = RSTGPT2Dyploc_TrainingModule.get_ckpt_file(
-                tparams['dir_checkpoints'])
+            checkpoint = RSTGPT2Pair_TrainingModule.get_ckpt_file(
+                tparams['dir_checkpoints'], 'best' )
             training_module.load_state_dict(checkpoint['state_dict'])
 
             training_module.eval()
@@ -870,44 +899,32 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             with open(fn, 'w') as outfile:
                 json.dump(existing_results, outfile)
 
-
     def forward(self, input_):
             return self.model(**input_, return_dict=True)
 
-    
     def step(self, batch, step_name):
 
         output = {}
-        #edit
+        
         if step_name == 'train':
-            model_output_dyploc = self.forward(batch['dyploc_dset'])
-            model_output_reg = self.forward(batch['regularization'])
+            model_output_reg = self.forward(batch)
 
-            loss = model_output_dyploc.loss 
-            loss =  loss + model_output_reg.loss
-
-            with torch.no_grad():
-                loss *= 0.5
-
+            loss = model_output_reg.loss
             
             output["loss"]  = loss
-            output["loss/dyploc"] = model_output_dyploc.loss.detach()
-            output["loss/reg"] = model_output_reg.loss.detach()
+            output["loss/reg"] = loss.detach()
 
-            self.log( "loss", output["loss"], sync_dist=False)
-            self.log( "loss/dyploc", output["loss/dyploc"], sync_dist=False)
-            self.log( "loss/reg", output["loss/reg"], sync_dist=False)
-
+            self.log( "loss", loss.detach(), sync_dist=False)
+            self.log( "loss/reg", loss.detach(), sync_dist=False)
 
         else:
             model_output = self.forward(batch)
             loss_key = f"{step_name}_loss"
-            self.log( loss_key, model_output.loss, sync_dist=False)
+            self.log( loss_key, model_output.loss.detach(), sync_dist=False)
             output[loss_key]= model_output.loss
 
         return output
     
-
     def training_step(self, batch, batch_idx):
         output = self.step(batch, "train")
         return output
@@ -938,95 +955,6 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             
             self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True)
         
-        if False and step_name == "val" and _get_rank() == 0:
-            # Making directory if it doesnt exist
-            dir_infer = os.path.join(self.trainer.log_dir, "inference")
-            
-            if not os.path.exists(dir_infer):
-                os.makedirs(dir_infer, exist_ok=True)
-
-            # Adding true values and making csv files if thy dont already exists
-            for idx, encoded_input_ in enumerate(self.inference_samples):
-                
-                encoded_input = { k:v.detach().clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v) for k,v in encoded_input_.items()}
-                                
-                fp = os.path.join(dir_infer, f"example_{idx:03d}.csv")
-
-                # If there file does not exists we add the true observed records
-                if not os.path.exists(fp):
-
-                    df = pd.DataFrame(columns=['epoch', 'rst_rels', 'rst_ns', 'rst_pos',
-
-                                               'keyphrase', 'utterance',
-                                                'dict_pos_edu', 'li_kprstpos',
-                                                 'orig_title'])
-
-                    rst_rels = encoded_input.pop('orig_rst_rels')
-                    rst_ns = encoded_input.pop('orig_rst_ns')
-                    rst_pos = encoded_input.pop('orig_rst_pos')
-
-                    keyphrase = encoded_input.pop('orig_key_phrase')
-                    utterance = encoded_input.pop('orig_utt')
-                    dict_pos_edu = encoded_input.pop('orig_dict_pos_edu')
-
-                    orig_li_kprstpos = encoded_input.pop('orig_li_kprstpos')
-                    orig_title =  encoded_input.pop('orig_title', None)
-                    
-
-                    datum = {
-                        'epoch': -1,
-
-                        'rst_rels': ', '.join(rst_rels),
-                        'rst_ns': ', '.join(rst_ns),
-                        'rst_pos': rst_pos,
-
-                        "keyphrase": ', '.join(keyphrase),
-                        "utterance": utterance,
-                        "dict_pos_edu": json.dumps(dict_pos_edu),
-
-                        "li_kprstpos": json.dumps(orig_li_kprstpos),
-                        "orig_title": json.dumps(orig_title)
-                        
-                    }
-
-                    df = df.append(datum, ignore_index=True)
-                    df.to_csv(fp, index=False)
-
-                # creating predition andding to existing results
-                encoded_input.pop('orig_rst_rels', None)
-                encoded_input.pop('orig_rst_ns', None)
-                encoded_input.pop('orig_rst_pos', None)
-
-                encoded_input.pop('orig_key_phrase', None)
-                encoded_input.pop('orig_utt', None)
-                encoded_input.pop('orig_dict_pos_edu', None)
-                encoded_input.pop('orig_li_kprstpos', None)
-                encoded_input.pop('orig_title', None)
-                
-                # encoded_input.pop('labels', None)
-
-                generation_params = copy.deepcopy(self.model.generation_params)
-                generation_params['max_length'] = 60
-                generation_params['max_time'] = 20
-                decoded_text = self.model.generate_plus( encoded_input, generation_params )
-
-                datum = {
-                    'epoch': self.current_epoch,
-                    'rst_rels': '',
-                    'keyphrase': '',
-                    'utterance': json.dumps(decoded_text),
-                    'dict_pos_edu': '',
-                    'li_kprstpos': '',
-                    'rst_ns': '',
-                    'rst_pos': '',
-                    'orig_title':''
-                }
-
-                pd.DataFrame.from_records([datum]).to_csv(fp, index=False, mode='a', header=False)
-                # Saving to file
-        
-        else:
-            pass
         
     def create_data_loaders(self, modes ):
         if 'train' in modes:
@@ -1062,42 +990,83 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
 
     @lru_cache()
     def total_steps(self):
-
+        #This is not made to work with multi-node training
         ds_size = len(self.train_dl)
+        
         steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
         return steps
 
     def configure_optimizers(self):
 
-        self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
 
+
+        #region original
+        # self.freeze_specific_modules( [ self.model.embed_rst_rels, self.model.embed_rst_ns, self.model.embed_rst_pos] )
+
+        # parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
+        
+        # optimizer = Adafactor(parameters, scale_parameter=True, 
+        #                 relative_step=True, warmup_init=True, lr=None )
+
+        # lr_scheduler = AdafactorSchedule(optimizer)
+        #end region
+
+        #region with linear warm up
+        # optimizer = Adafactor(self.model.parameters(), scale_parameter=False, 
+        #                 relative_step=False, warmup_init=False, lr=1e-4 )
+
+        # lr_scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 
+        #                                 num_warmup_steps=  int( (8*self.total_steps())/self.max_epochs) ,
+        #                                 num_training_steps=self.total_steps(),
+        #                                 last_epoch=-1 )
+
+        #endregion
+
+        #region Freezing whole model except final two layers w/ warmup
+
+        self.freeze_specific_modules( [ self.model ] )
+        self.freeze_specific_modules( self.model.transformer.h, freeze=False )
+        
         parameters = filter( lambda p: p.requires_grad, self.model.parameters() )
         
-
         optimizer = Adafactor(parameters,
                              scale_parameter=False, 
                              relative_step=False,
                              warmup_init=False,
-                             lr=self.learning_rate )
+                             lr=1e-3 )
 
         lr_scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 
-                                        num_warmup_steps=  int( (3.0*self.total_steps())/self.max_epochs) ,
+                                        num_warmup_steps=  int( (0.5*self.total_steps())/self.max_epochs) ,
                                         num_training_steps=self.total_steps(),
                                         last_epoch=-1 )
 
-        if self.mode == "train_cont":
-            # restore the optimizers
-            checkpoint = self.get_ckpt_file(self.dir_checkpoints)
-            optimizer_states = checkpoint['optimizer_states']
-            optimizer.load_state_dict(optimizer_states[0])
+        # if self.mode in ['finetune']:
+        #     checkpoint = self.get_ckpt_file(self.dir_checkpoints)
+            
+        #     checkpoint = RSTGPT2_TrainingModule.get_ckpt_file(f"./models/RSTGPT2/version_{self.finetune_version}/checkpoints")
+
+        #     optimizer_states = checkpoint['optimizer_states']
+        #     optimizer.load_state_dict( optimizer_states[0], strict=False )
    
             # restore the lr schedulers
-            lr_scheduler_states = checkpoint['lr_schedulers']
-            lr_scheduler.load_state_dict(lr_scheduler_states[0])
+            # if 'lr_schedulers' in checkpoint:
+            #     lr_scheduler_states = checkpoint['lr_schedulers']
+            #     lr_scheduler.load_state_dict(lr_scheduler_states[0], strict=False)
+
+        if self.mode in ["train_cont"]:
+            # restore the optimizers
+            checkpoint = self.get_ckpt_file(self.dir_checkpoints, 'last' )
+            optimizer_states = checkpoint['optimizer_states']
+            optimizer.load_state_dict(optimizer_states[0] )
+   
+            # restore the lr schedulers
+            if 'lr_schedulers' in checkpoint:
+                lr_scheduler_states = checkpoint['lr_schedulers']
+                lr_scheduler.load_state_dict(lr_scheduler_states[0])
             
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
-    def freeze_specific_modules(self, modules, train_bn=True):
+    def freeze_specific_modules(self, modules, train_bn=True, freeze=True):
 
         modules = BaseFinetuning.flatten_modules(modules)
 
@@ -1107,11 +1076,10 @@ class RSTGPT2Dyploc_TrainingModule(pl.LightningModule):
             else:
                 # recursion could yield duplicate parameters for parent modules w/ parameters so disabling it
                 for param in mod.parameters(recurse=False):
-                    param.requires_grad = False
+                    param.requires_grad = not freeze
                     
     def return_params(self):
-        params = {}
-        keys = ['batch_size', 'accumulate_grad_batches', 'learning_rate', 'max_epochs', 'dir_data', 'tag']
+        keys = ['batch_size', 'accumulate_grad_batches', 'learning_rate', 'max_epochs', 'dir_data','tag']
 
         params = {
             k: self.__dict__[k] for k in keys if k in self.__dict__.keys()}
@@ -1156,7 +1124,6 @@ class DataLoaderGenerator():
         
         if split_name == 'train':
 
-            fn = filter_fns( glob.glob(  os.path.join( self.dir_data,"train","*") ))
             shuffle = True
             inference = False
             bs = self.batch_size 
@@ -1165,34 +1132,25 @@ class DataLoaderGenerator():
 
             ds_regularization = train_RSTGPT.SingleDataset( "./dataset_v3_2/changemyview/0000511465",
                                     copy.deepcopy(self.tokenizer),0,int(511465*0.6),inference=False, sample_kps=True  )
-            if self.gpus <= 1:
-                sampler_regularization = SizedOrderedBatchSampler(ds_regularization,bs, drop_last=True,shuffle=True)
-            
-            elif self.gpus > 1 and split_name not in ['inference', 'test']:
-                sampler_regularization = SizedOrderedDistributedBatchSampler(
-                    ds_regularization,bs, drop_last=True,shuffle=True, gpus=self.gpus )
 
-            dl_regularization = torch.utils.data.DataLoader( ds_regularization,
-                                                             num_workers=self.workers//2,
-                                                             batch_sampler =sampler_regularization,
-                                                             pin_memory=True,
-                                                             collate_fn = self.tokenizer.default_collate_pad )
         elif split_name == 'val':
-            fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"val","*") ))
             shuffle = False
             inference = False
             bs = self.batch_size
             sampler = True
             sample_kps = False
+            ds_regularization = train_RSTGPT.SingleDataset( "./dataset_v3_2/changemyview/0000511465",
+                                    copy.deepcopy(self.tokenizer),int(511465*0.6),int(511465*0.8),inference=False, sample_kps=True  )
             
             
         elif split_name == 'test':
-            fn = filter_fns(glob.glob(  os.path.join( self.dir_data,"test","*") ))
             shuffle = False
             bs = self.batch_size
             inference = False
             sampler = True
             sample_kps = False
+            ds_regularization = train_RSTGPT.SingleDataset( "./dataset_v3_2/changemyview/0000511465",
+                                    copy.deepcopy(self.tokenizer),int(511465*.8),int(511465),inference=False, sample_kps=True  )
             raise NotImplementedError
 
             
@@ -1205,30 +1163,24 @@ class DataLoaderGenerator():
             sample_kps = False
             
 
-        ds = SingleDataset(fn, copy.deepcopy(self.tokenizer), inference, sample_kps=sample_kps )
         
         if self.gpus <= 1 and split_name not in ['inference', 'test']:
-            sampler = SizedOrderedBatchSampler(ds, bs, True, shuffle=True) if sampler else sampler
-            bs = 1
+            sampler = SizedOrderedBatchSampler(ds_regularization,bs, drop_last=True,shuffle=shuffle)
+        
+        elif self.gpus > 1 and split_name not in ['inference', 'test']:
+            sampler = SizedOrderedDistributedBatchSampler(ds_regularization, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus )
+        
         else:
-            sampler = SizedOrderedDistributedBatchSampler(ds, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus)
-            bs = 1
+            sampler = None
 
+        dataloader = torch.utils.data.DataLoader( ds_regularization,
+                                                            num_workers=self.workers if sampler else 1,
+                                                             batch_size=1,
+                                                            batch_sampler =sampler,
+                                                            pin_memory=True,
+                                                            collate_fn = self.tokenizer.default_collate_pad )
 
-        dataloader = torch.utils.data.DataLoader(ds, 
-                                                 num_workers=self.workers//2 if sampler else 1, 
-                                                 batch_size=bs,
-                                                 batch_sampler = sampler,
-                                                 pin_memory=True,
-                                                 collate_fn=self.tokenizer.default_collate_pad,
-                                                )
-
-        if split_name == "train":
-
-            return { 'dyploc_dset':dataloader , 'regularization':dl_regularization }
-
-        else:
-            return dataloader
+        return dataloader
 
 class SingleDataset(Dataset):
     """creates a dataloader given a directory of text files each containing a conversation
@@ -1256,7 +1208,6 @@ class SingleDataset(Dataset):
             self.np_rstlens = dict_cached_order['np_rstlens']
             self.np_keyphrase_lens = dict_cached_order['np_keyphrase_lens']
             self.np_title_lens = dict_cached_order['np_title_lens']
-            self.li_li_claim_lens = dict_cached_order['li_li_claim_lens']
 
         else:
             # len of text
@@ -1284,32 +1235,17 @@ class SingleDataset(Dataset):
                                             padding = 'do_not_pad',
                                             return_tensors=None).__len__() for title in li_title] )
 
-            li_claims = [ ujson.loads(claim)  for claim in self.data.li_claim.tolist() ]
-            li_claims = [ [ self.tokenizer.claim_start_token+claim for claim in claims] if len(claims)>0 else []  for claims in li_claims ]
-            self.li_li_claim_lens =  [ [ self.tokenizer.encode(claim,
-                                            add_special_tokens=False, 
-                                            truncation=False,
-                                            padding = 'do_not_pad',
-                                            return_tensors=None).__len__() for claim in claims ] for claims in li_claims ]            
-
             dict_cached_order = {'np_textlens': self.np_textlens,
                                 'np_rstlens': self.np_rstlens,
                                 'np_keyphrase_lens': self.np_keyphrase_lens,
-                                'np_title_lens':self.np_title_lens,
-                                'li_li_claim_lens':self.li_li_claim_lens}
+                                'np_title_lens':self.np_title_lens,                                }
 
             pickle.dump(dict_cached_order, open(fp_cached_order, "wb"))
-
-        #randomly choosing a claim
-        self.li_claim_idxs = [ random.randint(0,len(li_claim_lens)-1) if len(li_claim_lens)!=0 else -1 for li_claim_lens in self.li_li_claim_lens ] 
-        self.np_claim_lens = np.array( [ self.li_li_claim_lens[datum_idx][claim_idx] if claim_idx>-1 else 0 for datum_idx, claim_idx in enumerate(self.li_claim_idxs) ] )
-
 
         #v2 We initialize the rst/kp lengths as the actual length of each entry
         # In the Sampler, we change the max length to that of its pre-prescribed batch
         self.rst_len = copy.deepcopy( self.np_rstlens )
         self.key_phrase_len = copy.deepcopy( self.np_keyphrase_lens )
-        self.claim_len = copy.deepcopy(self.np_claim_lens)
         self.title_len = copy.deepcopy(self.np_title_lens)
         self.data = self.data.to_dict('records')
 
@@ -1318,7 +1254,7 @@ class SingleDataset(Dataset):
 
     def __getitem__(self, index):
 
-        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title, claim = self.getitem_extract_datum(
+        rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title = self.getitem_extract_datum(
             index)
 
         if self.inference == True:
@@ -1333,9 +1269,8 @@ class SingleDataset(Dataset):
                                                   dict_pos_edu=dict_pos_edu,
                                                   max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
                                                   max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
-                                                    title=title, claim=claim,
+                                                    title=title,
                                                   max_len_title=min( self.title_len[index], self.tokenizer.max_len_title),
-                                                  max_len_claim=min( self.claim_len[index], self.tokenizer.max_len_claim),
                                                    )
 
             encoded['orig_rst_rels'] = rst_rels
@@ -1348,7 +1283,6 @@ class SingleDataset(Dataset):
             encoded['orig_dict_pos_edu'] = dict_pos_edu
             encoded['orig_li_kprstpos'] = li_kprstpos
             encoded['orig_title'] = title
-            encoded['orig_claim'] = claim
 
 
         elif self.inference==False:
@@ -1358,11 +1292,10 @@ class SingleDataset(Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                title=title,claim=claim,
+                title=title,
                 max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst ),
                 max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase),
                 max_len_title=min( self.title_len[index], self.tokenizer.max_len_title),
-                max_len_claim=min( self.claim_len[index], self.tokenizer.max_len_claim)
                  )
 
         return encoded
@@ -1406,13 +1339,10 @@ class SingleDataset(Dataset):
         #title        
         title = ujson.loads(datum['prompt']).lstrip( string.punctuation )
 
-        #claim
-        claim = ujson.loads(datum['li_claim'])[self.li_claim_idxs[index]] if self.li_claim_idxs[index] != -1 else ""
-
         #pos and edus
         dict_pos_edu = json.loads(datum['dict_pos_edu'])   
 
-        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title, claim
+        return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu, title
 
 class SizedOrderedBatchSampler(Sampler[List[int]]):
     r"""Wraps another sampler to yield a mini-batch of indices.
@@ -1448,14 +1378,11 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.has_title = hasattr( self.data_source , "np_title_lens")
-        self.has_claim = hasattr( self.data_source , "np_claim_lens")
 
         self.prepare_ds()
                
-    
     def __iter__(self) -> Iterator[List[int]]:
         return iter(self.li_chunked_idxs)
-
 
     def __len__(self) -> int:
         return len(self.li_chunked_idxs)
@@ -1471,15 +1398,12 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
         np_key_phrase_lens = self.data_source.np_keyphrase_lens
         if self.has_title:
             np_title_lens = self.data_source.np_title_lens
-        if self.has_claim:
-            np_claim_lens = self.data_source.np_claim_lens
+
        
         # Sorting and (maybe) shuffling
         tuple_factors = (np_txt_lens,)
         if self.has_title:
             tuple_factors = (np_title_lens, ) + tuple_factors
-        if self.has_claim:
-            tuple_factors = (np_claim_lens, ) + tuple_factors
         tuple_factors = (np_rst_lens, np_key_phrase_lens,  ) + tuple_factors
 
         if self.shuffle:
@@ -1514,10 +1438,6 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
             self.li_chunk_title_len = [
                 np.take(np_title_lens, idxs).max() for idxs in self.li_chunked_idxs]
 
-        if self.has_claim:
-            self.li_chunk_claim_len = [
-                np.take(np_claim_lens, idxs).max() for idxs in self.li_chunked_idxs]
-
         # Updating Chunk sizes
         for chunk_idx, data_idxs in enumerate(self.li_chunked_idxs):
             for data_idx in data_idxs:
@@ -1527,8 +1447,7 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
                 
                 if self.has_title:
                     self.data_source.title_len[data_idx] = self.li_chunk_title_len[chunk_idx]
-                if self.has_claim:
-                    self.data_source.claim_len[data_idx] = self.li_chunk_claim_len[chunk_idx]
+
 
 class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
     r"""
@@ -1605,7 +1524,6 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         self.num_replicas = num_replicas
         self.rank = rank
         self.has_title = hasattr(data_source,"np_title_lens")
-        self.has_claim = hasattr( data_source , "np_claim_lens")
 
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -1644,16 +1562,12 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         np_key_phrase_lens = self.data_source.np_keyphrase_lens
         if self.has_title:
             np_title_lens = self.data_source.np_title_lens
-        if self.has_claim:
-            np_claim_lens = self.data_source.np_claim_lens
 
 
         # Sorting and (maybe) shuffling
         tuple_factors = (np_txt_lens,)
         if self.has_title:
             tuple_factors = (np_title_lens, ) + tuple_factors
-        if self.has_claim:
-            tuple_factors = (np_claim_lens, ) + tuple_factors
         tuple_factors = (np_rst_lens, np_key_phrase_lens,  ) + tuple_factors
 
         if self.shuffle:
@@ -1704,11 +1618,6 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
                 np.take(np_title_lens, idxs).max()
                 for idxs in li_chunked_idxs] for li_chunked_idxs in li_li_chunked_idxs]
 
-        if self.has_claim:
-            li_li_chunk_claim_len = [[
-                np.take(np_claim_lens, idxs).max()
-                for idxs in li_chunked_idxs] for li_chunked_idxs in li_li_chunked_idxs]
-
         #Updating the max_len_rst and max_len_keyphrase 
         for (idx, (li_chunked_idxs, li_chunk_rst_len, li_chunk_key_phrase_len) ) in enumerate( zip(li_li_chunked_idxs, li_li_chunk_rst_len, li_li_chunk_key_phrase_len) ):
             # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
@@ -1722,8 +1631,6 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
                     if self.has_title:
                         self.data_source.title_len[data_idx] = li_li_chunk_title_len[idx][chunk_idx]   
 
-                    if self.has_claim:
-                        self.data_source.claim_len[data_idx] = li_li_chunk_claim_len[idx][chunk_idx]        
 
 def main(tparams={}, mparams={}):
 
@@ -1741,21 +1648,21 @@ def main(tparams={}, mparams={}):
     os.makedirs(tparams['dir_checkpoints'], exist_ok=True)
 
     # initiating training loop
-    training_module = RSTGPT2Dyploc_TrainingModule.instatiate_training_module(
+    training_module = RSTGPT2Pair_TrainingModule.instatiate_training_module(
         tparams, mparams)
-    trainer, training_module = RSTGPT2Dyploc_TrainingModule.instatiate_trainer(
+    trainer, training_module = RSTGPT2Pair_TrainingModule.instatiate_trainer(
         tparams, tb_logger, training_module)
-    RSTGPT2Dyploc_TrainingModule.start(trainer, tparams, training_module, mparams)
+    RSTGPT2Pair_TrainingModule.start(trainer, tparams, training_module, mparams)
 
 if __name__ == '__main__':
 
     parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
 
     # add model specific args
-    mparams = RSTGPT2Dyploc.parse_model_specific_args(parent_parser)
+    mparams = RSTGPT2Pair.parse_model_specific_args(parent_parser)
 
     # add the trainer specific args
-    tparams = RSTGPT2Dyploc_TrainingModule.parse_train_specific_args(parent_parser)
+    tparams = RSTGPT2Pair_TrainingModule.parse_train_specific_args(parent_parser)
 
     if tparams.mode == "test":
         assert tparams.gpus in [0, 1]
@@ -1769,5 +1676,3 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-
-# python3 train_RSTGPT_arggen_dyploc2.py --batch_size 16 --version 22 --finetune_version 2 --precision 16 --mode finetune --workers 8 --gpus --tag debugging --max_len_utt 270 --max_len_rst 64 --max_len_title 30 --max_len_claim 20 --max_len_key_phrase 64 --tag "ArgGen. With regularisation loss" --rst_tree_aligned_attention 0 --rst_segment_method segbot

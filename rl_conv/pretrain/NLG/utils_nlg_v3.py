@@ -1,6 +1,5 @@
 import os
 import json
-from torch._C import Value
 
 from transformers.generation_utils import GenerationMixin
 
@@ -67,17 +66,22 @@ except Exception as e:
 
 
 #region loading and saving
-def get_path(_path,_dir=False):
+def get_path(_path,_dir=False, relative=True):
 
     if os.path.isabs(_path) == False:
         _path = os.path.join(dirname, _path)
     
-    _path = os.path.realpath(_path)
+    if relative:
+        _path = os.path.realpath(_path)
     
-    if _dir:
-        os.makedirs(_path, exist_ok=True)
-    else:
-        os.makedirs(os.path.dirname(_path), exist_ok=True)
+    try:
+        if _dir:
+            os.makedirs(_path, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(_path), exist_ok=True)
+    except PermissionError as e:
+        print("Insufficient permission to create directory", _path)
+        pass
 
     return _path
 
