@@ -983,7 +983,8 @@ class RSTGPT2Pair_TrainingModule(pl.LightningModule):
         return steps
 
     def configure_optimizers(self):
-
+        
+        
         self.freeze_specific_modules( [ self.model ] )
         self.freeze_specific_modules( self.model.transformer.h, freeze=False )
         self.freeze_specific_modules( [ self.model.wte_title, self.model.wpe_title], freeze=False )

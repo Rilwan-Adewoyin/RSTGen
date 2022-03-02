@@ -50,7 +50,7 @@ from transformers.optimization import AdafactorSchedule
 from transformers.tokenization_utils_base import AddedToken
 import string
 import utils_nlg_v3 as utils
-from utils_nlg_v3 import EmbeddingRstPos, RstModelMixin
+from utils_nlg_v3 import EmbeddingRstPos, mpatch_save_model, RstModelMixin
 
 import torch_optimizer as optim
 import functools
@@ -58,8 +58,6 @@ import operator
 
 T_co = TypeVar('T_co', covariant=True)
 import sys
-
-from utils_nlg_v3 import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
 
 mp1 = os.path.abspath(os.path.join('..'))
 mp2 = "../DockerImages/feng_hirst_rst_parser"
@@ -248,9 +246,8 @@ def bart_forward(self,
                  inputs_embeds=None,
                  decoder_inputs_embeds=None,
 
-                 decoder_context_rstpos=None,
-                 decoder_edu_rstpos=None,
-
+                            decoder_context_rstpos=None,
+                            decoder_edu_rstpos=None,
                  use_cache=None,
                  output_attentions=None,
                  output_hidden_states=None,
@@ -323,213 +320,6 @@ def bart_forward(self,
         encoder_attentions=encoder_outputs.attentions,
     )
 
-# Monkey Patch for BartModel Decoder forward - to allow token dropout in embedding during training
-def bart_decoder_forward(
-    self,
-    input_ids=None,
-    attention_mask=None,
-    encoder_hidden_states=None,
-    encoder_attention_mask=None,
-    head_mask=None,
-    cross_attn_head_mask=None,
-    past_key_values=None,
-    inputs_embeds=None,
-    use_cache=None,
-    output_attentions=None,
-    output_hidden_states=None,
-    return_dict=None,):
-    r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-            provide it.
-            Indices can be obtained using [`BartTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-            [What are input IDs?](../glossary#input-ids)
-        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-            [What are attention masks?](../glossary#attention-mask)
-        encoder_hidden_states (`torch.FloatTensor` of shape `(batch_size, encoder_sequence_length, hidden_size)`, *optional*):
-            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention
-            of the decoder.
-        encoder_attention_mask (`torch.LongTensor` of shape `(batch_size, encoder_sequence_length)`, *optional*):
-            Mask to avoid performing cross-attention on padding tokens indices of encoder input_ids. Mask values
-            selected in `[0, 1]`:
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-            [What are attention masks?](../glossary#attention-mask)
-        head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-            Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-        cross_attn_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-            Mask to nullify selected heads of the cross-attention modules in the decoder to avoid performing
-            cross-attention on hidden heads. Mask values selected in `[0, 1]`:
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
-            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of
-            shape `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
-            Contains pre-computed hidden-states (key and values in the self-attention blocks and in the
-            cross-attention blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those
-            that don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of
-            all ``decoder_input_ids``` of shape `(batch_size, sequence_length)`. inputs_embeds (`torch.FloatTensor`
-            of shape `(batch_size, sequence_length, hidden_size)`, *optional*): Optionally, instead of passing
-            `input_ids` you can choose to directly pass an embedded representation. This is useful if you want more
-            control over how to convert `input_ids` indices into associated vectors than the model's internal
-            embedding lookup matrix.
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-            returned tensors for more detail.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-            for more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~file_utils.ModelOutput`] instead of a plain tuple.
-    """
-    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-    output_hidden_states = (
-        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-    )
-    use_cache = use_cache if use_cache is not None else self.config.use_cache
-    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-    # retrieve input_ids and inputs_embeds
-    if input_ids is not None and inputs_embeds is not None:
-        raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-    elif input_ids is not None:
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
-    elif inputs_embeds is not None:
-        input_shape = inputs_embeds.size()[:-1]
-    else:
-        raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-
-    # past_key_values_length
-    past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-
-    if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
-        # Using embedding dropout for better regularisation on limited dset
-        inputs_embeds = self.discrete_embedding_dropout(
-            input_ids, self.embed_tokens, self.config.embed_tkn_pdrop
-        ) * self.embed_scale
-
-    attention_mask = self._prepare_decoder_attention_mask(
-        attention_mask, input_shape, inputs_embeds, past_key_values_length
-    )
-
-    # expand encoder attention mask
-    if encoder_hidden_states is not None and encoder_attention_mask is not None:
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
-
-    # embed positions
-    positions = self.embed_positions(input_shape, past_key_values_length)
-
-    hidden_states = inputs_embeds + positions
-    hidden_states = self.layernorm_embedding(hidden_states)
-
-    hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-
-    # decoder layers
-    all_hidden_states = () if output_hidden_states else None
-    all_self_attns = () if output_attentions else None
-    all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
-    next_decoder_cache = () if use_cache else None
-
-    # check if head_mask/cross_attn_head_mask has a correct number of layers specified if desired
-    for attn_mask, mask_name in zip([head_mask, cross_attn_head_mask], ["head_mask", "cross_attn_head_mask"]):
-        if attn_mask is not None:
-            if attn_mask.size()[0] != (len(self.layers)):
-                raise ValueError(
-                    "The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
-                )
-
-    for idx, decoder_layer in enumerate(self.layers):
-        # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-        dropout_probability = random.uniform(0, 1)
-        if self.training and (dropout_probability < self.layerdrop):
-            continue
-
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-        if self.gradient_checkpointing and self.training:
-
-            if use_cache:
-                logger.warning(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    # None for past_key_value
-                    return module(*inputs, output_attentions, use_cache)
-
-                return custom_forward
-
-            layer_outputs = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(decoder_layer),
-                hidden_states,
-                attention_mask,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                head_mask[idx] if head_mask is not None else None,
-                cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
-                None,
-            )
-        else:
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                cross_attn_layer_head_mask=(
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                ),
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-        hidden_states = layer_outputs[0]
-
-        if use_cache:
-            next_decoder_cache += (layer_outputs[3 if output_attentions else 1],)
-
-        if output_attentions:
-            all_self_attns += (layer_outputs[1],)
-
-            if encoder_hidden_states is not None:
-                all_cross_attentions += (layer_outputs[2],)
-
-    # add hidden states from the last decoder layer
-    if output_hidden_states:
-        all_hidden_states += (hidden_states,)
-
-    next_cache = next_decoder_cache if use_cache else None
-    if not return_dict:
-        return tuple(
-            v
-            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
-            if v is not None
-        )
-    return BaseModelOutputWithPastAndCrossAttentions(
-        last_hidden_state=hidden_states,
-        past_key_values=next_cache,
-        hidden_states=all_hidden_states,
-        attentions=all_self_attns,
-        cross_attentions=all_cross_attentions,
-    )
-
 class RSTBart_Config(BartConfig):
 
     def __init__(self,
@@ -537,16 +327,11 @@ class RSTBart_Config(BartConfig):
                  model_name="RSTBart",
                  scale_grad_by_freq=True,
                  max_len_rst=28,
-                 max_len_kp=30,
+                 max_len_key_phrase=30,
                  max_len_utt=256,
                  rst_tree_aligned_attention=False,
                  rst_segment_method='None', 
                  max_rst_pos=4094,
-
-                embed_tkn_pdrop=0.15,
-                embed_kp_pdrop=0.15,
-                embed_rst_pdrop=0.15,
-
                  **kwargs):
 
         super().__init__(**kwargs)
@@ -556,7 +341,7 @@ class RSTBart_Config(BartConfig):
         self.scale_grad_by_freq = scale_grad_by_freq
         self.max_len_utt = max_len_utt
         self.max_len_rst = max_len_rst
-        self.max_len_kp = max_len_kp
+        self.max_len_key_phrase = max_len_key_phrase
         self.rst_tree_aligned_attention = rst_tree_aligned_attention
         self.rst_segment_method = rst_segment_method
         self.rst_rel_li = ['Attribution',
@@ -571,10 +356,6 @@ class RSTBart_Config(BartConfig):
         self.forced_bos_token_id=self.bos_token_id
 
         self.vocab_size = self.vocab_size + self.rst_added_tokens
-
-        self.embed_tkn_pdrop = embed_tkn_pdrop
-        self.embed_kp_pdrop = embed_kp_pdrop
-        self.embed_rst_pdrop = embed_rst_pdrop
         
 class RSTBart(BartForConditionalGeneration, RstModelMixin):
 
@@ -587,14 +368,13 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
         self.model_name = config.model_name
         self.scale_grad_by_freq = config.scale_grad_by_freq
         self.max_len_rst = config.max_len_rst
-        self.max_len_kp = config.max_len_kp
+        self.max_len_key_phrase = config.max_len_key_phrase
         self.max_len_utt = config.max_len_utt
         self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
         self.rst_segment_method = config.rst_segment_method
         self.model.forward = types.MethodType(bart_forward, self.model)
-        self.model.encoder.forward = types.MethodType(bart_encoder_forward, self.model.encoder)
-        self.model.decoder.forward = types.MethodType(bart_decoder_forward, self.model.decoder)
-
+        self.model.encoder.forward = types.MethodType(
+            bart_encoder_forward, self.model.encoder)
                 
         self.embed_rst_rels = torch.nn.Embedding( len(self.config.rst_rel_li)+1,
                                                  self.config.d_model, padding_idx=len(
@@ -618,6 +398,8 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
 
         self.loss_fct = CrossEntropyLoss()
 
+
+            
         self.generation_params = {
                                             'early_stopping': True,
                                             'do_sample':True, 
@@ -625,7 +407,6 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                                             'top_p':0.95, 
                                             'no_repeat_ngram_size': 2,
                                             'min_length': 5, 'max_length': 190 }
-   
     def forward(self,
                 rst_start_token_id=None,
                 rst_rel=None,
@@ -711,34 +492,18 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
 
         lm_logits = self.lm_head(transformer_outputs[0]) + self.final_logits_bias
 
-        loss = None
-        ll_loss = None
-        ul_loss_token = None
+        masked_lm_loss = None
         if labels is not None:           
             lm_logits = lm_logits.contiguous()
             labels = labels.contiguous()
             masked_lm_loss = self.loss_fct( lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1) )
 
-            if self.ull_loss_tkn:
-                ll_loss = masked_lm_loss
-                #Replacing the kp start tokens with pad tokens
-                kp_cands = key_phrase_ids.masked_fill( key_phrase_ids==self.tokenizer.keyphrase_start_token_id,
-                                                         self.config.pad_token_id  )
-                ul_loss_token = self._compute_token_level_unlikelihood_loss(    
-                                    lm_logits, labels, kp_cands, tkn_pad_idx=self.config.pad_token_id )
-                loss = masked_lm_loss + ul_loss_token
-            else:
-                loss = masked_lm_loss
-
         if not return_dict:
-            raise NotImplementedError("return dict")
             output = (lm_logits,) + transformer_outputs[1:]
             return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
         output =  Seq2SeqLMOutput(
-            loss=loss,
-            ll_loss=ll_loss,
-            ul_loss_token=ul_loss_token,
+            loss=masked_lm_loss,
             logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values,
             decoder_hidden_states=transformer_outputs.decoder_hidden_states,
@@ -769,31 +534,14 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
      ):
         # RST context embedding
         rst_start_token_embed = self.model.encoder.embed_tokens(rst_start_token_id)
-        # rst_rel_embed = self.embed_rst_rels(rst_rel) 
-        # rst_ns_embed = self.embed_rst_ns(rst_ns)
-        # rst_pos_embed = self.embed_rst_pos(rst_pos) 
-        # rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) 
-
-        rst_rel_embed = self.discrete_embedding_dropout(
-            rst_rel, self.embed_rst_rels, self.config.embed_rst_pdrop)
-        rst_ns_embed = self.discrete_embedding_dropout(
-            rst_ns, self.embed_rst_ns, self.config.embed_rst_pdrop)
-        rst_pos_embed = self.embed_rst_pos( 
-            rst_pos,self.embed_rst_pos, self.config.embed_rst_pdrop)
+        rst_rel_embed = self.embed_rst_rels(rst_rel) 
+        rst_ns_embed = self.embed_rst_ns(rst_ns)
+        rst_pos_embed = self.embed_rst_pos(rst_pos) 
         rst_embed = ( rst_rel_embed + rst_ns_embed + rst_pos_embed ) 
 
         # Key Phrase context embedding
-        # key_phrases_phrase_embed = self.model.encoder.embed_tokens( key_phrase_ids) 
-
-        # key_phrases_rst_pos_embed = self.embed_rst_pos(li_kprstpos) 
-
-        # key_phrases_embed = key_phrases_rst_pos_embed + key_phrases_phrase_embed
-
-        key_phrases_phrase_embed = self.discrete_embedding_dropout( 
-            key_phrase_ids,self.model.encoder.embed_tokens,self.config.embed_kp_pdrop )
-        key_phrases_rst_pos_embed = self.discrete_embedding_dropout(
-            li_kprstpos,self.embed_rst_pos,self.config.embed_kp_pdrop)
-
+        key_phrases_phrase_embed = self.model.encoder.embed_tokens( key_phrase_ids) 
+        key_phrases_rst_pos_embed = self.embed_rst_pos(li_kprstpos) 
         key_phrases_embed = key_phrases_rst_pos_embed + key_phrases_phrase_embed
 
         inputs_embeds = torch.cat([
@@ -962,12 +710,12 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
                 f'./models/{model_name}/version_{model_version}/checkpoints')
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name', 'model_name', 'max_len_kp',
+                'base_model_name', 'model_name', 'max_len_key_phrase',
                 'max_len_rst', 'max_len_utt',
                 'scale_grad_by_freq','rst_tree_aligned_attention']}
 
-            # overriding wit    h new keys
-            if mparams['rst_tree_aligned_attention']:
+            # overriding with new keys
+            if mparams['rst_tree_aligned_attention'] == True:
                 print("Default segmenter is feng-hirst. To change default behaviour pass alternative segmenter to mparams_new.")
             for key, value in mparams_new.items():
                 mparams[key] = value
@@ -1011,24 +759,12 @@ class RSTBart(BartForConditionalGeneration, RstModelMixin):
         parser.add_argument('--model_name', default='RSTBart', required=False)
         parser.add_argument('--max_len_utt', type=int, default=250)
         parser.add_argument('--max_len_rst', type=int, default=30)
-        parser.add_argument('--max_len_kp', type=int, default=40)
-        parser.add_argument('--scale_grad_by_freq', action='store_true', default=True,
+        parser.add_argument('--max_len_key_phrase', type=int, default=40)
+        parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=False,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
         parser.add_argument('--rst_tree_aligned_attention', type=lambda x: bool(int(x)), default=False)
         parser.add_argument('--rst_segment_method', type=str, default=None, choices=['None','fenghirst','segbot'])
         
-
-        #Regularization params
-        parser.add_argument('--attention_dropout', type=float, default=0.1)
-        parser.add_argument('--dropout', type=float, default=0.1 )
-        
-        parser.add_argument('--embed_tkn_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
-        parser.add_argument('--embed_kp_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
-        parser.add_argument('--embed_rst_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
-        
-        parser.add_argument('--ull_loss_tkn', default=False, action='store_true')
-        parser.add_argument('--prev_context_len', type=int, default=None, help="lookback length for ul token loss")
-
         mparams = parser.parse_known_args()[0]
         return mparams
 
@@ -1088,7 +824,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     # Setting up context lengths
     max_len_rst = 12
-    max_len_kp = 24
+    max_len_key_phrase = 24
     max_len_utt = 1024
     max_rst_pos = 4094
 
@@ -1102,7 +838,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         super().__init__( *args, **kwargs)
         
         self.max_len_rst = kwargs.get('max_len_rst', self.max_len_rst)
-        self.max_len_kp = kwargs.get('max_len_kp',self.max_len_kp)
+        self.max_len_key_phrase = kwargs.get('max_len_key_phrase',self.max_len_key_phrase)
         self.max_len_utt = kwargs.get('max_len_utt', self.max_len_utt)
         self.max_rst_pos = kwargs.get('max_rst_pos', self.max_rst_pos )
         self.rst_tree_aligned_attention = kwargs.get('rst_tree_aligned_attention',self.rst_tree_aligned_attention)
@@ -1203,6 +939,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
     def encode_utterance(self, utterance=None, utterance_prompt=None, context_len=None):
 
         # Creating labels/targets
+        # Creating labels/targets
         if utterance_prompt != None:
             # utterance_prompt = self.bos_token + utterance_prompt
             utterance_prompt = self.eos_token + self.bos_token + utterance_prompt
@@ -1237,7 +974,6 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 return_tensors='pt',
                 return_length=False,
             )[0]
-            #NOTE: labels shoold have a context_len number of -100 prepended to the front of it to factor in the context which is ignored
 
             decoder_input_ids = shift_tokens_right(labels.unsqueeze(0), 
                                     self.pad_token_id ,
@@ -1331,7 +1067,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 [type]: [description]
         """
         if len(key_phrases)!=0:
-            max_len = self.max_len_kp
+            max_len = self.max_len_key_phrase
 
             if self.inference_mode == False:
             
@@ -1640,7 +1376,7 @@ class RSTTokenizer(BartTokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                         dir_tokenizer="./tokenizers/RSTBart",
                         base_tokenizer_name="facebook/bart-base",
                         rst_params={},
-                        **kwargs):  # max_len_rst, max_len_kp, max_rst_depth, max_len_utt, max_rst_pos
+                        **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
@@ -1681,13 +1417,13 @@ class RSTBart_TrainingModule(pl.LightningModule):
                  accumulate_grad_batches=1,
                  max_epochs=25,
                  gpus=1,
-                 learning_rate=None,
-                 warmup_proportion=None,
+                 learning_rate=1e-4,
+                 warmup_proportion=0.1,
                  workers=0,
                  mode='train_new',
                  tag='',
-                 ull_loss_tkn=None,
-                 prev_context_len=None,
+                 batching_style='effecient',
+                 optimizer = 'adafactor',
                  **kwargs):
         super().__init__()
 
@@ -1695,13 +1431,12 @@ class RSTBart_TrainingModule(pl.LightningModule):
         self.gpus = gpus
         self.mode = mode
         self.workers = workers
-        self.ull_loss_tkn = ull_loss_tkn
-        self.prev_context_len = prev_context_len
-        
+        self.batching_style = batching_style
+        self.optimizer = optimizer
         self.tokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
-                                                                                                               'max_len_kp',
+                                                                                                               'max_len_key_phrase',
                                                                                                                'max_rst_depth',
                                                                                                                'max_len_utt', 
                                                                                                                'max_rst_pos',
@@ -1716,6 +1451,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
         self.model.config.vocab_size = mconfig.vocab_size
         self.model.resize_token_embeddings(self.model.config.vocab_size)
 
+
+        
         self.pad_values = {'rst_start_token': mconfig.pad_token_id,
                            'rst_rel': self.model.embed_rst_rels.padding_idx,
                            'rst_ns': self.model.embed_rst_ns.padding_idx,
@@ -1745,20 +1482,21 @@ class RSTBart_TrainingModule(pl.LightningModule):
             'rst_ns': mconfig.max_len_rst-1,
             'rst_pos': mconfig.max_len_rst-1,
 
-            'key_phrase_ids': mconfig.max_len_kp,
-            'li_kprstpos': mconfig.max_len_kp,
+            'key_phrase_ids': mconfig.max_len_key_phrase,
+            'li_kprstpos': mconfig.max_len_key_phrase,
 
             'labels': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
             'decoder_input_ids': mconfig.max_len_utt if mconfig.max_len_utt else self.config.max_position_embeddings,
 
-            'attention_mask': mconfig.max_len_rst + mconfig.max_len_kp,  # axis:max_length
-            'decoder_cross_attention_mask': [ mconfig.max_len_utt , mconfig.max_len_rst+mconfig.max_len_kp ] , #max_lens in both 2d dimensions
+            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase,  # axis:max_length
+            'decoder_cross_attention_mask': [ mconfig.max_len_utt , mconfig.max_len_rst+mconfig.max_len_key_phrase ] , #max_lens in both 2d dimensions
 
-            'position_ids_kp': mconfig.max_len_kp,
+            'position_ids_kp': mconfig.max_len_key_phrase,
             
             'decoder_edu_rstpos': mconfig.max_rst_pos // 2,
-            'decoder_context_rstpos':mconfig.max_len_rst + mconfig.max_len_kp}
+            'decoder_context_rstpos':mconfig.max_len_rst + mconfig.max_len_key_phrase
 
+        }
         self.tokenizer.pad_maxlens = self.pad_maxlens
         
         self.model.tokenizer = self.tokenizer
@@ -1771,38 +1509,33 @@ class RSTBart_TrainingModule(pl.LightningModule):
             self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                  workers=self.workers, mode=self.mode, gpus=self.gpus,
                                  pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
-                                 batching_style=self.batching_style,
-                                 num_nodes=self.num_nodes
+                                 batching_style=self.batching_style
                                  )
 
             if self.mode == "test":
                 self.create_data_loaders(['test'])
             else:
-
-                self.max_epochs = max_epochs
-                self.warmup_proportion = warmup_proportion
-                self.learning_rate = learning_rate
-
                 self.create_data_loaders(['train', 'val', 'inference'] )
-
                 self.tokenizer.inference_mode = True
                 self.inference_samples = list(islice(self.inference_dl, 2))
                 self.tokenizer.inference_mode = False
                 del self.inference_dl
 
-                # train_params_to_save = self.return_params()
-                # mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
-                #     lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTBart_Config.__init__).parameters.keys()) ))}
+        if self.mode in ['train_new', 'train_cont']:
+            self.max_epochs = max_epochs
+            self.warmup_proportion = warmup_proportion
+            self.learning_rate = learning_rate
 
-                # self.hparams.update({**train_params_to_save, **mparams_to_save})
-                # pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
-                #     kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
+            train_params_to_save = self.return_params()
+            mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
+                lambda p: p not in ['self','kwargs'], list(inspect.signature(RSTBart_Config.__init__).parameters.keys()) ))}
 
-                # self.trainer.logger.add_hparams( vars(mconfig) )
-                mconfig_dict = RSTBart_Config.to_dict()
-                self.hparams.update( **mconfig_dict )
-                ignore_list = ['mconfig','dir_data','gpus','workers']
-                self.save_hyperparameters(ignore=ignore_list)
+            self.hparams.update({**train_params_to_save, **mparams_to_save})
+            pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
+                kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
+
+
+            # self.trainer.logger.add_hparams( vars(mconfig) )
 
         if self.mode in ['inference']:
             self.eval()
@@ -1818,9 +1551,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
         parser.add_argument('--max_epochs', default=8, type=int)
         parser.add_argument('--accumulate_grad_batches', default=3, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
+        parser.add_argument('--batching_style', default='effecient', type=str, choices=['effecient','standard'])
 
-        parser.add_argument('--num_nodes',default=1, type=int )
-        parser.add_argument('--learning_rate', default=None, type=float)
+        parser.add_argument('--learning_rate', default=1e-4, type=float)
         parser.add_argument('--workers', default=16, type=int)  # TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
         parser.add_argument('--mode', default='train_new', type=str,
@@ -1831,10 +1564,8 @@ class RSTBart_TrainingModule(pl.LightningModule):
                             type=int, help="Precision to use", choices=[16, 32])
         parser.add_argument('--optimizer', default='adafactor', choices=['adafactor','AdamW'])
         parser.add_argument('--tag', default='', required=True, type=str)
-        parser.add_argument('--override', default=False, action='store_true')
-
-        parser.add_argument('--val_check_interval', type=float, default=0.2) 
-                
+        parser.add_argument('--override', default=False,
+                            type=lambda x: bool(int(x)), choices=[0, 1])
         tparams = parser.parse_known_args()[0]
 
         return tparams
@@ -1863,7 +1594,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                      'learning_rate', 'precision', 'splits', 'tag','optimizer']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_kp',
+                    'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase',
                     'scale_grad_by_freq','rst_tree_aligned_attention' ]})
 
                 mparams = mparams
@@ -1889,7 +1620,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     'learning_rate', 'precision']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_kp']})
+                    'base_model_name', 'model_name', 'max_len_utt','max_len_rst','max_len_key_phrase']})
             except KeyError:
                 pass
 
@@ -1917,33 +1648,35 @@ class RSTBart_TrainingModule(pl.LightningModule):
             trainer_vars = {}
         else:
 
-            trainer_vars = {'accelerator': 'ddp',
-                            'plugins': DDPPlugin(find_unused_parameters=False),
-                            'num_nodes':tparams['num_nodes'] }
+            trainer_vars = {    'accelerator': 'ddp',
+                            'plugins': DeepSpeedPlugin(stage=1, 
+                                                        contiguous_gradients=True) 
+                            # 'plugins' : DDPPlugin(find_unused_parameters=True)
+                            }
 
         # Creating Callbacks    
-        checkpoin_valloss = ModelCheckpoint(monitor='val_loss', 
+        callbacks = []
+        checkpoint_callback = ModelCheckpoint(monitor='val_loss', 
                                             save_top_k=2,
                                             mode='min', dirpath=dir_checkpoints,
                                             filename='{epoch:03d}_{val_loss:.5f}')
-        checkpoint_interval = ModelCheckpoint(
-            filename="interval-{epoch}-{step}",
-            monitor="step",
-            mode="max",
-            every_n_val_epochs=1,
-            save_top_k=1/tparams['val_check_interval']
-        )
+
+        checkpoint_callback._save_model = types.MethodType(
+            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience = 1/tparams['val_check_interval'],       
+            patience = 5,       
             verbose=False,
             mode='min'
         )
-        callbacks = [checkpoin_valloss, early_stop_callback, checkpoint_interval]
-
+        callbacks.append(checkpoint_callback)
+        callbacks.append(early_stop_callback)
+        
         if tparams['mode'] in ["train_new"]:
+
+
 
             trainer = pl.Trainer.from_argparse_args(argparse.Namespace(**tparams),
                                                     #progress_bar_refresh_rate=tparams['accumulate_grad_batches'],
@@ -1951,7 +1684,7 @@ class RSTBart_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=tparams['val_check_interval'],
+                                                    val_check_interval=0.1,
                                                     reload_dataloaders_every_n_epochs=1,
                                                     num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
@@ -2104,24 +1837,22 @@ class RSTBart_TrainingModule(pl.LightningModule):
             raise NotImplementedError
 
     def forward(self, input_):
-        # with torch.cuda.amp.autocast(enabled=True):
-        return self.model(**input_, return_dict=True)
+        with torch.cuda.amp.autocast(enabled=True):
+            return self.model(**input_, return_dict=True)
 
     def step(self, batch, step_name):
-        
-        loss_key = "loss" if step_name == "train" else f"{step_name}_loss"
-        moutput = self.forward(batch)
-        
-        output = { loss_key:moutput.loss}
-        self.log( loss_key, moutput.loss.detach(), sync_dist=False)
-        
 
-        if self.ull_loss_tkn:
-            output.update({f"{step_name}_ll_loss":moutput.ll_loss,
-                            f"(step_name)_ul_loss_tkn":moutput.ul_loss_tkn})
-            self.log( f"{step_name}_ll_loss", moutput.ll_loss, sync_dist=False)
-            self.log( f"{step_name}_ul_loss_tkn", moutput.ul_loss_tkn, sync_dist=False)
+        output = self.forward(batch)
+        output = {}
+        
+        if step_name == 'train':
+            output["loss"] = output.loss
+            self.log( "loss", output.loss, sync_dist=False)
 
+        else:
+            loss_key = f"{step_name}_loss"
+            self.log( loss_key, output.loss, sync_dist=False)
+            output[loss_key]=output.loss
 
         return output
     
@@ -2149,21 +1880,18 @@ class RSTBart_TrainingModule(pl.LightningModule):
         self.epoch_end_log(outputs, "test")
 
     def epoch_end_log(self, outputs, step_name):
-        
-        if not hasattr(self,'w_rank'):
-            self.w_rank = _get_rank()
 
         if step_name == "train":
             pass
         else:
             loss = torch.stack([x[f"{step_name}_loss"]for x in outputs]).mean()
             
-            self.log(f"{step_name}_loss", loss, prog_bar=True, sync_dist=True)
-
-        if step_name == "val":
+            self.log(f"{step_name}_loss", loss, logger=True, prog_bar=True, sync_dist=True, on_step=False)
+        
+        if step_name == "val" and _get_rank() == 0:
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
-
+            
             if not os.path.exists(dir_infer):
                 os.makedirs(dir_infer, exist_ok=True)
 
@@ -2179,7 +1907,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
                     df = pd.DataFrame(columns=['epoch', 'rst_rels', 'key_phrases', 'utterance',
                                             'dict_pos_edu', 'li_kprstpos',
-                                            'rst_ns','rst_pos',
+
+                                            'rst_ns',
+                                            'rst_pos',
                                             ])
 
                     rst_rels = encoded_input.pop('orig_rst_rels')
@@ -2194,20 +1924,20 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
                     datum = {
                         'epoch': -1,
-                        "utterance": utterance,
 
                         'rst_rels': ', '.join(rst_rels),
                         'rst_ns': ', '.join(rst_ns),
                         'rst_pos': rst_pos,
+
                         "key_phrases": ', '.join(key_phrases),
+                        "utterance": utterance,
                         "dict_pos_edu": json.dumps(dict_pos_edu),
+
                         "li_kprstpos": json.dumps(orig_li_kprstpos),
                     }
 
                     df = df.append(datum, ignore_index=True)
                     df.to_csv(fp, index=False)
-                    if self.w_rank==0:
-                        df.to_csv(fp, index=False)
 
                 # creating predition andding to existing results
                 encoded_input.pop('orig_rst_rels', None)
@@ -2221,13 +1951,9 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 # encoded_input.pop('labels', None)
 
                 generation_params = copy.deepcopy(self.model.generation_params)
-                generation_params['max_time'] = 30
-                generation_params['max_length'] = 160
-                try:
-                    decoded_text = self.model.generate_plus(
-                        encoded_input, generation_params)
-                except Exception as e:
-                    decoded_text = "ERROR"
+                generation_params['max_time'] = 45
+                decoded_text = self.model.generate_plus(
+                    encoded_input, generation_params)
 
                 datum = {
                     'epoch': self.current_epoch,
@@ -2240,20 +1966,19 @@ class RSTBart_TrainingModule(pl.LightningModule):
                     'rst_pos': ''
                 }
 
-                if self.w_rank==0:
-                    pd.DataFrame.from_records([datum]).to_csv(
-                        fp, index=False, mode='a', header=False)
+                pd.DataFrame.from_records([datum]).to_csv(fp, index=False, mode='a', header=False)
                 # Saving to file
-                pass
-        
         else:
             pass
     
+        
     def create_data_loaders(self, modes ):
+
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
                 split_name='train')
-            self.train_dl_gen_count = 0
+            self.train_dl_used = False
+            
         if 'val' in modes:
             self.val_dl = self.dg.prepare_dataloader(
                 split_name='val')
@@ -2265,8 +1990,10 @@ class RSTBart_TrainingModule(pl.LightningModule):
                 split_name='inference')
 
     def train_dataloader(self):
-        if self.train_dl_gen_count == 0:
-            self.train_dl_gen_count += 1
+        # return self.train_dl
+
+        if self.train_dl_used == False:
+            self.train_dl_used = True
             return self.train_dl
         else:
             self.train_dl = self.dg.prepare_dataloader(
@@ -2281,15 +2008,20 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
     @lru_cache()
     def total_steps(self):
+
         ds_size = len(self.train_dl) // self.gpus
         steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches * self.batch_size)
         return steps
 
     def configure_optimizers(self):
-    
-        optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
-                        relative_step=True, warmup_init=True, lr=None, weight_decay=0.01)
-        lr_scheduler = AdafactorSchedule(optimizer)
+
+        if self.optimizer == 'adafactor':
+            optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
+                            relative_step=True, warmup_init=True, lr=None,
+                            weight_decay=0.01 )
+
+
+            lr_scheduler = AdafactorSchedule(optimizer)
 
         return { 'optimizer':optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}    
     
@@ -2304,23 +2036,18 @@ class RSTBart_TrainingModule(pl.LightningModule):
 
         return params
 
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-
-        res = super().on_save_checkpoint(checkpoint)
-        next( filter( lambda cb: isinstance(cb, ModelCheckpoint), self.trainer.callbacks) ).to_yaml()
-        return res
-
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
     """
 
     def __init__(self, dir_data, batch_size,
                  tokenizer,
-                 workers=0, mode='train_new',
+                 workers=0, 
+                 mode='train_new',
                  gpus=1,
                  pad_values={},
                  pad_maxlens={},
-                 num_nodes=1,
+                 batching_style='effecient',
                  **kwargs):
 
         self.dir_data = dir_data
@@ -2328,39 +2055,33 @@ class DataLoaderGenerator():
         self.splits = {'train': 0.6, 'val': 0.2, 'test': 0.2}
 
         self.batch_size = batch_size
+        self.batching_style = batching_style
         self.workers = workers
         self.mode = mode
         self.gpus = gpus
         self.pad_values = pad_values
         self.pad_maxlens = pad_maxlens
-        self.num_nodes =num_nodes
 
     def prepare_dataloader(self,
-                           split_name='train',
-                           debugging=False):
+                           split_name='train'):
         """Prepares a dataloader given a directory of data for NLG language module
             # The current method takes a percentage of data from each subdirectory
             Args:
                 dir_dset ([type]): [description]
         """
-        seed = random.randint(1,1000)
         dir_data = self.dir_data
 
         # getting all files from all different subreddits/types of conversation
-        fns = glob.glob(os.path.join(utils.get_path(dir_data,_dir=True, relative=True), "*", "*"))
-        
-        
+        #debugging
+        fns = glob.glob(os.path.join(utils.get_path(dir_data), "*", "*"))
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn] #[:5] #debugging
-
-        if debugging:
-            fns = fns[:5]
-
+            fn)[-1] != "lock" and "dict_len" not in fn]
+                
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
-        
 
         # defining starting line and total lines to use for dataset
+        
         if split_name == 'train':
             line_starts = [0]*len(files_sizes)
             line_ends = [ls+int(fs*self.splits['train'])
@@ -2368,35 +2089,27 @@ class DataLoaderGenerator():
             inference = False
             bs = self.batch_size
             shuffle = True
-            sample_kps = True
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
 
-            def collate_fn(
-                batch): return self.tokenizer.default_collate_pad(batch)
 
         elif split_name == 'val':
             line_starts = [int(fs*self.splits['train']) for fs in files_sizes]
             line_ends = [ls+int(fs*self.splits['val'])
                          for ls, fs in zip(line_starts, files_sizes)]
-
-            shuffle = False
+            shuffle = True
             inference = False
             bs = self.batch_size
-            sample_kps = False
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
 
-            def collate_fn(
-                batch): return self.tokenizer.default_collate_pad(batch)
 
         elif split_name == 'test':
             line_starts = [int(fs*(1-self.splits['test']))
                            for fs in files_sizes]
+            shuffle = False
             line_ends = files_sizes
             inference = False
             bs = self.batch_size
-
-            def collate_fn(batch): return self.tokenizer.default_collate_pad(
-                batch)
-            shuffle = False
-            sample_kps=False
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
             
 
         elif split_name == 'inference':
@@ -2407,35 +2120,30 @@ class DataLoaderGenerator():
             inference = True
             shuffle = False
             bs = 1
-            sample_kps=False
-            def collate_fn(
-                batch): return self.tokenizer.default_collate_pad(batch)
+            collate_fn = lambda batch: self.tokenizer.default_collate_pad(batch)
 
-        li_dsets = [ SingleDataset(_f, copy.deepcopy( self.tokenizer ), line_start, line_end, inference, sample_kps=sample_kps)
+        li_dsets = [SingleDataset(_f, self.tokenizer, line_start, line_end, inference )
                     for _f, line_start, line_end in zip(fns, line_starts, line_ends)]
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
         if self.gpus <= 1 and split_name not in ['inference', 'test']:
-            sampler = SizedOrderedBatchSampler(concat_dset, bs, drop_last=True, shuffle=shuffle)
-            bs = 1
-
-        elif self.gpus > 1 and split_name not in ['inference', 'test']:
-            sampler = SizedOrderedDistributedBatchSampler(concat_dset, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus, seed=seed, num_nodes=self.num_nodes)
-            bs = 1
+            sampler = SizedOrdered_Sampler(concat_dset, bs, shuffle=shuffle, batching_style=self.batching_style)
+            
+        elif self.batching_style=='effecient' and self.gpus > 1 and split_name not in ['inference', 'test' ]:
+            sampler = SizedOrdered_DistributedSampler(concat_dset, bs, shuffle=shuffle, gpus=self.gpus)
+            
         else:
             sampler = None
 
-        dataloader = torch.utils.data.DataLoader(concat_dset,
-                                                batch_size = bs,
+        dataloader = torch.utils.data.DataLoader(concat_dset, 
+                                                batch_size= bs,
                                                  num_workers=self.workers,
-                                                 batch_sampler=sampler,
+                                                 sampler=sampler,
                                                  pin_memory=True,
-                                                 collate_fn=collate_fn,
-                                                 )
-
+                                                 collate_fn=collate_fn)
+           
         return dataloader
-
 
 # concat basically makes all entries one long list of sequential indexes
 # sampler creates a randomised index list to sample from list above
@@ -2453,7 +2161,6 @@ class SingleDataset(torch.utils.data.Dataset):
         self.line_start = line_start
         self.line_end = line_end
         self.inference = inference
-        self.tokenizer.sample_kps = kwargs.get('sample_kps',False)
 
         skiprows = self.line_start if self.line_start != 0 else None
         with open(self.fp, 'r') as f:
@@ -2531,13 +2238,13 @@ class SingleDataset(torch.utils.data.Dataset):
 
         if self.inference == True:
 
-            utterance_prompt = ' '.join(utterance.split(' ')[:1])
+            utterance_prompt = ' '.join(utterance.split(' ')[:2])
 
             encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
                                                   li_kp=li_kp,
                                                   li_kprstpos=li_kprstpos,
                                                   utterance_prompt=utterance_prompt,
-                                                  max_len_rst=min( self.rst_len[index], self.tokenizer.max_len_rst),
+                                                  max_len_rst=self.rst_len[index],
                                                   dict_pos_edu=dict_pos_edu)
 
             encoded['orig_rst_rels'] = rst_rels
@@ -2558,9 +2265,10 @@ class SingleDataset(torch.utils.data.Dataset):
                 li_kprstpos=li_kprstpos,
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
-                max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst)
+                max_len_rst=self.rst_len[index],
             )
   
+
         return encoded
 
     def getitem_extract_datum(self, index):
@@ -2608,11 +2316,146 @@ class SizedOrdered_Sampler(Sampler[int]):
         data_source (Dataset): dataset to sample from
     """
 
-    def __init__(self, data_source, batch_size, shuffle ) -> None:
+    def __init__(self, data_source, batch_size, shuffle, batching_style='effecient' ) -> None:
         self.data_source = data_source
         self.batch_size = batch_size
 
+                #v1
+        if batching_style=='standard':
+            self.li_chunked_ordered_lens = list(range(len(self.data_source)))
+            random.shuffle(self.li_chunked_ordered_lens)
+        
+        else:
+            np_txt_lens = np.concatenate(
+                [ds.np_textlens for ds in self.data_source.datasets]).flatten()
+            np_rst_lens = np.concatenate(
+                [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
+            np_key_phrase_lens = np.concatenate(
+                [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
 
+            # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
+            np_ordered_lens = np.lexsort(
+                (np_rst_lens, np_key_phrase_lens, np_txt_lens))
+            # We Randomly re-arrange them in batches of batch size
+        
+
+            li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
+                                for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
+
+            if shuffle:
+                random.shuffle(li_chunked_lens)
+
+            # Getting max sizes for rst in each chunk
+            self.li_chunk_rst_len = [
+                np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
+
+            self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
+
+
+            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
+            for chunk_idx, data_idxs in enumerate(li_chunked_lens):
+                rst_len = self.li_chunk_rst_len[chunk_idx]
+
+                for data_idx in data_idxs:
+                    dataset_idx = bisect.bisect_right(
+                        self.data_source.cumulative_sizes, data_idx)
+
+                    if dataset_idx == 0:
+                        sample_idx = data_idx
+                    else:
+                        sample_idx = data_idx - \
+                            self.data_source.cumulative_sizes[dataset_idx - 1]
+
+                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
+
+    def __iter__(self):
+        return iter(self.li_chunked_ordered_lens)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
+class SizedOrdered_DistributedSampler(Sampler[T_co]):
+    r"""
+        Adapted so that each process takes sequential indices as opposed to strides across indices
+    """
+    r"""Sampler that restricts data loading to a subset of the dataset.
+        It is especially useful in conjunction with
+        :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
+        process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
+        :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
+        original dataset that is exclusive to it.
+        .. note::
+            Dataset is assumed to be of constant size.
+        Args:
+            dataset: Dataset used for sampling.
+            num_replicas (int, optional): Number of processes participating in
+                distributed training. By default, :attr:`world_size` is retrieved from the
+                current distributed group.
+            rank (int, optional): Rank of the current process within :attr:`num_replicas`.
+                By default, :attr:`rank` is retrieved from the current distributed
+                group.
+            shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
+                indices.
+            seed (int, optional): random seed used to shuffle the sampler if
+                :attr:`shuffle=True`. This number should be identical across all
+                processes in the distributed group. Default: ``0``.
+            drop_last (bool, optional): if ``True``, then the sampler will drop the
+                tail of the data to make it evenly divisible across the number of
+                replicas. If ``False``, the sampler will add extra indices to make
+                the data evenly divisible across the replicas. Default: ``False``.
+        .. warning::
+            In distributed mode, calling the :meth:`set_epoch` method at
+            the beginning of each epoch **before** creating the :class:`DataLoader` iterator
+            is necessary to make shuffling work properly across multiple epochs. Otherwise,
+            the same ordering will be always used.
+        Example::
+            >>> sampler = DistributedSampler(dataset) if is_distributed else None
+            >>> loader = DataLoader(dataset, shuffle=(sampler is None),
+            ...                     sampler=sampler)
+            >>> for epoch in rDange(start_epoch, n_epochs):
+            ...     if is_distributed:
+            ...         sampler.set_epoch(epoch)
+            ...     train(loader)
+        """
+
+    def __init__(self, dataset: Dataset, batch_size: int,
+                 num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None,
+                 seed: int = 0,
+                 shuffle: bool = False,
+                 gpus: int = 2) -> None:
+
+        self.batch_size = batch_size
+
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError(
+                    "Requires distributed package to be available")
+            #num_replicas = dist.get_world_size()
+            num_replicas = gpus
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError(
+                    "Requires distributed package to be available")
+            #rank = dist.get_rank()
+            rank = _get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(rank, num_replicas - 1))
+
+        # normal code
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+
+        # self.num_samples
+        #self.total_size = self.num_samples * self.num_replicas
+        self.seed = seed
+
+        # new code
+        self.data_source = dataset
         np_txt_lens = np.concatenate(
             [ds.np_textlens for ds in self.data_source.datasets]).flatten()
         np_rst_lens = np.concatenate(
@@ -2620,46 +2463,76 @@ class SizedOrdered_Sampler(Sampler[int]):
         np_key_phrase_lens = np.concatenate(
             [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
 
-        # Indices are sorted in order of 1.tokenized txt length, key_phrase_length then rst length
+        # Indices are sorted in order of the text lens of records in the datasets
         np_ordered_lens = np.lexsort(
             (np_rst_lens, np_key_phrase_lens, np_txt_lens))
-        # We Randomly re-arrange them in batches of batch size
-    
 
+        # We Randomly re-arrange them in batches of batch size
         li_chunked_lens = [np_ordered_lens[idx:idx+batch_size]
-                            for idx in range(0, np_ordered_lens.size - batch_size, batch_size)]
+                           for idx in range(0, np_ordered_lens.size-batch_size, batch_size)]
+
+        # Divide into n sublists,
+        # Each sublist at index i, contains the indices for process at rank i
+        # Each sublist at index i, is a list non flatten indices. Each index represents items in the dataset
+
+        li_li_chunked_lens = [
+            [li_chunked_lens[(self.num_replicas*idx)+_rank]
+             for idx in range(len(li_chunked_lens)//self.num_replicas)]
+                for _rank in range(self.num_replicas)]
+
+        # shuffle each processes subllist in the same order to optimize paralel training
+        _ = list(zip(*li_li_chunked_lens))
 
         if shuffle:
-            random.shuffle(li_chunked_lens)
+            random.shuffle(_)
+        
+        # unpacking into worker size length list 
+        li_li_chunked_lens = list(zip(*_))
 
-        # Getting max sizes for rst in each chunk
-        self.li_chunk_rst_len = [
-            np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens]
+        # Getting max sizes for rst and key_phrase in each chunk
+        self.li_li_chunk_rst_len = [ [np.take(np_rst_lens, idxs).max() for idxs in li_chunked_lens ] 
+                                            for li_chunked_lens in li_li_chunked_lens ]
+        
+        self.li_li_chunked_ordered_lens = [ np.concatenate(li_chunked_lens).tolist() 
+                                            for li_chunked_lens in li_li_chunked_lens ]
+        
+        for (li_chunked_lens, li_chunk_rst_len) in zip( li_li_chunked_lens, self.li_li_chunk_rst_len ) :
+            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
+            
+            for chunk_idx, data_idxs in enumerate(li_chunked_lens):
+                rst_len = li_chunk_rst_len[chunk_idx]
 
-        self.li_chunked_ordered_lens = np.concatenate(li_chunked_lens).tolist()
+                for data_idx in data_idxs:
+                    dataset_idx = bisect.bisect_right(
+                        self.data_source.cumulative_sizes, data_idx)
 
+                    if dataset_idx == 0:
+                        sample_idx = data_idx
+                    else:
+                        sample_idx = data_idx - \
+                            self.data_source.cumulative_sizes[dataset_idx - 1]
 
-        # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-        for chunk_idx, data_idxs in enumerate(li_chunked_lens):
-            rst_len = self.li_chunk_rst_len[chunk_idx]
+                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
+                
+    def __iter__(self) -> Iterator[T_co]:
 
-            for data_idx in data_idxs:
-                dataset_idx = bisect.bisect_right(
-                    self.data_source.cumulative_sizes, data_idx)
-
-                if dataset_idx == 0:
-                    sample_idx = data_idx
-                else:
-                    sample_idx = data_idx - \
-                        self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                self.data_source.datasets[dataset_idx].rst_len[sample_idx] = rst_len
-
-    def __iter__(self):
-        return iter(self.li_chunked_ordered_lens)
+        return iter(self.li_li_chunked_ordered_lens[self.rank])
 
     def __len__(self) -> int:
-        return len(self.data_source)
+        if self.batch_size != -1:
+            return len(self.data_source)
+        else:
+            return len( self.li_li_chunked_ordered_lens[0] )
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
 
 def main(tparams={}, mparams={}):
 
@@ -2670,8 +2543,10 @@ def main(tparams={}, mparams={}):
         version=tparams['version'])
 
     tparams['version'] = tb_logger.version
+
     tparams['dir_checkpoints'] = os.path.join(
         tparams['model_dir'], mparams['model_name'], f"version_{tparams['version']}", 'checkpoints')
+
     os.makedirs(tparams['dir_checkpoints'], exist_ok=True)
 
     # initiating training loop
@@ -2703,5 +2578,5 @@ if __name__ == '__main__':
     except Exception:
         print(traceback.format_exc())
 
-# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_kp 40 --tag "RSTBart with non attention"
-# CUDA_VISIBLE_DEVICES=2 python3 train_RSTBart.py --batch_size 32 --version 6  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_kp 40 --tag "RSTBart with normal attention"
+# CUDA_VISIBLE_DEVICES=1 python3 train_RSTBart.py --batch_size 32 --version 1  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 0 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with non attention"
+# CUDA_VISIBLE_DEVICES=2 python3 train_RSTBart.py --batch_size 32 --version 6  --precision 16 --mode train_new --workers 6 --rst_tree_aligned_attention 1 --scale_grad_by_freq 1 --max_epochs 12 --gpus 1 --max_len_utt 190 --max_len_rst 28 --max_len_key_phrase 40 --tag "RSTBart with normal attention"

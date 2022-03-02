@@ -64,7 +64,7 @@ for path_ in modules_paths:
 
 from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 
-from data_setup import _tree_to_rst_code, _parse_trees
+from utils_data_setup import _tree_to_rst_code, _parse_trees
 
 # Only take dsets with 5 or more RST chunks since we want to learn transitions between chunks of 3 EDUs
 
@@ -309,6 +309,7 @@ def edu_segmenter(li_dict_rsttext, use_kp_ds=True):
         for idx in range(len(li_dict_rsttext)):
             txt_to_find = li_dict_rsttext[idx]['txt_preproc']
             idxs_in_kpdf = df_kp.index[ df_kp['txt_preproc'] == txt_to_find  ]
+            
             
             if len(idxs_in_kpdf) == 1:
                 idx_record = idxs_in_kpdf[0]

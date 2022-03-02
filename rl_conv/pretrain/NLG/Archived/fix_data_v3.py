@@ -6,6 +6,8 @@ import ujson
 import multiprocessing as mp
 import traceback
 
+#Remove insufficiently small datums. either too few keyphrases are too few words / RST length
+
 def main():
     dir_data = "./dataset_v3/"
     li_fps = glob.glob(os.path.join( dir_data, "*","*") ) 

@@ -13,8 +13,10 @@ import regex as re
 import torch
 from pytorch_lightning.callbacks import Callback
 
-from torch import nn
-from typing import DefaultDict, Optional, Callable, Union, Optional, List, Iterable, Tuple
+from torch import negative, nn
+
+from typing import (Any, Dict, Iterator, List, Optional, OrderedDict, TypeVar)
+
 import numpy as np
 import copy
 
@@ -28,11 +30,16 @@ import collections
 from itertools import groupby
 
 import torch.nn.functional as F
+from pytorch_lightning.utilities.distributed import _get_rank
+import torch.distributed as dist
+
 from torch.utils.data._utils.collate import default_collate_err_msg_format
 from math import floor
 import regex as re
+from scipy.linalg import toeplitz
+import bisect
+T_co = TypeVar('T_co', covariant=True)
 
-pattern_punctuation_space = re.compile(r'\s([?.!";:#_](?:\s|$))')
 pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start of string
                 "(?<!\.\w)([\.?!] )\w|"+     # after a ?/!/. and a space, 
                                             # but not after an acronym
@@ -41,7 +48,7 @@ pattern_capitalize_after_punct = re.compile(r"(\A\w)|"+                  # start
                 )
 pattern_apostrophe = re.compile(r"\b\s+'\b")
 pattern_brackets_rm_space = re.compile('\(\s*(.*?)\s*\)')
-
+pattern_punctuation_space = re.compile(r'\s([?.!";:#_](?:\s|$))')
 import pytextrank
 import en_core_web_sm
 sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
@@ -50,7 +57,8 @@ nlp = en_core_web_sm.load()
 
 from spacy.language import Language
 from transformers.generation_logits_process import LogitsProcessor, _get_generated_ngrams
-
+from torch.utils.data import Sampler, Dataset
+from typing import (Any, Dict, Iterator, List, Optional, OrderedDict, TypeVar)
 try:
     nlp.add_pipe("textrank", last=True)
     
@@ -102,46 +110,6 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     return True    
 #endregion 
 
-#region Monkey Patches the save module
-def monkey_save_model(self, trainer, filepath: str):
-    #TODO: suggest this change on github pytorch lightning 
-    # in debugging, track when we save checkpoints
-    trainer.dev_debugger.track_checkpointing_history(filepath)
-
-    # make paths
-    if trainer.is_global_zero:
-        self._fs.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-    # delegate the saving to the trainer
-    # if self.save_function is not None:
-        # self.save_function(filepath, self.save_weights_only)
-        trainer.save_checkpoint(filepath)
-    
-        self.to_yaml()
-
-
-class SaveModelCallBack(Callback):
-
-    def on_train_end(self, trainer, pl_module):
-
-        # Saving Model using the pytorch method.
-        # This allows relaoding using from_pretrained
-        os.makedirs(
-            f"./models_pt/{pl_module.model_name}/version_{trainer.logger.version}/", exist_ok=True)
-
-        pl_module.model.save_pretrained(
-            f"./models_pt/{pl_module.model_name}/version_{trainer.logger.version}/")
-#endregion
-
-def mpatch_save_model(func):
-
-    def inner(self, *args):
-
-        func(*args)
-
-        self.to_yaml()
-
-    return inner
 
 #region RST helper
 
@@ -846,8 +814,6 @@ class RstTokenizerMixin():
             rst_rel_encoded = [  self.rst_rel_labeler.transform(rst_combwr) for rst_combwr in li_rst_combwr] #list of list of each relation
 
         return rst_rel_encoded, rst_names
-
-
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
     
     def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
@@ -1082,51 +1048,311 @@ class EffeciencyMixin():
             return [self.default_collate_pad(samples ) for samples in transposed]
         raise TypeError(default_collate_err_msg_format.format(elem_type))
 
+class SizedOrderedBatchSampler(Sampler[List[int]]):
+    r"""Wraps another sampler to yield a mini-batch of indices.
+
+    Args:
+        sampler (Sampler or Iterable): Base sampler. Can be any iterable object
+        batch_size (int): Size of mini-batch.
+        drop_last (bool): If ``True``, the sampler will drop the last batch if
+            its size would be less than ``batch_size``
+
+    Example:
+        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=False))
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=True))
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    """
+
+    def __init__(self, data_source, batch_size: int, drop_last: bool, shuffle: bool) -> None:
+        # Since collections.abc.Iterable does not check for `__getitem__`, which
+        # is one way for an object to be an iterable, we don't do an `isinstance`
+        # check here.
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or \
+                batch_size <= 0:
+            raise ValueError("batch_size should be a positive integer value, "
+                             "but got batch_size={}".format(batch_size))
+        if not isinstance(drop_last, bool):
+            raise ValueError("drop_last should be a boolean value, but got "
+                             "drop_last={}".format(drop_last))
+
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        self.prepare_ds()
+                
+    
+    def __iter__(self) -> Iterator[List[int]]:
+        return iter( self.li_chunked_idxs )
+
+
+    def __len__(self) -> int:
+        return len(self.li_chunked_idxs)
+    
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+        if self.shuffle:
+            self.prepare_ds()        
+
+    def prepare_ds(self):
+        # Sorting and (maybe) shuffling
+        np_txt_lens = np.concatenate(
+            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
+        np_rst_lens = np.concatenate(
+            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
+        np_key_phrase_lens = np.concatenate(
+            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
+
+        tuple_factors = (np_rst_lens, np_key_phrase_lens, np_txt_lens)
+        if self.shuffle:
+            random_idxs = np.random.random( np_txt_lens.size )
+            tuple_factors = (random_idxs, )+ tuple_factors
+        np_ordered_idxs = np.lexsort(tuple_factors)
+
+
+        # Handing drop last
+        if self.drop_last:
+            rem_records = np_txt_lens.size % self.batch_size
+            li_ordered_idxs = np_ordered_idxs.tolist()
+            for idx in range(rem_records):
+                li_ordered_idxs.pop( random.randint(0,len(li_ordered_idxs)-1) )
+            np_ordered_idxs = np.array(li_ordered_idxs)
+
+        # We Randomly re-arrange them in batches of batch size
+        self.li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
+                            for idx in range(0, np_ordered_idxs.size - self.batch_size, self.batch_size)]
+
+        if self.shuffle:
+            random.shuffle(self.li_chunked_idxs)
+
+        # Getting max sizes for rst in each chunk
+        self.li_chunk_rst_len = [
+            np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_idxs]
+
+        self.li_chunk_key_phrase_len = [
+            np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_idxs]
+        
+
+        # Updating Chunk sizes
+        for chunk_idx, data_idxs in enumerate(self.li_chunked_idxs):
+
+            for data_idx in data_idxs:
+                dataset_idx = bisect.bisect_right(
+                    self.data_source.cumulative_sizes, data_idx)
+
+                if dataset_idx == 0:
+                    sample_idx = data_idx
+                else:
+                    sample_idx = data_idx - \
+                        self.data_source.cumulative_sizes[dataset_idx - 1]
+
+                self.data_source.datasets[dataset_idx].rst_len[sample_idx] = self.li_chunk_rst_len[chunk_idx]
+                self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = self.li_chunk_key_phrase_len[chunk_idx]
+
+class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
+    r"""
+        Adapted so that each process takes sequential indices as opposed to strides across indices
+    """
+    r"""Sampler that restricts data loading to a subset of the dataset.
+        It is especially useful in conjunction with
+        :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
+        process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
+        :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
+        original dataset that is exclusive to it.
+        .. note::
+            Dataset is assumed to be of constant size.
+        Args:
+            dataset: Dataset used for sampling.
+            num_replicas (int, optional): Number of processes participating in
+                distributed training. By default, :attr:`world_size` is retrieved from the
+                current distributed group.
+            rank (int, optional): Rank of the current process within :attr:`num_replicas`.
+                By default, :attr:`rank` is retrieved from the current distributed
+                group.
+            shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
+                indices.
+            seed (int, optional): random seed used to shuffle the sampler if
+                :attr:`shuffle=True`. This number should be identical across all
+                processes in the distributed group. Default: ``0``.
+            drop_last (bool, optional): if ``True``, then the sampler will drop the
+                tail of the data to make it evenly divisible across the number of
+                replicas. If ``False``, the sampler will add extra indices to make
+                the data evenly divisible across the replicas. Default: ``False``.
+        .. warning::
+            In distributed mode, calling the :meth:`set_epoch` method at
+            the beginning of each epoch **before** creating the :class:`DataLoader` iterator
+            is necessary to make shuffling work properly across multiple epochs. Otherwise,
+            the same ordering will be always used.
+        Example::
+            >>> sampler = DistributedSampler(dataset) if is_distributed else None
+            >>> loader = DataLoader(dataset, shuffle=(sampler is None),
+            ...                     sampler=sampler)
+            >>> for epoch in rDange(start_epoch, n_epochs):
+            ...     if is_distributed:
+            ...         sampler.set_epoch(epoch)
+            ...     train(loader)
+        """
+
+    def __init__(self,
+                data_source: Dataset, batch_size: int,
+                 drop_last:bool,
+                 num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None,
+                 seed: int = 0,
+                 shuffle: bool = False,
+                 gpus: int = 2,
+                 num_nodes:int = 1,
+                 ) -> None:
+
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError(
+                    "Requires distributed package to be available")
+            try:
+                num_replicas = dist.get_world_size()
+            except Exception as e :
+                num_replicas = num_nodes*gpus
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError(
+                    "Requires distributed package to be available")
+            #rank = dist.get_rank()
+            rank = _get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(rank, num_replicas - 1))
+
+        # normal code
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.data_source = data_source
+        self.shuffle = shuffle
+
+        self.seed = seed
+        self.epoch = 0
+
+        self.prepare_ds()
+       
+    def __iter__(self) -> Iterator[T_co]:
+        
+        # for idx in range( len(self) ):
+        #     batch = self.li_li_chunked_idxs[self.rank][idx]
+        #     yield batch
+
+        return iter( self.li_li_chunked_idxs[self.rank] )
+    
+    def __len__(self) -> int:
+        
+        return len(self.li_li_chunked_idxs[self.rank] )
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+        if self.shuffle:
+            self.prepare_ds()
+
+
+    def prepare_ds(self):
+        # new code
+        np_txt_lens = np.concatenate(
+            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
+        np_rst_lens = np.concatenate(
+            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
+        np_key_phrase_lens = np.concatenate(
+            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
+
+        g = torch.Generator()
+        g.manual_seed(self.seed+self.epoch)
+
+        # Sorting and (maybe) shuffling
+        tuple_factors = (np_rst_lens, np_key_phrase_lens, np_txt_lens)
+
+        if self.shuffle:
+            random_idxs= list(range(np_txt_lens.size))
+            random.Random(self.seed+self.epoch).shuffle(random_idxs) 
+            tuple_factors = (random_idxs, )+ tuple_factors
+        np_ordered_idxs = np.lexsort(tuple_factors)
+
+       # Handing drop_last
+        if self.drop_last:
+            rem_records = np_txt_lens.size % (self.batch_size*self.num_replicas)
+            li_ordered_idxs = np_ordered_idxs.tolist()
+            for idx in range(rem_records):
+                li_ordered_idxs.pop( random.Random(self.seed+self.epoch).randint(0,len(li_ordered_idxs)-1) )
+            np_ordered_idxs = np.array(li_ordered_idxs)
+
+
+        # We Randomly re-arrange them in batches of batch size
+        li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
+                           for idx in range(0, np_ordered_idxs.size-self.batch_size, self.batch_size)]
+
+        # Divide into n sublists,
+        # Each sublist at index i, contains the indices for process at rank i
+        # Each sublist at index i, represents similar sized items in the dataset
+        li_li_chunked_idxs = [
+            [li_chunked_idxs[(self.num_replicas*idx)+_rank]
+             for idx in range( len(li_chunked_idxs)//self.num_replicas ) ]
+            for _rank in range(self.num_replicas)]
+
+        # shuffle each processes subllist in the same order to optimize paralel training
+        if self.shuffle:
+            _ = list(zip(*li_li_chunked_idxs))
+            random.Random(self.seed+self.epoch).shuffle(_)
+            # unpacking into worker size length list
+            li_li_chunked_idxs = list(zip(*_))
+
+        self.li_li_chunked_idxs = li_li_chunked_idxs
+
+        # Getting max sizes for rst and key_phrase in each chunk
+        li_li_chunk_rst_len = [[np.take(np_rst_lens, idxs).max() for idxs in li_chunked_idxs]
+                                    for li_chunked_idxs in li_li_chunked_idxs]
+        li_li_chunk_key_phrase_len = [[
+            np.take(np_key_phrase_lens, idxs).max()
+            for idxs in li_chunked_idxs] for li_chunked_idxs in li_li_chunked_idxs]
+        
+                    
+        #Updating the max_len_rst and max_len_keyphrase 
+        for (li_chunked_idxs, li_chunk_rst_len, li_chunk_key_phrase_len) in zip(li_li_chunked_idxs, li_li_chunk_rst_len, li_li_chunk_key_phrase_len):
+            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
+
+            for chunk_idx, data_idxs in enumerate(li_chunked_idxs):
+
+                for data_idx in data_idxs:
+                    dataset_idx = bisect.bisect_right(
+                        self.data_source.cumulative_sizes, data_idx)
+
+                    if dataset_idx == 0:
+                        sample_idx = data_idx
+                    else:
+                        sample_idx = data_idx - \
+                            self.data_source.cumulative_sizes[dataset_idx - 1]
+
+                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = li_chunk_rst_len[chunk_idx]
+                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = li_chunk_key_phrase_len[chunk_idx]
+
 #endregion
 
 #region data making
-def edu_fixer(li_textwedutoken, li_text):
-        
-    li_li_edus = [ list( split(text_wedutoken,"EDU_BREAK") )[:-1] for text_wedutoken in li_textwedutoken ]
-    
-    for li_edutext in li_li_edus:
-        for idx2,elem in enumerate(li_edutext):
-            elem.reverse() #reversing list of words in an edu
-            it = enumerate(elem)
-            edu_len = len(elem) 
-            elem_new =  [next(it)[1]+str_ if ( idx!=edu_len-1 and (str_[0] == "'" or str_ in ["n't", ".", "?", "!", ",", "[", "]" ]) ) else str_ for idx,str_ in it]
-            elem_new.reverse()
-
-            li_edutext[idx2] = elem_new
-
-    # for each utterance, merge list of words into one text
-    li_li_edus = [ [ ' '.join( edus ) for edus in li_edus ] for li_edus in li_li_edus ]
-    
-    # Fixing:
-        # random spaces in words due to splitting at apostrophes such as isn 't
-        # random spaces due to splitting at forward slash
-        # random spaces due to converting brakcests to - LRB - and - RRB - codes
-    li_li_edus = [ [edutxt.replace(" n't", "n't").replace(" / ", "/").replace(" '", "'").replace("- LRB -", "(").replace("- RRB -", ")").replace("-LRB-", "(").replace("-RRB-", ")")
-                     if edutxt not in origtext else edutxt for edutxt in li_edutext ] for li_edutext, origtext in zip( li_li_edus, li_text) ]
-    
-    #outer re.sub does that space inbetween brakcets/
-    li_li_edus = [ [ re.sub('\[\s*(.*?)\s*\]', r'[\1]', re.sub( pattern_punctuation_space, r"'", edutxt)) for edutxt in li_edutext] for li_edutext in  li_li_edus ]
-    for idx in range(len(li_li_edus)):
-        li_edus = li_li_edus[idx]
-        li_edus =  [ re.sub(pattern_brackets_rm_space, r'(\1)', edu_text) for edu_text in li_edus ]
-        li_edus =  [ re.sub(pattern_punctuation_space, r'\1', edu_text) for edu_text in li_edus ]
-
-    return li_li_edus
-
-def split(sequence, sep):
-    chunk = []
-    for val in sequence:
-        if val == sep:
-            yield chunk
-            chunk = []
-        else:
-            chunk.append(val)
-    yield chunk
 
 def non_parseable_remover(li_dict_rsttext):
     # print("Start non parseable remover")
@@ -1160,30 +1386,7 @@ def non_parseable_remover(li_dict_rsttext):
     # print("End non parseable remover")
     return li_dict_rsttext
 
-def position_edus(li_dict_rsttext):
-    #Creates dict_pos_edu
-    if len(li_dict_rsttext) == 0:
-        return li_dict_rsttext
-         
-    for idx in range(len(li_dict_rsttext)):
-        
-        if 'dict_pos_edu' in li_dict_rsttext[idx]:
-            continue            
 
-        li_rst_pos = [ rst_node['pos'] for rst_node in li_dict_rsttext[idx]['rst'] ]
-        
-        li_child_pos =  sum( [ find_child_edus(pos, li_rst_pos ) for pos in li_rst_pos ], [] )
-
-        # sorting the child_pos by their rst order
-        li_child_pos = sorted( li_child_pos, key= lambda pos: RstTokenizerMixin.edukp_pos_sort_function(pos) )
-
-        li_edus = li_dict_rsttext[idx].pop('li_edus')
-
-        dict_pos_edu = { edu_pos:edu for edu_pos, edu in zip( li_child_pos, li_edus ) }
-        
-        li_dict_rsttext[idx]['dict_pos_edu'] = dict_pos_edu
-    
-    return li_dict_rsttext
 
 def _parse_trees(li_strtree):
     
@@ -1309,15 +1512,6 @@ def __parse_leaves(tree_leaves ):
 
    return _str3
 
-def find_child_edus(pos_parentnode, li_rst_pos):
-        #returns the pos of any child elements of a parent node(rst) that are edus
-               
-        li_child_pos = [2*pos_parentnode+1, 2*pos_parentnode+2 ]
-
-        li_child_edu_pos = [ pos for pos in li_child_pos if pos not in li_rst_pos]
-
-        return li_child_edu_pos 
-
 #endregion
 
 #region generation
@@ -1394,5 +1588,122 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
             scores[i, banned_tokens] = -float("inf")
 
         return scores
+
+#endregion
+
+# region Degenerate Losses Mixin
+class DegenerateLossMixin():
+
+
+    def _compute_token_level_unlikelihood_loss(self, tgt_log_probs, target_tokens, kp_cands, tkn_pad_idx=-100, step_i=0):
+        #https://github.com/BorealisAI/keyphrase-generation/blob/c65c45938f6056b590e89fbc3186ebe8eb1c136a/keyphrase_generation/models/copy_seq2seq_attn.py#L462
+        
+        """
+        Calculate the token level unlikelihood loss
+        - At each time step, we look at all the words in the the ground truth from the previous time steps
+        - which forms the negative list at that time step
+        - loss is calculated by penalizing the probability of predicting these words present the negative candidate list
+        """
+        #HERE
+        #TODO: 
+            # Code can be kept the same for Context
+            # But for keywords, we can't simply look at the last n tokens since key phrases have <kp> tokens in between
+            # M1: pass kp_cands to this method.
+            # Furthermore, must remember to mask over the RST section. 
+                # One quick way to do this is based on the target_tokens
+                # the RST section responds to any section that has -100 as the index
+
+        #TODO: Might be best to have key phrase tokens simply passed in, ignoring the <kp>
+
+        # tgt_log_probs is [batch_size , max_tgt_len , tgt_vocab_size]
+        # Collapse it to a 2d tensor:
+        # to get tensor of dim [(batch_size * max_tgt_len) x tgt_vocab_size]
+        batch_size, max_tgt_len, tgt_vocab_size = tgt_log_probs.size()
+        tgt_log_probs = tgt_log_probs.view(-1, tgt_log_probs.size(-1))
+        
+        with torch.no_grad():
+            # The first timestep is just the @START@ token, which is not included in the likelihoods
+            # i.e., we do not ask the model to predict the @START@ token
+            # target = target_tokens[:, (step_i+1):] #TODO: check this sequence hasn't already been shifted
+            target= target_tokens
+
+            # Get the context candidates
+            ctx_cands = target.unsqueeze(1).expand(
+                target.size(0), target.size(1), target.size(1))
+
+            # removing all negative indexes from target
+            ctx_cands = ctx_cands.masked_fill( ctx_cands<0, tkn_pad_idx )
+
+            # get the lower triangular matrix
+            # ctx_cands = (ctx_cands.tril(-1) + tkn_pad_idx)
+            ctx_cands = ctx_cands.tril(-1) + torch.full_like(ctx_cands,tkn_pad_idx).triu()
+
+            # what is the point of these 2 lines (?)
+            # -- taken from https://github.com/facebookresearch/unlikelihood_training/blob/master/custom/candidate_penalty_ce_loss.py
+            # NOTE: this line below assumes padding index si 1
+            # ctx_cands_ = ctx_cands_ * ctx_cands_.triu()
+            # ctx_cands = ctx_cands.tril(-1) + ctx_cands_
+
+            # Don't include the target for that timestep as a negative target
+            # i.e., remove it if it was a part of the candidate list
+            ctx_cands = ctx_cands.masked_fill(
+                ctx_cands == target.unsqueeze(2), tkn_pad_idx)
+
+            if self.config.prev_context_len > 0:
+                
+                # to consider only a pre-specified previous context size
+                # len(mask_generator) == max_tgt_len
+                mask_generator = [0] + [1]*self.config.prev_context_len + \
+                    [0]*(max_tgt_len-self.config.prev_context_len-1)
+                # https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.linalg.toeplitz.html
+                mask = toeplitz(mask_generator, np.zeros_like(mask_generator))
+                # with the above mask, only the prev n words in the context are considered
+                mask = torch.tensor(mask, dtype=ctx_cands.dtype,
+                                    requires_grad=False, device=ctx_cands.device)
+                # create the same mask for the entire batch
+                mask = mask.unsqueeze(0).expand(
+                    batch_size, max_tgt_len, max_tgt_len)
+
+                # incorporate the previous-N-context-only mask
+                ctx_cands = mask * ctx_cands
+
+            # reshape to [(batch_size * max_tgt_len), max_tgt_len]
+            ctx_cands = ctx_cands.view(-1, ctx_cands.size(-1))
+
+            # get a zero matrix of the same size size as tgt_log_probs ---> [(batch_size * max_tgt_len), tgt_vocab_size]
+            # for each row, fill 1s in the positions that correspond to the candidate token ids
+            # negative_targets ---> is a k-hot vector with the token idx of the candidates as 1
+            negative_targets = torch.zeros_like(
+                tgt_log_probs).scatter_(1, ctx_cands, 1)
+            
+            # adjusting for tokens in the keyphrase set of tokens
+            #Don't include to kp_cands if it is acc the target at this timestep
+            kp_cands = kp_cands.unsqueeze(1).expand( 
+                kp_cands.size(0), target.size(1), kp_cands.size(1))
+            
+            kp_cands = kp_cands.masked_fill(
+                kp_cands == target.unsqueeze(2), tkn_pad_idx)
+
+            kp_cands = kp_cands.view(-1, kp_cands.size(-1))
+
+            negative_targets.scatter_(1, kp_cands, 1)
+
+            #ensuring pad token is not included in negative targets
+            negative_targets[:, tkn_pad_idx]= 0
+
+        # - compute loss
+        # tgt_log_probs refer to log of probabilities, exp() of it gives the actual prob. values
+        # [(batch_size * max_tgt_len) x tgt_vocab_size]
+        one_minus_probs = torch.clamp((1.0 - tgt_log_probs.exp()), min=1e-6)
+
+        # only keep the probabilities at the negative token indices
+        # [(batch_size * max_tgt_len) x tgt_vocab_size]
+        loss = -torch.log(one_minus_probs)*negative_targets
+
+        loss = loss.sum(-1)/negative_targets.sum(-1)
+        loss = loss.reshape(batch_size, max_tgt_len)
+        loss = loss.sum(-1).mean() # average across the batch
+
+        return loss
 
 #endregion

@@ -13,14 +13,12 @@ os.environ['TOKENIZERS_PARALLELISM'] = "true"
 
 from transformers.utils import logging
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
-from utils_nlg_v3 import EmbeddingRstPos, KeyPhraseNoRepeatLogitsProcessor, mpatch_save_model, SaveModelCallBack, RstModelMixin
+from utils_nlg_v3 import EmbeddingRstPos, RstModelMixin, DegenerateLossMixin
 import utils_nlg_v3 as utils
 import operator
 import functools
 import string
-import math
 import argparse
-import bisect
 import copy
 import glob
 import inspect
@@ -30,29 +28,24 @@ import random
 import traceback
 import types
 import contextlib
-from functools import lru_cache
+import time
 from itertools import islice
 from pathlib import Path
 from typing import (Any, Dict, Iterator, List, Optional, OrderedDict, TypeVar)
 import einops
 import numpy as np
 import pandas as pd
-import time
 import ujson
 import yaml
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.plugins import DDPPlugin, DeepSpeedPlugin
-from pytorch_lightning.utilities.distributed import _get_rank
+from pytorch_lightning.plugins import DDPPlugin
+
 from sklearn.preprocessing import LabelEncoder
 from torch.nn import CrossEntropyLoss
-from torch.utils.data._utils.collate import default_convert
-# from torch.utils.data.dataset import Dataset
-# from torch.utils.data.sampler import Sampler
-from torch.utils.data import Dataset
-from torch.utils.data import Sampler 
-from transformers import GPT2Config, GPT2Tokenizer, GPT2TokenizerFast
+
+from transformers import GPT2Config, GPT2TokenizerFast
 from transformers.modeling_outputs import (ModelOutput,
                                            BaseModelOutputWithPastAndCrossAttentions,
                                            CausalLMOutputWithCrossAttentions
@@ -62,12 +55,11 @@ from transformers.optimization import Adafactor, AdafactorSchedule, AdamW, get_c
 from transformers.tokenization_utils_base import AddedToken
 import sys
 from torch.utils.data import Sampler
-import torch.distributed as dist
+from pytorch_lightning.utilities.distributed import _get_rank
+
 import torch
 import pytorch_lightning as pl
-from transformers.generation_logits_process import EncoderNoRepeatNGramLogitsProcessor
-# from torch.optim.lr_scheduler import ChainedScheduler
-
+import torch_optimizer as toptim
 T_co = TypeVar('T_co', covariant=True)
 
 mp1 = os.path.abspath(os.path.join('..'))
@@ -82,10 +74,12 @@ for path_ in modules_paths:
 from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
 logger = logging.get_logger(__name__)
+from nltk.tokenize.treebank import TreebankWordDetokenizer
 
 from torch import nn
 from transformers.modeling_utils import Conv1D
 
+from utils_nlg_v3 import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype):
     """
@@ -316,20 +310,25 @@ class RSTGPT2_Config(GPT2Config):
                  model_name="RSTGPT2",
                  scale_grad_by_freq=True,
                  max_len_rst=36,
-                 max_len_key_phrase=64,
+                 max_len_kp=64,
                  max_len_utt=270,
                  rst_tree_aligned_attention=False,
                  rst_segment_method='None',
                  max_rst_pos=4094,
                  
-                 embd_index_pdrop=0.3,
-                 embd_pdrop=0.15,
+                 embed_tkn_pdrop=0.15,
+                 embed_kp_pdrop=0.15,
+                 embed_rst_pdrop=0.15,
+
                  attn_pdrop=0.15,
                  resid_pdrop=0.15,
+                 
+                 ull_loss_tkn=False,
+                 prev_context_len=None,
+
                  **kwargs):
 
-        super().__init__( embd_pdrop=embd_pdrop,
-                            attn_pdrop=attn_pdrop,
+        super().__init__( attn_pdrop=attn_pdrop,
                             resid_pdrop=resid_pdrop,
                             **kwargs)
 
@@ -338,7 +337,7 @@ class RSTGPT2_Config(GPT2Config):
         self.scale_grad_by_freq = scale_grad_by_freq
         self.max_len_utt = max_len_utt
         self.max_len_rst = max_len_rst
-        self.max_len_key_phrase = max_len_key_phrase
+        self.max_len_kp = max_len_kp
         self.rst_tree_aligned_attention = rst_tree_aligned_attention
         self.rst_segment_method = rst_segment_method
         self.rst_rel_li = ['Attribution',
@@ -351,24 +350,66 @@ class RSTGPT2_Config(GPT2Config):
         self.rst_added_tokens = 2
         self.vocab_size = self.vocab_size + self.rst_added_tokens
 
-        self.embd_index_pdrop = embd_index_pdrop
-        self.embd_pdrop = embd_pdrop
+        self.embed_tkn_pdrop=embed_tkn_pdrop
+        self.embed_kp_pdrop=embed_kp_pdrop
+        self.embed_rst_pdrop=embed_rst_pdrop
         self.attn_pdrop = attn_pdrop
         self.resid_pdrop = resid_pdrop
 
-    def to_dict_log(self):
+        self.ull_loss_tkn = ull_loss_tkn
+        self.prev_context_len = prev_context_len
 
-        return {
-            'base_model': self.base_model_name,
-            'scale_grad_by_freq': self.scale_grad_by_freq,
-            'max_len_utt': self.max_len_utt,
-            'max_len_rst': self.max_len_rst,
-            'max_len_key_phrase': self.max_len_key_phrase,
-            'rst_tree_aligned_attention': self.rst_tree_aligned_attention
-        }
+        self.pad_token_id= self.eos_token_id
+
+        self.pad_values = {'rst_start_token': self.eos_token_id,
+                           'rst_rel': len(self.rst_rel_li),
+                           'rst_ns': len(self.rst_ns_li),
+                           'rst_pos': self.max_rst_pos-1,
+
+                           'key_phrase_ids': self.eos_token_id,
+                           'li_kprstpos': self.max_rst_pos-1,
+
+                            'position_ids_keyphrase':self.n_ctx-1,
+                            'position_ids_utt':self.n_ctx-1,
+
+                           'input_ids_utt': self.eos_token_id,
+                           'attention_mask': 0.0,
+
+                           'labels': -100, #self.model.loss_fct.ignore_index,
+
+                           'edu_rstpos': -1,
+
+                           'context_rst_rstpos':-1,
+                           'context_kp_rstpos':-1
+                           }
+
+        self.pad_maxlens = {
+            'rst_start_token': 1,
+            
+            'rst_rel': self.max_len_rst-1,
+            'rst_ns': self.max_len_rst-1,
+            'rst_pos': self.max_len_rst-1,
+
+            'key_phrase_ids': self.max_len_kp,
+            'li_kprstpos': self.max_len_kp,
+            'input_ids_utt': self.max_len_utt,
+            'labels': self.max_len_rst + self.max_len_kp + self.max_len_utt,
+
+            'attention_mask': self.max_len_rst + self.max_len_kp + self.max_len_utt,
 
 
-class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
+            'position_ids_keyphrase':self.max_len_kp,
+            'position_ids_utt':self.max_len_utt ,
+
+            'edu_rstpos': self.max_rst_pos // 2, #40,
+            'context_rst_rstpos':self.max_len_rst,
+            'context_kp_rstpos':self.max_len_kp
+            }
+
+
+
+
+class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
 
     def __init__(self,
                  config: RSTGPT2_Config):
@@ -379,7 +420,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
         self.model_name = config.model_name
         self.scale_grad_by_freq = config.scale_grad_by_freq
         self.max_len_rst = config.max_len_rst
-        self.max_len_key_phrase = config.max_len_key_phrase
+        self.max_len_kp = config.max_len_kp
         self.max_len_utt = config.max_len_utt
         self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
         self.rst_segment_method = config.rst_segment_method
@@ -415,7 +456,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
             'bad_words_ids': [[50257], [50258]],
             'early_stopping': True,
             'no_repeat_ngram_size': 3,
-            'min_length': 5, 'max_length': 260}
+            'min_length': 5, 'max_length': 260, 'pad_token_id':self.config.eos_token_id }
         
         self.correct_attn_bias()
 
@@ -510,7 +551,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = self.lm_head(hidden_states) 
 
         loss = None
         if labels is not None:
@@ -521,7 +562,32 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
             loss = self.loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
+
+        loss = None
+        lm_loss = None
+        ul_loss_token = None
+        if labels is not None:       
+
+            # Shift so that tokens < n predict n
+            shift_lm_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            lm_loss = self.loss_fct(
+                shift_logits.view(-1, shift_lm_logits.size(-1)), shift_labels.view(-1))
+
+            if self.config.ull_loss_tkn:
+                
+                #Replacing the kp start tokens with pad tokens
+                kp_cands = key_phrase_ids.masked_fill( key_phrase_ids==self.tokenizer.keyphrase_start_token_id.to(key_phrase_ids.device),
+                                                         self.config.pad_values['key_phrase_ids'] )
+                ul_loss_token = self._compute_token_level_unlikelihood_loss(    
+                                    shift_lm_logits, shift_labels, kp_cands, tkn_pad_idx=self.config.pad_values['input_ids_utt'] )
+                loss = lm_loss + ul_loss_token
+            else:
+                loss = lm_loss
+
         if not return_dict:
+            raise NotImplementedError("return dict")
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
@@ -532,6 +598,9 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions)
+        
+        output['ll_loss']=lm_loss
+        output['ul_loss_token']=ul_loss_token
 
         output['curr_edu_pos'] = curr_edu_pos
         # output['context_rstpos'] = 
@@ -557,10 +626,10 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
      ):
         # RST context embedding
         rst_start_token_embed = self.transformer.wte(rst_start_token_id)
-        rst_rel_embed = self.embed_rst_rels(rst_rel)
-        rst_ns_embed = self.embed_rst_ns(rst_ns)
-        # rst_rel_embed   = self.discrete_embedding_dropout( rst_rel, self.embed_rst_rels, self.config.embd_index_pdrop)
-        # rst_ns_embed    = self.discrete_embedding_dropout( rst_ns, self.embed_rst_ns, self.config.embd_index_pdrop )
+        # rst_rel_embed = self.embed_rst_rels(rst_rel)
+        # rst_ns_embed = self.embed_rst_ns(rst_ns)
+        rst_rel_embed   = self.discrete_embedding_dropout( rst_rel, self.embed_rst_rels, self.config.embed_rst_pdrop)
+        rst_ns_embed    = self.discrete_embedding_dropout( rst_ns, self.embed_rst_ns, self.config.embed_rst_pdrop )
 
         rst_pos_embed = self.embed_rst_pos(rst_pos)
 
@@ -568,14 +637,13 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
 
         # Key Phrase context embedding
         # keyphrase_phrase_embed = self.transformer.wte( key_phrase_ids)
-        keyphrase_phrase_embed = self.discrete_embedding_dropout(key_phrase_ids, self.transformer.wte, self.config.embd_index_pdrop)
-
+        keyphrase_phrase_embed = self.discrete_embedding_dropout(key_phrase_ids, self.transformer.wte, self.config.embed_kp_pdrop)
         keyphrase_rst_pos_embed = self.embed_rst_pos(li_kprstpos)
         keyphrase_embed = keyphrase_rst_pos_embed + keyphrase_phrase_embed
 
         # input_id embedding
         # utt_inputs_embeds = self.transformer.wte(input_ids_utt)
-        utt_inputs_embeds = self.discrete_embedding_dropout(input_ids_utt, self.transformer.wte, self.config.embd_index_pdrop)
+        utt_inputs_embeds = self.discrete_embedding_dropout(input_ids_utt, self.transformer.wte, self.config.embed_tkn_pdrop)
 
         inputs_embeds = torch.cat([
             rst_start_token_embed,
@@ -847,7 +915,7 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
                 f'./models/{model_name}/version_{model_version}/checkpoints')
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name', 'model_name', 'max_len_key_phrase',
+                'base_model_name', 'model_name', 'max_len_kp',
                 'max_len_rst', 'max_len_utt',
                 'scale_grad_by_freq', 'rst_tree_aligned_attention']}
 
@@ -891,19 +959,21 @@ class RSTGPT2( RstModelMixin, GPT2LMHeadModel):
         parser.add_argument('--model_name', default='RSTGPT2', required=False)
         parser.add_argument('--max_len_utt', type=int, default=270)
         parser.add_argument('--max_len_rst', type=int, default=36)
-        parser.add_argument('--max_len_key_phrase', type=int, default=64)
-        parser.add_argument('--scale_grad_by_freq', type=lambda x: bool(int(x)), default=True,
+        parser.add_argument('--max_len_kp', type=int, default=64)
+        parser.add_argument('--scale_grad_by_freq', action='store_true', default=True,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
-        parser.add_argument('--rst_tree_aligned_attention',
-                            type=lambda x: bool(int(x)), default=False)
-        parser.add_argument('--rst_segment_method', type=str,
-                            default='None', choices=['None', 'fenghirst', 'segbot'])
+        parser.add_argument('--rst_tree_aligned_attention',default=False, action='store_true')
+        parser.add_argument('--rst_segment_method', type=str,default='segbot', choices=['None', 'fenghirst', 'segbot'])
         #Regularization params
-        parser.add_argument('--embd_pdrop',type=float, default=0.1, help="Normal dropout of on output of embeddings")
         parser.add_argument('--attn_pdrop', type=float, default=0.1)
         parser.add_argument('--resid_pdrop', type=float, default=0.1)
 
-        parser.add_argument('--embd_index_pdrop',type=float, default=0.1, help="We drop specific indices from embedding")
+        parser.add_argument('--embed_tkn_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
+        parser.add_argument('--embed_kp_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
+        parser.add_argument('--embed_rst_pdrop',type=float, default=0.15, help="We drop specific indices from embedding")
+
+        parser.add_argument('--ull_loss_tkn', default=False, action='store_true')
+        parser.add_argument('--prev_context_len', type=int, default=0, help="lookback length for ull token loss")
 
         mparams = parser.parse_known_args()[0]
         return mparams
@@ -929,7 +999,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     # Setting up context lengths
     max_len_rst = 30
-    max_len_key_phrase = 64
+    max_len_kp = 64
     max_len_utt = 240
     max_rst_pos = 4094
 
@@ -943,17 +1013,19 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         super().__init__( *args, **kwargs)
         
         self.max_len_rst = kwargs.get('max_len_rst', self.max_len_rst)
-        self.max_len_key_phrase = kwargs.get('max_len_key_phrase',self.max_len_key_phrase)
+        self.max_len_kp = kwargs.get('max_len_kp',self.max_len_kp)
         self.max_len_utt = kwargs.get('max_len_utt', self.max_len_utt)
         self.max_rst_pos = kwargs.get('max_rst_pos', self.max_rst_pos )
         self.rst_tree_aligned_attention = kwargs.get('rst_tree_aligned_attention',self.rst_tree_aligned_attention)
         self.sample_kps = kwargs.get('sample_kps', self.sample_kps)
 
+        self.detok = TreebankWordDetokenizer()
+
 
     def encode_input(self, rst_rel, rst_ns, rst_pos, li_kp, li_kprstpos,
                      utterance=None, utterance_prompt=None, dict_pos_edu=None,
-                     max_len_rst=None, max_len_key_phrase=None,
-                     exclude_from_output=[], device=None):
+                     max_len_rst=None, max_len_kp=None,
+                     exclude_from_output=[], device=None ):
         """
             This version is a smaller output space than v1, by dropping rst_pos and rst_ns
             Return 
@@ -973,7 +1045,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             rst_rel, rst_ns, rst_pos, max_len_rst)
 
         key_phrase_ids, li_kprstpos, ta_tokens_pos, kp_phrase_lens, kp_pad_len = self.encode_keyphrase(
-            li_kp, li_kprstpos, max_len_key_phrase)
+            li_kp, li_kprstpos, max_len_kp)
 
         input_ids_utt, labels, utt_len = self.encode_utterance(utterance, utterance_prompt,
                                                                context_len= 1 + rst_rel.shape[-1] + 
@@ -1016,7 +1088,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         attention_mask = self.prepare_attention_mask_handle_padding(
             attention_mask,
             r_len, rst_pad_len, max_len_rst,
-            rt_len, kp_pad_len, max_len_key_phrase)
+            rt_len, kp_pad_len, max_len_kp)
         
         output = OrderedDict(
                 { 
@@ -1048,6 +1120,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             
             output['context_rst_rstpos'] = torch.cat([rst_pos[0:1], rst_pos] )
             output['context_kp_rstpos']  = li_kprstpos
+            dict_pos_edu =  self.detokenize_dict_pos_edu(dict_pos_edu)
             dec_rst_pos = [self.clamp_values(np.array(int(key)), utils.MAX_LONG_VALUE).item(
                 0) for key in dict_pos_edu.keys()]
 
@@ -1151,7 +1224,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         if len(key_phrases) != 0:
 
             # max_len = min(variable_padding_size,
-            #               self.max_len_key_phrase) if variable_padding_size else self.max_len_key_phrase
+            #               self.max_len_kp) if variable_padding_size else self.max_len_kp
             
             max_len = variable_padding_size
             # Shuffling the order of the keyphrases during training
@@ -1159,16 +1232,25 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
             if self.sample_kps == True:
                 
                 # counts =  np.array( [ (1+idx)//7+1 for idx in range(len(key_phrases)) ] )
-                counts = np.array( [ 2**(1+idx) for idx in range(len(key_phrases)) ] ) #Larger weight on choosing key_phrases that occur later in text
+                counts = np.array( [ 2**(1+idx) for idx in range(len(key_phrases)+1) ] ) #Larger weight on choosing key_phrases that occur later in text
                 p = counts/np.sum(counts)
-                indexes = list(range(len(key_phrases)))
+                p = p.astype('float64')
+
+                possible_amounts_to_keep = list(range(len(key_phrases)+1)) # indexes
                 # kps_to_keep = random.randint( 1 ,len(key_phrases) ) 
-                kps_to_keep = np.random.choice( np.array(indexes)+1, size=1, replace=False, p=p )[0]# Larger weight on choosing to keep a larger amount
-                                
+                kps_to_keep = np.random.choice( np.array(possible_amounts_to_keep), size=1, replace=False, p=p )[0]# Larger weight on choosing to keep a larger amount
+
+                p = counts[:-1]/np.sum(counts[:-1])
+                p = p.astype('float64')
+                indexes = list(range(len(key_phrases))) # indexes
                 sampled_idxs = np.random.choice(indexes, size=kps_to_keep, replace=False, p=p ).tolist()
-                key_phrases, li_kprstpos = list(
-                    zip(*[(key_phrases[idx], li_kprstpos[idx]) for idx in sampled_idxs]))
-            
+                
+                if len(sampled_idxs) != 0: 
+                    key_phrases, li_kprstpos = list(zip(*[(key_phrases[idx], li_kprstpos[idx]) for idx in sampled_idxs]))
+                else:
+                    key_phrases = []
+                    li_kprstpos = []
+           
 
             if len(key_phrases) > 0 :
                 str_keyphrases = '<|kp|> ' + '<|kp|> '.join(key_phrases)
@@ -1179,8 +1261,9 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                                             return_tensors='np',
                                             max_length=max_len,
                                             return_special_tokens_mask=False)[0]
+            
             else:
-                key_phrase_ids = np.array([],dtype=int)
+                key_phrase_ids = np.array([self.pad_values['li_kprstpos']]*max_len,dtype=int)
 
             # Repeating each score in the case where the score is allocated to a phrase topic which is broken down into constituent words
             # e.g. keyphrase - ["fast car", "motorbike", "long rail road"], scores = [0.9, 0.4, 0.2] -> scores = [0.9, 0.9, 0.9, 0.4, 0.4, 0.2, 0.2, 0.2, 0.2]
@@ -1215,7 +1298,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         
         else:
             max_len = min(variable_padding_size,
-                          self.max_len_key_phrase) if variable_padding_size else self.max_len_key_phrase
+                          self.max_len_kp) if variable_padding_size else self.max_len_kp
 
             key_phrase_ids = torch.full(
                 size=(variable_padding_size,), fill_value=self.pad_values['key_phrase_ids'])
@@ -1240,7 +1323,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 padding='do_not_pad',
                 truncation=False,
                 max_length=self.max_len_utt,
-                return_tensors='pt')[0]
+                return_tensors='pt' )[0]
 
             utt_ids = utt_prompt_tok_ids.contiguous()
             labels = None
@@ -1254,8 +1337,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                 padding='do_not_pad',
                 truncation=True,
                 max_length=self.max_len_utt,
-                return_tensors='pt',
-            )[0]
+                return_tensors='pt' )[0]
 
             utt_ids = utt_tok_ids.contiguous()
             labels = torch.cat(
@@ -1560,12 +1642,19 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
         return attention_mask
 
+    def detokenize_dict_pos_edu( self, dict_pos_edu ):
+        
+        for pos in dict_pos_edu.keys():
+            dict_pos_edu[pos] = self.detok.detokenize(  dict_pos_edu[pos].split() )
+            
+        return dict_pos_edu
+
     @classmethod
     def from_pretrained(cls,
                         dir_tokenizer="./tokenizers/RSTGPT2",
                         base_tokenizer_name="gpt2",
                         rst_params={},
-                        **kwargs):  # max_len_rst, max_len_key_phrase, max_rst_depth, max_len_utt, max_rst_pos
+                        **kwargs):  # max_len_rst, max_len_kp, max_rst_depth, max_len_utt, max_rst_pos
 
         if os.path.exists(dir_tokenizer):
             tokenizer = super(RSTTokenizer, cls).from_pretrained(
@@ -1615,7 +1704,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                  optimizer='adafactor',
                  model = None,
                  tokenizer = None,
-                 num_nodes = 1,
+                 num_nodes = 1,        
+                 debugging=False,
                  **kwargs):
 
         super().__init__()
@@ -1627,12 +1717,13 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         self.optimizer = optimizer
         self.dir_checkpoints = kwargs.get('dir_checkpoints')
         self.num_nodes = num_nodes
+        self.debugging = debugging
         
         if tokenizer == None:
             self.tokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
                                                          rst_params={name: getattr(mconfig, name) for name in ['max_len_rst',
-                                                                                                               'max_len_key_phrase',
+                                                                                                               'max_len_kp',
                                                                                                                'max_rst_pos',
                                                                                                                'max_len_utt',
                                                                                                                'rst_tree_aligned_attention'] if hasattr(mconfig, name)
@@ -1651,55 +1742,56 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             self.model.resize_token_embeddings(self.model.config.vocab_size)
         self.model.correct_attn_bias()
 
-        self.pad_values = {'rst_start_token': mconfig.eos_token_id,
-                           'rst_rel': self.model.embed_rst_rels.padding_idx,
-                           'rst_ns': self.model.embed_rst_ns.padding_idx,
-                           'rst_pos': self.model.embed_rst_pos.padding_idx,
+        # self.pad_values = {'rst_start_token': mconfig.eos_token_id,
+        #                    'rst_rel': self.model.embed_rst_rels.padding_idx,
+        #                    'rst_ns': self.model.embed_rst_ns.padding_idx,
+        #                    'rst_pos': self.model.embed_rst_pos.padding_idx,
 
-                           'key_phrase_ids': mconfig.eos_token_id,
-                           'li_kprstpos': self.model.embed_rst_pos.padding_idx,
+        #                    'key_phrase_ids': mconfig.eos_token_id,
+        #                    'li_kprstpos': self.model.embed_rst_pos.padding_idx,
 
-                            'position_ids_keyphrase':mconfig.n_ctx-1,
-                            'position_ids_utt':mconfig.n_ctx-1,
+        #                     'position_ids_keyphrase':mconfig.n_ctx-1,
+        #                     'position_ids_utt':mconfig.n_ctx-1,
 
-                           'input_ids_utt': mconfig.eos_token_id,
-                           'attention_mask': 0.0,
+        #                    'input_ids_utt': mconfig.eos_token_id,
+        #                    'attention_mask': 0.0,
 
-                           'labels': self.model.loss_fct.ignore_index,
+        #                    'labels': self.model.loss_fct.ignore_index,
 
-                           'edu_rstpos': -1,
+        #                    'edu_rstpos': -1,
 
-                           'context_rst_rstpos':-1,
-                           'context_kp_rstpos':-1
-                           }
+        #                    'context_rst_rstpos':-1,
+        #                    'context_kp_rstpos':-1
+        #                    }
+        # self.tokenizer.pad_values = self.pad_values
 
-        self.tokenizer.pad_values = self.pad_values
-
-        self.pad_maxlens = {
-            'rst_start_token': 1,
+        # self.pad_maxlens = {
+        #     'rst_start_token': 1,
             
-            'rst_rel': mconfig.max_len_rst-1,
-            'rst_ns': mconfig.max_len_rst-1,
-            'rst_pos': mconfig.max_len_rst-1,
+        #     'rst_rel': mconfig.max_len_rst-1,
+        #     'rst_ns': mconfig.max_len_rst-1,
+        #     'rst_pos': mconfig.max_len_rst-1,
 
-            'key_phrase_ids': mconfig.max_len_key_phrase,
-            'li_kprstpos': mconfig.max_len_key_phrase,
-            'input_ids_utt': mconfig.max_len_utt,
-            'labels': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,
+        #     'key_phrase_ids': mconfig.max_len_kp,
+        #     'li_kprstpos': mconfig.max_len_kp,
+        #     'input_ids_utt': mconfig.max_len_utt,
+        #     'labels': mconfig.max_len_rst + mconfig.max_len_kp + mconfig.max_len_utt,
 
-            'attention_mask': mconfig.max_len_rst + mconfig.max_len_key_phrase + mconfig.max_len_utt,
+        #     'attention_mask': mconfig.max_len_rst + mconfig.max_len_kp + mconfig.max_len_utt,
 
 
-            'position_ids_keyphrase':mconfig.max_len_key_phrase,
-            'position_ids_utt':mconfig.max_len_utt ,
+        #     'position_ids_keyphrase':mconfig.max_len_kp,
+        #     'position_ids_utt':mconfig.max_len_utt ,
 
-            'edu_rstpos': mconfig.max_rst_pos // 2, #40,
-            'context_rst_rstpos':mconfig.max_len_rst,
-            'context_kp_rstpos':mconfig.max_len_key_phrase
-            }
+        #     'edu_rstpos': mconfig.max_rst_pos // 2, #40,
+        #     'context_rst_rstpos':mconfig.max_len_rst,
+        #     'context_kp_rstpos':mconfig.max_len_kp
+        #     }
 
-        self.tokenizer.pad_maxlens = self.pad_maxlens
-
+        # self.tokenizer.pad_maxlens = self.pad_maxlens
+        
+        self.tokenizer.pad_values = self.model.config.pad_values
+        self.tokenizer.pad_maxlens = self.model.config.pad_maxlens
         self.model.tokenizer = self.tokenizer
 
         if self.mode in ['train_new', 'train_cont', 'test']:
@@ -1709,31 +1801,42 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
             self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
                                           workers=self.workers, mode=self.mode, gpus=self.gpus,
-                                          pad_maxlens=self.pad_maxlens, pad_values=self.pad_values,
+                                          pad_maxlens=self.model.config.pad_maxlens, 
+                                          pad_values=self.model.config.pad_values,
                                           num_nodes=self.num_nodes
                                           )
 
             if self.mode == "test":
                 self.create_data_loaders(['test'])
             else:
+                self.max_epochs = max_epochs
+                self.warmup_proportion = warmup_proportion
+                self.learning_rate = learning_rate
+
                 self.create_data_loaders(['train', 'val', 'inference'])
+                self.tokenizer.inference_mode = True
                 self.inference_samples = list(islice(self.inference_dl, 2))
+                self.tokenizer.inference_mode = False
                 del self.inference_dl
 
-        if self.mode in ['train_new', 'train_cont']:
-            self.max_epochs = max_epochs
-            self.warmup_proportion = warmup_proportion
-            self.learning_rate = learning_rate
 
-            train_params_to_save = self.return_params()
-            mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
-                lambda p: p not in ['self', 'kwargs'], list(inspect.signature(RSTGPT2_Config.__init__).parameters.keys())))}
 
-            self.hparams.update({**train_params_to_save, **mparams_to_save})
-            pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
-                kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
+                # train_params_to_save = self.return_params()
+                # mparams_to_save = {param: getattr(mconfig, param) for param in list(filter(
+                #     lambda p: p not in ['self', 'kwargs'], list(inspect.signature(RSTGPT2_Config.__init__).parameters.keys())))}
 
-        if self.mode in ['inference']:
+                # self.hparams.update({**train_params_to_save, **mparams_to_save})
+                # pl.core.saving.save_hparams_to_yaml(os.path.join(os.path.dirname(
+                #     kwargs['dir_checkpoints']), "hparams.yaml"), self.hparams)
+
+                # mconfig_dict = self.model.config.to_dict()
+                mconfig_dict = {param: getattr(mconfig, param) for param in list(filter(
+                    lambda p: p not in ['self', 'kwargs'], list(inspect.signature(RSTGPT2_Config.__init__).parameters.keys())))}
+                self.hparams.update( **mconfig_dict )
+                ignore_list = ['mconfig','dir_data','gpus','workers','debugging','model','model_dir','tokenizer','override']
+                self.save_hyperparameters(ignore=ignore_list)
+
+        elif self.mode in ['inference']:
             self.eval()
             self.freeze()
 
@@ -1747,15 +1850,13 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--max_epochs', default=50, type=int)
         parser.add_argument('--accumulate_grad_batches', default=3, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
-        parser.add_argument('--batching_style', default='effecient',
-                            type=str, choices=['effecient', 'standard'])
+
         parser.add_argument('--num_nodes',default=1, type=int )
         parser.add_argument('--learning_rate', default=4e-3, type=float)
         parser.add_argument('--workers', default=16,
                             type=int)  # TODO: change to 6
         parser.add_argument('--gpus', default=1, type=int)
-        parser.add_argument('--low_var_start', default=True,
-                            type=lambda val: bool(int(val)))
+
 
         parser.add_argument('--mode', default='train_new', type=str,
                             choices=['train_new', 'train_cont', 'test', 'inference'])
@@ -1768,6 +1869,11 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                             type=lambda x: bool(int(x)), choices=[0, 1])
         parser.add_argument('--optimizer', default='adafactor',
                             choices=['adafactor', 'adamw'])
+
+        parser.add_argument('--val_check_interval', type=float, default=0.33) 
+        parser.add_argument('--debugging', action='store_true', default=False) 
+        
+
         tparams = parser.parse_known_args()[0]
 
         return tparams
@@ -1799,7 +1905,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                     'learning_rate', 'splits', 'tag', 'optimizer']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_key_phrase',
+                    'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_kp',
                      'rst_tree_aligned_attention']})
 
                 mparams = mparams
@@ -1826,7 +1932,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                     'learning_rate', 'precision']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_key_phrase']})
+                    'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_kp']})
             except KeyError:
                 pass
 
@@ -1842,7 +1948,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         return training_module
 
     @staticmethod
-    def instatiate_trainer(tparams, tb_logger, training_module):
+    def instatiate_trainer(tparams, tb_logger, training_module, debugging=False):
         """[summary]
 
             Creates The Trainer and callbacks
@@ -1858,26 +1964,28 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                             'num_nodes':tparams['num_nodes']
                             }
 
-        callbacks = []
-        checkpoint_callback = ModelCheckpoint(monitor='val_loss',
-                                              save_top_k=2,
-                                              mode='min', dirpath=dir_checkpoints,
-                                              filename='{epoch:03d}_{val_loss:.5f}')
-
-        checkpoint_callback._save_model = types.MethodType(
-            mpatch_save_model(checkpoint_callback._save_model), checkpoint_callback)  #
+        checkpoin_valloss = ModelCheckpoint(monitor='val_loss', 
+                                            save_top_k=2,
+                                            mode='min', dirpath=dir_checkpoints,
+                                            filename='{epoch:03d}_{val_loss:.5f}')
+        
+        checkpoint_interval = ModelCheckpoint(
+            filename="interval-{epoch}-{step}",
+            monitor="step",
+            mode="max",
+            every_n_val_epochs=1,
+            save_top_k=1/tparams['val_check_interval']
+        )
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
             min_delta=0.00,
-            patience=2,
+            patience = 1/tparams['val_check_interval'],       
             verbose=False,
             mode='min'
         )
-        save_model_callback = SaveModelCallBack()
-        callbacks.append(checkpoint_callback)
-        callbacks.append(early_stop_callback)
-        # callbacks.append(save_model_callback)
+        callbacks = [checkpoin_valloss, early_stop_callback, checkpoint_interval]
+
 
         if tparams['mode'] in ["train_new"]:
             # Creating Callbacks
@@ -1888,9 +1996,14 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
                                                     # Training
-                                                    val_check_interval=1.0,
+                                                    val_check_interval=tparams['val_check_interval'],
+                                                    limit_train_batches=35 if debugging else 1.0,
+                                                    limit_val_batches=20 if debugging else 1.0,
+
+                                                    log_every_n_steps= 100,
+                                                    
                                                     replace_sampler_ddp=False,
-                                                    num_sanity_val_steps=0 ,
+                                                    num_sanity_val_steps=0,
                                                     **trainer_vars
                                                     )
             trainer.logger.log_hyperparams(training_module.hparams)
@@ -1904,8 +2017,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                                                     logger=tb_logger,
                                                     precision=tparams['precision'],
                                                     callbacks=callbacks,
-                                                    val_check_interval=1.0,
-                                                    num_sanity_val_steps=0 ,
+                                                    val_check_interval=0.33,
+                                                    num_sanity_val_steps=0,
                                                     replace_sampler_ddp=False,
                                                     **trainer_vars
                                                     )
@@ -2013,14 +2126,18 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         if step_name == 'train':
             output["loss"] = model_output.loss
             # self.log( "loss", model_output.loss, sync_dist=True)
-            self.log( "loss", model_output.loss, sync_dist=False)
+            self.log( "loss", model_output.loss, sync_dist=False, rank_zero_only=True)
 
 
         else:
             loss_key = f"{step_name}_loss"
             # self.log( loss_key, model_output.loss, sync_dist=True)
-            self.log( loss_key, model_output.loss, sync_dist=False)
+            self.log( loss_key, model_output.loss, sync_dist=False, rank_zero_only=True)
             output[loss_key]= model_output.loss
+        
+        self.log('step', self.global_step, prog_bar=False, 
+            logger=False, on_step=True, on_epoch=False, 
+            sync_dist=False, rank_zero_only=True)
 
         return output
 
@@ -2029,7 +2146,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         return output
 
     def validation_step(self, batch, batch_idx):
-        output = self.step(batch, "val")
+        with torch.no_grad():
+            output = self.step(batch, "val")
         return output
 
     def test_step(self, batch, batch_idx):
@@ -2046,6 +2164,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         self.epoch_end_log(outputs, "test")
 
     def epoch_end_log(self, outputs, step_name):
+        if not hasattr(self,'w_rank'):
+            self.w_rank = _get_rank()
 
         if step_name == "train":
             pass
@@ -2054,8 +2174,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
             self.log(f"{step_name}_loss", loss, prog_bar=True, sync_dist=True)
 
-        # if step_name == "val" and _get_rank() == 0:
-        if False and step_name == "val" and self.global_rank == 0:
+        if step_name == "val":# _get_rank() == 0:
+        # if step_name == "val" and self.trainer.global_rank == 0:
 
             # Making directory if it doesnt exist
             dir_infer = os.path.join(self.trainer.log_dir, "inference")
@@ -2064,10 +2184,10 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                 os.makedirs(dir_infer, exist_ok=True)
 
             # Adding true values and making csv files if thy dont already exists
-            for idx, encoded_input_ in enumerate(self.inference_samples):
+            for idx, encoded_input in enumerate(self.inference_samples):
 
                 encoded_input = {k: v.detach().clone() if isinstance(
-                    v, torch.Tensor) else copy.deepcopy(v) for k, v in encoded_input_.items()}
+                    v, torch.Tensor) else copy.deepcopy(v) for k, v in encoded_input.items()}
 
                 fp = os.path.join(dir_infer, f"example_{idx:03d}.csv")
 
@@ -2076,9 +2196,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
                     df = pd.DataFrame(columns=['epoch', 'rst_rels', 'keyphrase', 'utterance',
                                                'dict_pos_edu', 'li_kprstpos',
-
-                                               'rst_ns',
-                                               'rst_pos',
+                                               'rst_ns','rst_pos',
                                                ])
 
                     rst_rels = encoded_input.pop('orig_rst_rels')
@@ -2093,20 +2211,21 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
                     datum = {
                         'epoch': -1,
-
+                        "utterance": utterance,
                         'rst_rels': ', '.join(rst_rels),
                         'rst_ns': ', '.join(rst_ns),
                         'rst_pos': rst_pos,
 
                         "keyphrase": ', '.join(keyphrase),
-                        "utterance": utterance,
+                        
                         "dict_pos_edu": json.dumps(dict_pos_edu),
 
                         "li_kprstpos": json.dumps(orig_li_kprstpos),
                     }
 
                     df = df.append(datum, ignore_index=True)
-                    df.to_csv(fp, index=False)
+                    if self.w_rank==0:
+                        df.to_csv(fp, index=False)
 
                 # creating predition andding to existing results
                 encoded_input.pop('orig_rst_rels', None)
@@ -2139,30 +2258,32 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                     'rst_ns': '',
                     'rst_pos': ''
                 }
-
-                pd.DataFrame.from_records([datum]).to_csv(
-                    fp, index=False, mode='a', header=False)
+                if self.w_rank==0:
+                    pd.DataFrame.from_records([datum]).to_csv(
+                        fp, index=False, mode='a', header=False)
                 # Saving to file
-
-        # else:
-        #     pass
+                pass
+        else:
+            pass
+        a = 1
 
     def create_data_loaders(self, modes):
 
         if 'train' in modes:
             self.train_dl = self.dg.prepare_dataloader(
-                split_name='train')
+                split_name='train', debugging=self.debugging)
             self.train_dl_gen_count = 0
 
         if 'val' in modes:
             self.val_dl = self.dg.prepare_dataloader(
-                split_name='val')
+                split_name='val', debugging=self.debugging)
         if 'test' in modes:
             self.test_dl = self.dg.prepare_dataloader(
-                split_name='test')
+                split_name='test', debugging=self.debugging)
         if 'inference' in modes:
             self.inference_dl = self.dg.prepare_dataloader(
-                split_name='inference')
+                split_name='inference',
+                debugging=self.debugging)
 
     def train_dataloader(self):
         if self.train_dl_gen_count == 0:
@@ -2170,7 +2291,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             return self.train_dl
         else:
             self.train_dl = self.dg.prepare_dataloader(
-                split_name='train')
+                split_name='train', debugging=self.debugging)
             return self.train_dl
 
     def val_dataloader(self):
@@ -2179,30 +2300,23 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
     def test_dataloader(self):
         return self.test_dl
 
-    # @lru_cache(maxsize=1)
     def total_steps(self):
-
         ds_size = len(self.train_dl)
         steps = (ds_size * self.max_epochs) // (self.accumulate_grad_batches)
         return steps
 
     def configure_optimizers(self):
-
-        if self.optimizer == 'adafactor':
-            optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
-                                  relative_step=True, warmup_init=True, lr=None,
-                                  weight_decay=0.01
-                                  )
+        #optimal params for adafactor https://github.com/huggingface/transformers/pull/10526#issuecomment-804652154
+    
+        optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
+                                relative_step=True, warmup_init=True, lr=None,
+                                weight_decay=0.01) # Works better for small models
 
         # optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
-        #                         relative_step=False, warmup_init=False, lr=self.learning_rate)
+        #                         relative_step=False, warmup_init=False, lr=1e-3,
+        #                         weight_decay=0.01                         ) # works better for bigger models
 
-        # lr_scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 
-        #                             num_warmup_steps=int( 1*(self.total_steps()/self.max_epochs )),
-        #                             num_training_steps=self.total_steps(),
-        #                             last_epoch=-1 )
-
-        lr_scheduler = AdafactorSchedule(optimizer)
+        # lr_scheduler = AdafactorSchedule(optimizer)
         
         if self.mode == "train_cont":
             # restore the optimizers
@@ -2210,13 +2324,14 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             optimizer_states = checkpoint['optimizer_states']
             optimizer.load_state_dict(optimizer_states[0])
    
-            # restore the lr schedulers
-            if 'lr_schedulers' in checkpoint:
-                lr_scheduler_states = checkpoint['lr_schedulers']
-                lr_scheduler.load_state_dict(lr_scheduler_states[0])
+            # # restore the lr schedulers
+            # if 'lr_schedulers' in checkpoint:
+            #     lr_scheduler_states = checkpoint['lr_schedulers']
+            #     lr_scheduler.load_state_dict(lr_scheduler_states[0])
         
+        return {'optimizer': optimizer, "interval": "step", "monitor": "val_loss"}
         
-        return {'optimizer': optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
+        # return {'optimizer': optimizer, "lr_scheduler": lr_scheduler, "interval": "step", "monitor": "val_loss"}
 
     def return_params(self):
         params = {}
@@ -2228,6 +2343,12 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
         return params
 
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+
+        res = super().on_save_checkpoint(checkpoint)
+
+        next( filter( lambda cb: isinstance(cb, ModelCheckpoint) and cb.monitor=="val_loss" , self.trainer.callbacks) ).to_yaml()
+        return res
 
 class DataLoaderGenerator():
     """Handles the creation of dataloaders for a train, val and test set
@@ -2255,7 +2376,8 @@ class DataLoaderGenerator():
         self.num_nodes =num_nodes
 
     def prepare_dataloader(self,
-                           split_name='train'):
+                           split_name='train',
+                           debugging=False):
         """Prepares a dataloader given a directory of data for NLG language module
             # The current method takes a percentage of data from each subdirectory
             Args:
@@ -2267,15 +2389,15 @@ class DataLoaderGenerator():
         # getting all files from all different subreddits/types of conversation
         fns = glob.glob(os.path.join(utils.get_path(dir_data,_dir=True, relative=True), "*", "*"))
         
-        # fns = [fn for fn in fns if "changemyview" in fn ]
-
+        
         fns = [fn for fn in fns if os.path.split(
-            fn)[-1] != "lock" and "dict_len" not in fn]
+            fn)[-1] != "lock" and "dict_len" not in fn] #[:5] #debugging
+
+        if debugging:
+            fns = fns[:5]
 
         # getting number of utterances records in each file
         files_sizes = [int(fn[-10:]) for fn in fns]
-
-        # making new tokenizer. It exhibits different behaviour depending on whether Training or Validating
         
 
         # defining starting line and total lines to use for dataset
@@ -2285,8 +2407,7 @@ class DataLoaderGenerator():
                          for ls, fs in zip(line_starts, files_sizes)]
             inference = False
             bs = self.batch_size
-            shuffle = True 
-            
+            shuffle = True
             sample_kps = True
 
             def collate_fn(
@@ -2440,7 +2561,7 @@ class SingleDataset(torch.utils.data.Dataset):
         # #v1 We initialize the rst/kp  lengths as the max lengths of our training set
         # # In the Sampler, we change the max length to that of its pre-prescribed batch
         # self.rst_len = [tokenizer.max_len_rst]*self.__len__()
-        # self.key_phrase_len = [tokenizer.max_len_key_phrase]*self.__len__()
+        # self.key_phrase_len = [tokenizer.max_len_kp]*self.__len__()
 
         # v2 We initialize the rst/kp lengths as the actual length of each entry
         # In the Sampler, we change the max length to that of its pre-prescribed batch
@@ -2460,8 +2581,7 @@ class SingleDataset(torch.utils.data.Dataset):
 
         if self.inference == True:
 
-            # utterance_prompt = ' '.join(utterance.split(' ')[:0])
-            utterance_prompt = ""
+            utterance_prompt = ' '.join(utterance.split(' ')[:1])
 
             encoded = self.tokenizer.encode_input(rst_rel=rst_rels, rst_ns=rst_ns, rst_pos=rst_pos,
                                                   li_kp=li_kp,
@@ -2469,7 +2589,7 @@ class SingleDataset(torch.utils.data.Dataset):
                                                   utterance_prompt=utterance_prompt,
                                                   dict_pos_edu=dict_pos_edu,
                                                   max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst),
-                                                  max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase) )
+                                                  max_len_kp= min( self.key_phrase_len[index], self.tokenizer.max_len_kp) )
 
             encoded['orig_rst_rels'] = rst_rels
             encoded['orig_rst_ns'] = rst_ns
@@ -2490,7 +2610,7 @@ class SingleDataset(torch.utils.data.Dataset):
                 utterance=utterance,
                 dict_pos_edu=dict_pos_edu,
                 max_len_rst= min( self.rst_len[index], self.tokenizer.max_len_rst),
-                max_len_key_phrase= min( self.key_phrase_len[index], self.tokenizer.max_len_key_phrase)
+                max_len_kp= min( self.key_phrase_len[index], self.tokenizer.max_len_kp)
             )
 
         return encoded
@@ -2534,311 +2654,9 @@ class SingleDataset(torch.utils.data.Dataset):
         utterance = ujson.loads(datum['txt_preproc'])
 
         #pos and edus
-        dict_pos_edu = json.loads(datum['dict_pos_edu'])
+        dict_pos_edu = json.loads(datum['dict_pos_edu']) 
 
         return rst_rels, rst_ns, rst_pos, li_kp, li_kprstpos, utterance, dict_pos_edu
-
-class SizedOrderedBatchSampler(Sampler[List[int]]):
-    r"""Wraps another sampler to yield a mini-batch of indices.
-
-    Args:
-        sampler (Sampler or Iterable): Base sampler. Can be any iterable object
-        batch_size (int): Size of mini-batch.
-        drop_last (bool): If ``True``, the sampler will drop the last batch if
-            its size would be less than ``batch_size``
-
-    Example:
-        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=False))
-        [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
-        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=True))
-        [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
-    """
-
-    def __init__(self, data_source, batch_size: int, drop_last: bool, shuffle: bool) -> None:
-        # Since collections.abc.Iterable does not check for `__getitem__`, which
-        # is one way for an object to be an iterable, we don't do an `isinstance`
-        # check here.
-        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or \
-                batch_size <= 0:
-            raise ValueError("batch_size should be a positive integer value, "
-                             "but got batch_size={}".format(batch_size))
-        if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value, but got "
-                             "drop_last={}".format(drop_last))
-
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.data_source = data_source
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-        self.prepare_ds()
-                
-    
-    def __iter__(self) -> Iterator[List[int]]:
-        return iter( self.li_chunked_idxs )
-
-
-    def __len__(self) -> int:
-        return len(self.li_chunked_idxs)
-    
-    def set_epoch(self, epoch: int) -> None:
-        r"""
-        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
-        use a different random ordering for each epoch. Otherwise, the next iteration of this
-        sampler will yield the same ordering.
-        Args:
-            epoch (int): Epoch number.
-        """
-        self.epoch = epoch
-        if self.shuffle:
-            self.prepare_ds()        
-
-    def prepare_ds(self):
-        # Sorting and (maybe) shuffling
-        np_txt_lens = np.concatenate(
-            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-        np_rst_lens = np.concatenate(
-            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-        np_key_phrase_lens = np.concatenate(
-            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
-
-        tuple_factors = (np_rst_lens, np_key_phrase_lens, np_txt_lens)
-        if self.shuffle:
-            random_idxs = np.random.random( np_txt_lens.size )
-            tuple_factors = (random_idxs, )+ tuple_factors
-        np_ordered_idxs = np.lexsort(tuple_factors)
-
-
-        # Handing drop last
-        if self.drop_last:
-            rem_records = np_txt_lens.size % self.batch_size
-            li_ordered_idxs = np_ordered_idxs.tolist()
-            for idx in range(rem_records):
-                li_ordered_idxs.pop( random.randint(0,len(li_ordered_idxs)-1) )
-            np_ordered_idxs = np.array(li_ordered_idxs)
-
-        # We Randomly re-arrange them in batches of batch size
-        self.li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
-                            for idx in range(0, np_ordered_idxs.size - self.batch_size, self.batch_size)]
-
-        if self.shuffle:
-            random.shuffle(self.li_chunked_idxs)
-
-        # Getting max sizes for rst in each chunk
-        self.li_chunk_rst_len = [
-            np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_idxs]
-
-        self.li_chunk_key_phrase_len = [
-            np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_idxs]
-        
-
-        # Updating Chunk sizes
-        for chunk_idx, data_idxs in enumerate(self.li_chunked_idxs):
-
-            for data_idx in data_idxs:
-                dataset_idx = bisect.bisect_right(
-                    self.data_source.cumulative_sizes, data_idx)
-
-                if dataset_idx == 0:
-                    sample_idx = data_idx
-                else:
-                    sample_idx = data_idx - \
-                        self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                self.data_source.datasets[dataset_idx].rst_len[sample_idx] = self.li_chunk_rst_len[chunk_idx]
-                self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = self.li_chunk_key_phrase_len[chunk_idx]
-
-class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
-    r"""
-        Adapted so that each process takes sequential indices as opposed to strides across indices
-    """
-    r"""Sampler that restricts data loading to a subset of the dataset.
-        It is especially useful in conjunction with
-        :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
-        process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
-        :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
-        original dataset that is exclusive to it.
-        .. note::
-            Dataset is assumed to be of constant size.
-        Args:
-            dataset: Dataset used for sampling.
-            num_replicas (int, optional): Number of processes participating in
-                distributed training. By default, :attr:`world_size` is retrieved from the
-                current distributed group.
-            rank (int, optional): Rank of the current process within :attr:`num_replicas`.
-                By default, :attr:`rank` is retrieved from the current distributed
-                group.
-            shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
-                indices.
-            seed (int, optional): random seed used to shuffle the sampler if
-                :attr:`shuffle=True`. This number should be identical across all
-                processes in the distributed group. Default: ``0``.
-            drop_last (bool, optional): if ``True``, then the sampler will drop the
-                tail of the data to make it evenly divisible across the number of
-                replicas. If ``False``, the sampler will add extra indices to make
-                the data evenly divisible across the replicas. Default: ``False``.
-        .. warning::
-            In distributed mode, calling the :meth:`set_epoch` method at
-            the beginning of each epoch **before** creating the :class:`DataLoader` iterator
-            is necessary to make shuffling work properly across multiple epochs. Otherwise,
-            the same ordering will be always used.
-        Example::
-            >>> sampler = DistributedSampler(dataset) if is_distributed else None
-            >>> loader = DataLoader(dataset, shuffle=(sampler is None),
-            ...                     sampler=sampler)
-            >>> for epoch in rDange(start_epoch, n_epochs):
-            ...     if is_distributed:
-            ...         sampler.set_epoch(epoch)
-            ...     train(loader)
-        """
-
-    def __init__(self,
-                data_source: Dataset, batch_size: int,
-                 drop_last:bool,
-                 num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None,
-                 seed: int = 0,
-                 shuffle: bool = False,
-                 gpus: int = 2,
-                 num_nodes:int = 1,
-                 ) -> None:
-
-        if num_replicas is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            try:
-                num_replicas = dist.get_world_size()
-            except Exception as e :
-                num_replicas = num_nodes*gpus
-        if rank is None:
-            if not dist.is_available():
-                raise RuntimeError(
-                    "Requires distributed package to be available")
-            #rank = dist.get_rank()
-            rank = _get_rank()
-        if rank >= num_replicas or rank < 0:
-            raise ValueError(
-                "Invalid rank {}, rank should be in the interval"
-                " [0, {}]".format(rank, num_replicas - 1))
-
-        # normal code
-        self.num_replicas = num_replicas
-        self.rank = rank
-
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.data_source = data_source
-        self.shuffle = shuffle
-
-        self.seed = seed
-        self.epoch = 0
-
-        self.prepare_ds()
-       
-    def __iter__(self) -> Iterator[T_co]:
-        
-        # for idx in range( len(self) ):
-        #     batch = self.li_li_chunked_idxs[self.rank][idx]
-        #     yield batch
-
-        return iter( self.li_li_chunked_idxs[self.rank] )
-    
-    def __len__(self) -> int:
-        
-        return len(self.li_li_chunked_idxs[self.rank] )
-
-    def set_epoch(self, epoch: int) -> None:
-        r"""
-        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
-        use a different random ordering for each epoch. Otherwise, the next iteration of this
-        sampler will yield the same ordering.
-        Args:
-            epoch (int): Epoch number.
-        """
-        self.epoch = epoch
-        if self.shuffle:
-            self.prepare_ds()
-
-
-    def prepare_ds(self):
-        # new code
-        np_txt_lens = np.concatenate(
-            [ds.np_textlens for ds in self.data_source.datasets]).flatten()
-        np_rst_lens = np.concatenate(
-            [ds.np_rstlens for ds in self.data_source.datasets]).flatten()
-        np_key_phrase_lens = np.concatenate(
-            [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
-
-        g = torch.Generator()
-        g.manual_seed(self.seed+self.epoch)
-
-        # Sorting and (maybe) shuffling
-        tuple_factors = (np_rst_lens, np_key_phrase_lens, np_txt_lens)
-
-        if self.shuffle:
-            random_idxs= list(range(np_txt_lens.size))
-            random.Random(self.seed+self.epoch).shuffle(random_idxs) 
-            tuple_factors = (random_idxs, )+ tuple_factors
-        np_ordered_idxs = np.lexsort(tuple_factors)
-
-       # Handing drop_last
-        if self.drop_last:
-            rem_records = np_txt_lens.size % (self.batch_size*self.num_replicas)
-            li_ordered_idxs = np_ordered_idxs.tolist()
-            for idx in range(rem_records):
-                li_ordered_idxs.pop( random.Random(self.seed+self.epoch).randint(0,len(li_ordered_idxs)-1) )
-            np_ordered_idxs = np.array(li_ordered_idxs)
-
-
-        # We Randomly re-arrange them in batches of batch size
-        li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
-                           for idx in range(0, np_ordered_idxs.size-self.batch_size, self.batch_size)]
-
-        # Divide into n sublists,
-        # Each sublist at index i, contains the indices for process at rank i
-        # Each sublist at index i, represents similar sized items in the dataset
-        li_li_chunked_idxs = [
-            [li_chunked_idxs[(self.num_replicas*idx)+_rank]
-             for idx in range( len(li_chunked_idxs)//self.num_replicas ) ]
-            for _rank in range(self.num_replicas)]
-
-        # shuffle each processes subllist in the same order to optimize paralel training
-        if self.shuffle:
-            _ = list(zip(*li_li_chunked_idxs))
-            random.Random(self.seed+self.epoch).shuffle(_)
-            # unpacking into worker size length list
-            li_li_chunked_idxs = list(zip(*_))
-
-        self.li_li_chunked_idxs = li_li_chunked_idxs
-
-        # Getting max sizes for rst and key_phrase in each chunk
-        li_li_chunk_rst_len = [[np.take(np_rst_lens, idxs).max() for idxs in li_chunked_idxs]
-                                    for li_chunked_idxs in li_li_chunked_idxs]
-        li_li_chunk_key_phrase_len = [[
-            np.take(np_key_phrase_lens, idxs).max()
-            for idxs in li_chunked_idxs] for li_chunked_idxs in li_li_chunked_idxs]
-        
-                    
-        #Updating the max_len_rst and max_len_keyphrase 
-        for (li_chunked_idxs, li_chunk_rst_len, li_chunk_key_phrase_len) in zip(li_li_chunked_idxs, li_li_chunk_rst_len, li_li_chunk_key_phrase_len):
-            # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
-
-            for chunk_idx, data_idxs in enumerate(li_chunked_idxs):
-
-                for data_idx in data_idxs:
-                    dataset_idx = bisect.bisect_right(
-                        self.data_source.cumulative_sizes, data_idx)
-
-                    if dataset_idx == 0:
-                        sample_idx = data_idx
-                    else:
-                        sample_idx = data_idx - \
-                            self.data_source.cumulative_sizes[dataset_idx - 1]
-
-                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = li_chunk_rst_len[chunk_idx]
-                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = li_chunk_key_phrase_len[chunk_idx]
 
 def main(tparams={}, mparams={}):
 
@@ -2859,7 +2677,8 @@ def main(tparams={}, mparams={}):
     training_module = RSTGPT2_TrainingModule.instatiate_training_module(
         tparams, mparams)
     trainer, training_module = RSTGPT2_TrainingModule.instatiate_trainer(
-        tparams, tb_logger, training_module)
+        tparams, tb_logger, training_module, tparams['debugging'] )
+
     RSTGPT2_TrainingModule.start(trainer, tparams, training_module, mparams)
 
 
@@ -2878,12 +2697,15 @@ if __name__ == '__main__':
 
     if tparams.gpus not in [0, 1]:
         os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] =  '65512' #'65502'
+        os.environ['MASTER_PORT'] =  '6535' #'65502'
 
     try:
         main(vars(tparams), vars(mparams))
     except Exception:
         print(traceback.format_exc())
 
-# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 1 --workers 12 --gpus 2 --tag "RSTGPT with aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_key_phrase 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot
-# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 19 --version 2 --workers 12 --gpus 2 --tag "RSTGPT without aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_key_phrase 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 1 --workers 12 --gpus 2 --tag "RSTGPT with aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 19 --version 2 --workers 12 --gpus 2 --tag "RSTGPT without aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot
+
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 31 --workers 12 --gpus 2 --tag "RSTGPT2 with aligned attention, regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33
+# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 31 --workers 12 --gpus 2 --tag "RSTGPT2 with regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33

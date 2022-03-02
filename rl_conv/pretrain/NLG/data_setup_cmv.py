@@ -33,7 +33,7 @@ from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
 from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
 from utils_nlg_v3 import non_parseable_remover, edu_fixer, position_edus, _tree_to_rst_code, _parse_trees
-from dataset_cmv.pair_repo.compute_topic_signatures import TopicSignatureConstruction
+from pair_repo.compute_topic_signatures import TopicSignatureConstruction
 
 import string
 
@@ -178,12 +178,13 @@ def preprocess(li_records):
         # removing unicode from string and replacing with actual str
         reference = reference.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "")
         title = title.encode('ascii',errors='ignore').decode('ascii').replace("{", "").replace("}", "")
-
+ 
         #removing weird  symbols from reference
         reference = re.sub(regex_bulletpoints, "", reference)
 
         li_records[idx]['txt_preproc'] = reference
         li_records[idx]['title'] = title
+      
     
     # print("Ending preprocess")
     return li_records
