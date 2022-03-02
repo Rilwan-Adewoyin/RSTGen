@@ -1,7 +1,7 @@
+from ctypes import ArgumentError
 import os
-import transformers
 # os.environ['NCCL_SOCKET_IFNAME'] = 'ib0' #'lo' eno1,eno2, eno3,eno4,ens2,ens2d1
-os.environ['NCCL_SOCKET_IFNAME'] = 'lo' #'lo' eno1,eno2, eno3,eno4,ens2,ens2d1
+# os.environ['NCCL_SOCKET_IFNAME'] = 'lo' #'lo' eno1,eno2, eno3,eno4,ens2,ens2d1
 
 # os.environ['NCCL_DEBUG'] = "INFO"
 # os.environ['NCCL_SOCKET_IFNAME'] = 'enp226s0f0'
@@ -1696,6 +1696,9 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                  accumulate_grad_batches=1,
                  max_epochs=25,
                  gpus=1,
+                 gpu_nodes = 1,        
+                 tpu_nodes=None,
+                 tpu_cores=None,
                  learning_rate=1e-4,
                  warmup_proportion=0.1,
                  workers=0,
@@ -1704,21 +1707,31 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                  optimizer='adafactor',
                  model = None,
                  tokenizer = None,
-                 num_nodes = 1,        
                  debugging=False,
                  **kwargs):
 
         super().__init__()
 
         self.batch_size = batch_size
-        self.gpus = gpus
+
         self.mode = mode
         self.workers = workers
         self.optimizer = optimizer
         self.dir_checkpoints = kwargs.get('dir_checkpoints')
-        self.num_nodes = num_nodes
         self.debugging = debugging
-        
+
+        # Setting up gpu or tpu params
+        self.accelerator = "gpu"*(gpus!=None and gpu_nodes!=None) + "tpu"*(tpu_nodes!=None and tpu_cores!=None)
+        if self.accelerator == "gpu":
+            self.units = gpus #units per node
+            self.nodes = gpu_nodes
+        elif self.accelerator == "tpu":
+            self.units = tpu_cores 
+            self.nodes = tpu_nodes
+        else:
+            raise ArgumentError("User must either have tpu or gpu set up")
+
+
         if tokenizer == None:
             self.tokenizer = RSTTokenizer.from_pretrained(f"./tokenizers/{mconfig.model_name}",
                                                          base_tokenizer_name=mconfig.base_model_name,
@@ -1800,10 +1813,11 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             self.tag = tag
 
             self.dg = DataLoaderGenerator(self.dir_data,  self.batch_size, self.tokenizer,
-                                          workers=self.workers, mode=self.mode, gpus=self.gpus,
+                                          workers=self.workers, mode=self.mode, 
+                                          units=self.units,
+                                          nodes=self.nodes,
                                           pad_maxlens=self.model.config.pad_maxlens, 
-                                          pad_values=self.model.config.pad_values,
-                                          num_nodes=self.num_nodes
+                                          pad_values=self.model.config.pad_values
                                           )
 
             if self.mode == "test":
@@ -1833,7 +1847,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                 mconfig_dict = {param: getattr(mconfig, param) for param in list(filter(
                     lambda p: p not in ['self', 'kwargs'], list(inspect.signature(RSTGPT2_Config.__init__).parameters.keys())))}
                 self.hparams.update( **mconfig_dict )
-                ignore_list = ['mconfig','dir_data','gpus','workers','debugging','model','model_dir','tokenizer','override']
+                ignore_list = ['mconfig','dir_data','gpus','gpu_nodes','tpu_nodes','tpu_cores','workers','debugging','model','model_dir','tokenizer','override']
                 self.save_hyperparameters(ignore=ignore_list)
 
         elif self.mode in ['inference']:
@@ -1851,11 +1865,14 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--accumulate_grad_batches', default=3, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
 
-        parser.add_argument('--num_nodes',default=1, type=int )
         parser.add_argument('--learning_rate', default=4e-3, type=float)
         parser.add_argument('--workers', default=16,
                             type=int)  # TODO: change to 6
-        parser.add_argument('--gpus', default=1, type=int)
+        
+        parser.add_argument('--gpu_nodes',default=None, type=int )
+        parser.add_argument('--gpus', default=None, type=int)
+        parser.add_argument('--tpu_nodes',default=None, type=int )
+        parser.add_argument('--tpu_cores', default=None, type=int, )
 
 
         parser.add_argument('--mode', default='train_new', type=str,
@@ -1955,14 +1972,19 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         """
         dir_checkpoints = tparams['dir_checkpoints']
 
-        if tparams['gpus'] in [0, 1]:
-            trainer_vars = {}
-        else:
+        tparams.pop('tpu_nodes')
+        tparams.pop('tpu_cores')
+        tparams.pop('gpu_nodes')
+        tparams.pop('gpus')
+            
 
-            trainer_vars = {'accelerator': 'ddp',
-                            'plugins': DDPPlugin(find_unused_parameters=False),
-                            'num_nodes':tparams['num_nodes']
-                            }
+        trainer_vars = { 'accelerator': training_module.accelerator,
+                        'strategy': 'ddp',
+                        'plugins': DDPPlugin(find_unused_parameters=False),
+                        'num_nodes':training_module.nodes}
+
+        k = 'gpus' if training_module.accelerator=='gpu' else 'tpu_cores'
+        trainer_vars[k]= training_module.units
 
         checkpoin_valloss = ModelCheckpoint(monitor='val_loss', 
                                             save_top_k=2,
@@ -2039,7 +2061,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
 
 
             del checkpoint
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
         elif tparams['mode'] in ["test"]:
 
@@ -2357,10 +2379,11 @@ class DataLoaderGenerator():
     def __init__(self, dir_data, batch_size,
                  tokenizer,
                  workers=0, mode='train_new',
-                 gpus=1,
+                 units=1,
+                 nodes=1,
                  pad_values={},
                  pad_maxlens={},
-                 num_nodes=1,
+                 
                  **kwargs):
 
         self.dir_data = dir_data
@@ -2370,10 +2393,11 @@ class DataLoaderGenerator():
         self.batch_size = batch_size
         self.workers = workers
         self.mode = mode
-        self.gpus = gpus
+
+        self.nodes =nodes
+        self.units = units
         self.pad_values = pad_values
         self.pad_maxlens = pad_maxlens
-        self.num_nodes =num_nodes
 
     def prepare_dataloader(self,
                            split_name='train',
@@ -2456,12 +2480,12 @@ class DataLoaderGenerator():
 
         concat_dset = torch.utils.data.ConcatDataset(li_dsets)
 
-        if self.gpus <= 1 and split_name not in ['inference', 'test']:
+        if self.units*self.nodes <= 1 and split_name not in ['inference', 'test']:
             sampler = SizedOrderedBatchSampler(concat_dset, bs, drop_last=True, shuffle=shuffle)
             bs = 1
 
-        elif self.gpus > 1 and split_name not in ['inference', 'test']:
-            sampler = SizedOrderedDistributedBatchSampler(concat_dset, bs, drop_last=True, shuffle=shuffle, gpus=self.gpus, seed=seed, num_nodes=self.num_nodes)
+        elif self.units*self.nodes > 1 and split_name not in ['inference', 'test']:
+            sampler = SizedOrderedDistributedBatchSampler(concat_dset, bs, drop_last=True, shuffle=shuffle, units=self.units, seed=seed, nodes=self.nodes)
             bs = 1
         else:
             sampler = None
@@ -2707,5 +2731,5 @@ if __name__ == '__main__':
 # CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 1 --workers 12 --gpus 2 --tag "RSTGPT with aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot
 # CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 19 --version 2 --workers 12 --gpus 2 --tag "RSTGPT without aligned attention and regularisation" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot
 
-# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 31 --workers 12 --gpus 2 --tag "RSTGPT2 with aligned attention, regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33
-# CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --batch_size 12 --version 31 --workers 12 --gpus 2 --tag "RSTGPT2 with regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33
+# python3 train_RSTGPT.py --tpu_cores 2 --tpu_nodes 1 --batch_size 12 --version 31 --workers 12  --tag "RSTGPT2 with aligned attention, regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 1 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33
+# python3 train_RSTGPT.py --tpu_cores 2 --tpu_nodes 1  --batch_size 12 --version 31 --workers 12 --tag "RSTGPT2 with regularisation and unlikelihood loss" --max_len_utt 270 --max_len_rst 36 --max_len_kp 64 --rst_tree_aligned_attention 0 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --val_check_interval 0.33

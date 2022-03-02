@@ -1,3 +1,4 @@
+from argparse import ArgumentError
 import os
 import json
 
@@ -1207,12 +1208,23 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
                 data_source: Dataset, batch_size: int,
                  drop_last:bool,
                  num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None,
+                 rank: Optional[int]= None,
                  seed: int = 0,
                  shuffle: bool = False,
-                 gpus: int = 2,
-                 num_nodes:int = 1,
+                 units: Optional[int] = None,
+                 nodes:Optional[int] = None
                  ) -> None:
+
+        # Either using gpu set or tpu set up
+        # proc_type = "gpu"*(gpus==None and num_nodes==None) + "tpu"*(tpus==None and tpu_cores==None)
+        # if proc_type == "gpu":
+        #     units = gpus
+        #     nodes = num_nodes
+        # elif proc_type == "tpu":
+        #     units = tpus
+        #     nodes = tpu_cores
+        # else:
+        #     raise ArgumentError("User must either have tpu or gpu set up")
 
         if num_replicas is None:
             if not dist.is_available():
@@ -1221,12 +1233,11 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
             try:
                 num_replicas = dist.get_world_size()
             except Exception as e :
-                num_replicas = num_nodes*gpus
+                num_replicas = units*nodes
         if rank is None:
             if not dist.is_available():
                 raise RuntimeError(
                     "Requires distributed package to be available")
-            #rank = dist.get_rank()
             rank = _get_rank()
         if rank >= num_replicas or rank < 0:
             raise ValueError(
@@ -1700,9 +1711,9 @@ class DegenerateLossMixin():
         # [(batch_size * max_tgt_len) x tgt_vocab_size]
         loss = -torch.log(one_minus_probs)*negative_targets
 
-        loss = loss.sum(-1)/negative_targets.sum(-1)
+        loss = loss.sum(-1)/negative_targets.sum(-1) # Summing over each training datum
         loss = loss.reshape(batch_size, max_tgt_len)
-        loss = loss.sum(-1).mean() # average across the batch
+        loss = loss.sum(-1).mean() #Sum within each batch then average across the batch
 
         return loss
 
