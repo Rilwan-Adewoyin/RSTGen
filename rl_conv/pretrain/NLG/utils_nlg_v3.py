@@ -12,17 +12,23 @@ from itertools import (combinations, combinations_with_replacement,
 import random
 import regex as re
 import torch
+import pytorch_lightning as pl
+from pytorch_lightning.utilities import rank_zero_warn
+
 from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import TQDMProgressBar
+from torch import logsumexp, negative, nn
 
-from torch import negative, nn
-
-from typing import (Any, Dict, Iterator, List, Optional, OrderedDict, TypeVar)
+from typing import (Any, Dict, Iterator, List, Optional, OrderedDict, TypeVar, Union)
 
 import numpy as np
 import copy
-
+from pytorch_lightning.utilities.types import _METRIC
 from functools import lru_cache
 import nltk
+
+from collections import Counter
+
 import math
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data._utils.collate import default_convert
@@ -31,6 +37,7 @@ import collections
 from itertools import groupby
 
 import torch.nn.functional as F
+
 from pytorch_lightning.utilities.distributed import _get_rank
 import torch.distributed as dist
 
@@ -111,7 +118,6 @@ def save_version_params(t_params, m_params, version_code="DaNet_v000"):
     return True    
 #endregion 
 
-
 #region RST helper
 
 
@@ -154,33 +160,16 @@ class RstModelMixin():
 
     # segmentation helpers
     cue_phrases = ['above all',
-            'accordingly',
-            'actually',
-            'admittedly',
-            'after',
-            'after',
-            'after all',
-            'after that',
-            'afterwards',
-            'again',
-            'all in all',
-            'all the same',
-            'also',
-            'alternatively',
-            'although',
-            'always assuming that',
-            'and',
-            'and / or',
-            'anyway',
-            'as',
-            'as a consequence',
-            'as a corollary',
-            'as a result',
-            'as long as',
-            'as soon as',
-            'as well',
-            'at any rate',
-            'at first',
+            'accordingly', 'actually','admittedly','after',
+            'after','after all','after that','afterwards',
+            'again','all in all','all the same','also',
+            'alternatively','although','always assuming that',
+            'and','and / or',
+            'anyway','as',
+            'as a consequence','as a corollary',
+            'as a result','as long as',
+            'as soon as','as well',
+            'at any rate','at first',
             'at first blush',
             'at first sight',
             'at first view',
@@ -440,15 +429,14 @@ class RstModelMixin():
             self.prev_edu_pos = [ decoder_input_ids.new_tensor( [] ) for idx in range(num_hypos) ]
             curr_edu_pos = [None]* num_hypos
         else:
-            # curr_edu_pos = [self.prev_edu_pos[idx][-1:] for idx in range(num_hypos)]
+
             curr_edu_pos = [self.prev_edu_pos[idx][-1] for idx in range(num_hypos)]
 
         for idx in range(num_hypos):
             
             # Automated Checks to Increase edu pos                                
             #CASE: first generated token and no context utterance
-            if self.prev_edu_pos[0].numel() == 0 and decoder_input_ids.shape[1] == 1: 
-                # curr_edu_pos = [ edu_rstpos[idx//num_beams][:1]  for idx in range(num_hypos) ]
+            if self.prev_edu_pos[0].numel() == 0 and decoder_input_ids.shape[1] == 1:
                 curr_edu_pos = [ edu_rstpos[idx//num_beams][0]  for idx in range(num_hypos) ]
                 self.consecutive_steps_prev_edu_used = [1]*num_hypos
                 break
@@ -477,12 +465,17 @@ class RstModelMixin():
                 self.consecutive_steps_prev_edu_used = [1]*num_hypos
                 break
 
-            #CASE: Check we have not use previous edu too many times
-            elif self.consecutive_steps_prev_edu_used[idx] >= 3:
-                # We do not allow segmentation checks for two consecutive rounds                
+            #CASE: If no segmentation check for 5 generated tokens then force a check 
+            elif self.consecutive_steps_prev_edu_used[idx] >= 6:
+                               
                 self.consecutive_steps_prev_edu_used[idx] = 0
-                curr_edu_pos[idx] = None
-                
+                curr_edu_pos[idx] = None #segmentation check occurs for text idx if curr_edu_pos[idx] is None at the end of this elif block
+            
+            #CASE: If less than three tokens have been generated do not do a seg check
+            elif self.consecutive_steps_prev_edu_used[idx] <= 3:
+                self.consecutive_steps_prev_edu_used[idx] += 1
+
+
             #Case: END PUNCTUATION is previosly generated token - we advance to next EDU  
             elif li_gen_text[idx][ -1:] in self.punct_end_edu:
 
@@ -544,17 +537,17 @@ class RstModelMixin():
             
             #CASE: Check if dm marker / cue phrase occurs. If so then do segment check
             else:
-                #If dm marker occurs then do we set curr_edu_pos[idx] to 0. This indicates we should do a segment check
+                #If dm marker occurs then do we set curr_edu_pos[idx] to None. This indicates we should do a segment check
                 input_ids = decoder_input_ids[idx]
-                
-                for idx1 in range(1, min(len(self.dict_len_phrasetok), len(input_ids) )+1 ):
+                # dict len is key: list of dms of length key
+                for idx1 in range(1, min(len(self.dict_len_phrasetok), len(input_ids) )+1):
                     if ( input_ids[-idx1:] == torch.stack(self.dict_len_phrasetok[idx1],axis=0) ).all(axis=-1).any():
                         curr_edu_pos[idx] = None
-                    else:
-                        self.consecutive_steps_prev_edu_used[idx]+= 1
+                        break
+                if curr_edu_pos[idx] != None: 
+                    self.consecutive_steps_prev_edu_used[idx]+= 1
                         
-        
- 
+                        
         # Perform Segmentation using Segmenter  on selected indexes
         if not all(curr_edu_pos):
 
@@ -587,7 +580,6 @@ class RstModelMixin():
                 
             elif self.rst_segment_method == "segbot":
 
-                # idxs_to_update = [ idx for idx,bool_ in enumerate(bool_use_old_edu_pos) if bool_==False ]
                 idxs_to_update = [ idx for idx,val in enumerate(curr_edu_pos) if val==None ]
 
                 li_gen_text_filtr = [ gen_text for idx,gen_text in enumerate(li_gen_text) if idx in idxs_to_update]
@@ -610,26 +602,32 @@ class RstModelMixin():
 
                 # Adding back to original list
                 for i, idx in enumerate(idxs_to_update):
-                    # curr_edu_pos[idx] = updated_curr_edu_pos[i]
                     curr_edu_pos[idx] = updated_curr_edu_pos[i][0]
 
 
         # Appending curr_edu_pos to the self.prev_edu_pos
         self.prev_edu_pos = [ torch.cat( [ prev, curr.reshape(1) ] ) for prev,curr in zip( self.prev_edu_pos, curr_edu_pos ) ]
-        
-        # print(curr_edu_pos)
-        
+                
         return curr_edu_pos, li_gen_text
 
     def _get_logits_processor(self, *args, **kwargs ):
         processor = GenerationMixin._get_logits_processor(self, *args, **kwargs )
         
-        kp_logitsproc = KeyPhraseNoRepeatLogitsProcessor(self.gen_key_phrase_ids, 
+        kpnr_logitsproc = KeyPhraseNoRepeatLogitsProcessor(self.gen_key_phrase_ids, 
                                                          self.tokenizer.keyphrase_start_token_id[0],
                                                          self.tokenizer.eos_token_id,
                                                          tokenizer=self.tokenizer)
+                                            
+        kspnrws_logitsproc = KeySubPhraseNoRepeatWithinSpanLogitsProcessor(self.gen_key_phrase_ids, 
+                                                         self.tokenizer.keyphrase_start_token_id[0],
+                                                         self.tokenizer.eos_token_id,
+                                                         tokenizer=self.tokenizer)
+        
+
+
+
         # nonlocal logits_processor
-        processor.append( kp_logitsproc )
+        processor.extend( [ kpnr_logitsproc, kspnrws_logitsproc ] )
                 
         return processor
     
@@ -666,7 +664,7 @@ MAX_LONG_VALUE = torch.iinfo(torch.long).max
 class RstTokenizerMixin():
 
     @staticmethod
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def edukp_pos_sort_function(edukp_pos: int):
         # We use a sorting function to know tree leftright order of edukp_pos
             # sort_function
@@ -685,13 +683,14 @@ class RstTokenizerMixin():
         return flattened_pos
 
     @staticmethod
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def node_level(node_pos):
+        #This calculates the tree depth of node node_pos in a full binary tree
         val = math.floor( math.log( node_pos+1 , 2 ) )
         return val
 
     @staticmethod
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def left_right_seq_from_root_to_edu_pos( edukp_pos: int):
         # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
@@ -717,7 +716,7 @@ class RstTokenizerMixin():
         return li_leftright_seq
 
     @staticmethod
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def seq_from_root_to_edu_pos( edukp_pos: int):
         # from root_pos find the sequence of left/rights down the tree to each edukp_pos
 
@@ -737,7 +736,7 @@ class RstTokenizerMixin():
         return li_seq
 
     @staticmethod
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def parent_node(edukp_pos: int ):
         
         if edukp_pos > 0:
@@ -761,7 +760,7 @@ class RstTokenizerMixin():
 
         return x.astype( int )
     
-    @lru_cache(maxsize=4096)
+    @lru_cache()
     def clamp_value( pos ):
         while pos >= MAX_LONG_VALUE:
             pos = RstTokenizerMixin.parent_node(pos)
@@ -817,7 +816,7 @@ class RstTokenizerMixin():
         return rst_rel_encoded, rst_names
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
     
-    def __init__(self, max_rst_index=62, max_rst_level=8, rst_encoding_ndim=768,
+    def __init__(self, max_rst_index=62, max_rst_level=12, rst_encoding_ndim=768,
                     init_val=0.05, std=0.02):
         
         super(EmbeddingRstPos, self).__init__()
@@ -827,9 +826,10 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
         self.left_right_seq_from_root_to_edu_pos = EmbeddingRstPos.left_right_seq_from_root_to_edu_pos
 
         self.init_val = init_val
-        self.fixed_rst_encoding = self.make_rst_encoding( )
+        
         self.ffd = torch.nn.Linear(self.max_rst_level, rst_encoding_ndim, bias=True )
         self.ffd.weight.data.normal_(mean=0.0, std=std)
+        self.fixed_rst_encoding = self.make_rst_encoding( )
         
         self.padding_idx = self.fixed_rst_encoding.padding_idx
         
@@ -846,33 +846,42 @@ class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
         return x
     
     def make_rst_encoding(self):
-        
-        embedding_weight = torch.zeros( 
-                                (self.max_rst_index, self.max_rst_level ),
-                                dtype = torch.float )
-        
-        # zero index embedding vector
-        zero_embedding = np.zeros( [self.max_rst_level] )
 
-        split_dir_numb = {'L':-self.init_val, 'R':self.init_val}
+        _default_dir = "./models/EmbeddingRSTPos/"
+        path_ = os.path.join( _default_dir, f"max_rst_indx:{self.max_rst_index}-max_rst_level:{self.max_rst_level}.pkl" )
         
-        # for each embedding
-        for idx in range(self.max_rst_index):
+        if os.path.exists( path_ ):
+            fixed_rst_encoding = torch.load(path_,map_location=self.ffd.weight.device )
+        
+        else:
+            embedding_weight = torch.zeros( 
+                                    (self.max_rst_index, self.max_rst_level ),
+                                    dtype = torch.float )
             
-            idx_embedding = copy.deepcopy( zero_embedding )
-            
-            # Determine the sequence of lefts and rights to reach node    
-            left_rights_from_root_to_pos = EmbeddingRstPos.left_right_seq_from_root_to_edu_pos( idx )
-            
-            # Convert sequence of LRs to a sequence of -1 and 1s and 0s
-            for idx1, val in enumerate(left_rights_from_root_to_pos):
-                idx_embedding[idx1] = split_dir_numb[val]
+            # zero index embedding vector
+            zero_embedding = np.zeros( [self.max_rst_level] )
 
-            # set this as the new embedding
-            embedding_weight[idx] = torch.FloatTensor( idx_embedding )
+            split_dir_numb = {'L':-self.init_val, 'R':self.init_val}
+            
+            # for each embedding
+            for idx in range(self.max_rst_index):
+                
+                idx_embedding = copy.deepcopy( zero_embedding )
+                
+                # Determine the sequence of lefts and rights to reach node    
+                left_rights_from_root_to_pos = EmbeddingRstPos.left_right_seq_from_root_to_edu_pos( idx )
+                
+                # Convert sequence of LRs to a sequence of -1 and 1s and 0s
+                for idx1, val in enumerate(left_rights_from_root_to_pos):
+                    idx_embedding[idx1] = split_dir_numb[val]
 
-        fixed_rst_encoding = torch.nn.Embedding.from_pretrained( embedding_weight ,
-                                    freeze=True, padding_idx=self.max_rst_index-1 )
+                # set this as the new embedding
+                embedding_weight[idx] = torch.FloatTensor( idx_embedding )
+
+            fixed_rst_encoding = torch.nn.Embedding.from_pretrained( embedding_weight ,
+                                        freeze=True, padding_idx=self.max_rst_index-1 )
+            os.makedirs(_default_dir, exist_ok=True)
+            torch.save(fixed_rst_encoding, path_)
 
         return fixed_rst_encoding
 
@@ -941,11 +950,12 @@ class EffeciencyMixin():
             if torch.utils.data.get_worker_info() is not None:
                 # If we're in a background process, concatenate directly into a
                 # shared memory tensor to avoid an extra copy
-                numel = sum([x.numel() for x in batch])
+                numel = sum(x.numel() for x in batch)
                 storage = elem.storage()._new_shared(numel)
-                out = elem.new(storage)
+                out = elem.new(storage).view(-1, *list(elem.size())) #debug
 
             return torch.stack(batch, 0, out=out)
+
         elif isinstance(elem, float):
             return torch.tensor(batch, dtype=torch.float64)
         elif isinstance(elem, int):
@@ -1065,7 +1075,7 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
         [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
     """
 
-    def __init__(self, data_source, batch_size: int, drop_last: bool, shuffle: bool) -> None:
+    def __init__(self, data_source, batch_size: int, drop_last: bool, shuffle: bool, debugging:bool) -> None:
         # Since collections.abc.Iterable does not check for `__getitem__`, which
         # is one way for an object to be an iterable, we don't do an `isinstance`
         # check here.
@@ -1082,13 +1092,12 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
         self.data_source = data_source
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.debugging = debugging
 
         self.prepare_ds()
                 
-    
     def __iter__(self) -> Iterator[List[int]]:
         return iter( self.li_chunked_idxs )
-
 
     def __len__(self) -> int:
         return len(self.li_chunked_idxs)
@@ -1119,6 +1128,8 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
             random_idxs = np.random.random( np_txt_lens.size )
             tuple_factors = (random_idxs, )+ tuple_factors
         np_ordered_idxs = np.lexsort(tuple_factors)
+        if self.debugging:
+            np_ordered_idxs = np.flip( np_ordered_idxs )
 
 
         # Handing drop last
@@ -1133,15 +1144,18 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
         self.li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
                             for idx in range(0, np_ordered_idxs.size - self.batch_size, self.batch_size)]
 
-        if self.shuffle:
+        if self.shuffle and not self.debugging:
             random.shuffle(self.li_chunked_idxs)
-
+        
         # Getting max sizes for rst in each chunk
         self.li_chunk_rst_len = [
             np.take(np_rst_lens, idxs).max() for idxs in self.li_chunked_idxs]
 
         self.li_chunk_key_phrase_len = [
             np.take(np_key_phrase_lens, idxs).max() for idxs in self.li_chunked_idxs]
+
+        self.li_chunk_text_len = [
+            np.take(np_txt_lens, idxs).max() for idxs in self.li_chunked_idxs]
         
 
         # Updating Chunk sizes
@@ -1159,6 +1173,8 @@ class SizedOrderedBatchSampler(Sampler[List[int]]):
 
                 self.data_source.datasets[dataset_idx].rst_len[sample_idx] = self.li_chunk_rst_len[chunk_idx]
                 self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = self.li_chunk_key_phrase_len[chunk_idx]
+                self.data_source.datasets[dataset_idx].text_len[sample_idx] = self.li_chunk_text_len[chunk_idx]
+
 
 class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
     r"""
@@ -1212,19 +1228,10 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
                  seed: int = 0,
                  shuffle: bool = False,
                  units: Optional[int] = None,
-                 nodes:Optional[int] = None
+                 nodes:Optional[int] = None,
+                 static_graph_optim:Optional[bool] = False,
+                 debugging:Optional[bool] = False,
                  ) -> None:
-
-        # Either using gpu set or tpu set up
-        # proc_type = "gpu"*(gpus==None and num_nodes==None) + "tpu"*(tpus==None and tpu_cores==None)
-        # if proc_type == "gpu":
-        #     units = gpus
-        #     nodes = num_nodes
-        # elif proc_type == "tpu":
-        #     units = tpus
-        #     nodes = tpu_cores
-        # else:
-        #     raise ArgumentError("User must either have tpu or gpu set up")
 
         if num_replicas is None:
             if not dist.is_available():
@@ -1252,18 +1259,20 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         self.drop_last = drop_last
         self.data_source = data_source
         self.shuffle = shuffle
+        self.debugging = debugging
 
         self.seed = seed
         self.epoch = 0
+
+        # Reduce the variation in sizes of members of each of rst, kp, and utterance
+        # In this way we reduce the number of the times the computational graph is redrawn
+        # for TPU training and non eager GPU training
+        self.static_graph_optim = static_graph_optim
 
         self.prepare_ds()
        
     def __iter__(self) -> Iterator[T_co]:
         
-        # for idx in range( len(self) ):
-        #     batch = self.li_li_chunked_idxs[self.rank][idx]
-        #     yield batch
-
         return iter( self.li_li_chunked_idxs[self.rank] )
     
     def __len__(self) -> int:
@@ -1292,6 +1301,21 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         np_key_phrase_lens = np.concatenate(
             [ds.np_keyphrase_lens for ds in self.data_source.datasets]).flatten()
 
+        if self.static_graph_optim:   
+            # Increasing all tensors to be a multiple of 8 in size
+                
+            def round_up_to_mult_of_8(num):
+                return -((-num) // 8) * 8
+            def round_up_to_mult_of_4(num):
+                return -((-num) // 4) * 4
+
+            vf4= np.vectorize(round_up_to_mult_of_4)
+            vf8= np.vectorize(round_up_to_mult_of_8)
+
+            np_txt_lens = vf8(np_txt_lens)
+            np_rst_lens = vf4(np_rst_lens)
+            np_key_phrase_lens = vf4(np_key_phrase_lens)
+
         g = torch.Generator()
         g.manual_seed(self.seed+self.epoch)
 
@@ -1299,17 +1323,21 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         tuple_factors = (np_rst_lens, np_key_phrase_lens, np_txt_lens)
 
         if self.shuffle:
-            random_idxs= list(range(np_txt_lens.size))
+            random_idxs=list(range(np_txt_lens.size))
             random.Random(self.seed+self.epoch).shuffle(random_idxs) 
             tuple_factors = (random_idxs, )+ tuple_factors
-        np_ordered_idxs = np.lexsort(tuple_factors)
+        np_ordered_idxs = np.lexsort(tuple_factors) # Datums ordered by txt_len, kp_len and rst_len
+        
+        if self.debugging:
+            # Operating on largest to biggest
+            np_ordered_idxs = np.flip( np_ordered_idxs )
 
        # Handing drop_last
         if self.drop_last:
             rem_records = np_txt_lens.size % (self.batch_size*self.num_replicas)
             li_ordered_idxs = np_ordered_idxs.tolist()
             for idx in range(rem_records):
-                li_ordered_idxs.pop( random.Random(self.seed+self.epoch).randint(0,len(li_ordered_idxs)-1) )
+                li_ordered_idxs.pop( random.randint(0,len(li_ordered_idxs)-1) )
             np_ordered_idxs = np.array(li_ordered_idxs)
 
 
@@ -1317,36 +1345,75 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
         li_chunked_idxs = [np_ordered_idxs[idx:idx+self.batch_size]
                            for idx in range(0, np_ordered_idxs.size-self.batch_size, self.batch_size)]
 
-        # Divide into n sublists,
-        # Each sublist at index i, contains the indices for process at rank i
-        # Each sublist at index i, represents similar sized items in the dataset
-        li_li_chunked_idxs = [
-            [li_chunked_idxs[(self.num_replicas*idx)+_rank]
-             for idx in range( len(li_chunked_idxs)//self.num_replicas ) ]
-            for _rank in range(self.num_replicas)]
+        if not self.static_graph_optim:
+            # Divide into n sublists,
+            # Each sublist at index i, contains the indices for process at rank i
+            # Each sublist at index i, represents similar sized items in the dataset
+            # Across all sublists, the ith elements all contain similar sized datums 
+            li_li_chunked_idxs = [
+                [li_chunked_idxs[(self.num_replicas*idx)+_rank]
+                for idx in range( len(li_chunked_idxs)//self.num_replicas ) ]
+                for _rank in range(self.num_replicas)]
 
-        # shuffle each processes subllist in the same order to optimize paralel training
-        if self.shuffle:
-            _ = list(zip(*li_li_chunked_idxs))
-            random.Random(self.seed+self.epoch).shuffle(_)
-            # unpacking into worker size length list
-            li_li_chunked_idxs = list(zip(*_))
+            # shuffle each processes subllist in the same order to optimize paralel training        
+            if self.shuffle:
+                _ = list(zip(*li_li_chunked_idxs))
+                random.Random(self.seed+self.epoch).shuffle(_)
+                # unpacking into worker size length list
+                li_li_chunked_idxs = list(zip(*_))
+
+        elif self.static_graph_optim:
+            #We want to reduce the number of times the computational graph is redrawn on each core
+            # so we want each core to work on a sequence of datums with similar overall size
+            # we re-introduce randomness by making sure each core works on a different set of sizes 
+
+            # if there are  M chunks (batches): ordered so chunk m has smaller elements than chunk m+1
+            # sublist n will contain the nth set of  (M/N) chunks (batches)
+            # Extension: divs parameter:
+                # sublit n gets the 1st (M/N)/div smallest batches 
+                #                           and the div+1 smallest batch
+                #                           and then 2*div + 1 smallest batch ...
+                #                              
+
+            subli_len = len(li_chunked_idxs) // self.num_replicas
+            divs = 20
+            subli_len = subli_len // divs
+
+            li_li_li_chunked_idxs = [
+                [li_chunked_idxs[ (d+1)*(_rank*(subli_len)):(d+1)*(_rank+1)*(subli_len)] for d in range(divs) ]
+                for _rank in range(self.num_replicas)
+            ] # Each sublist i contains div lists. each of these div lists, contain a section of the batches to be passed to core i
+                # Each div lists has a datums of a similar size
+
+            # shuffle each processes subllist in the same order to optimize paralel training        
+            if self.shuffle:
+                _ = list(zip(*li_li_li_chunked_idxs))
+                random.Random(self.seed+self.epoch).shuffle(_)
+                # unpacking into worker size length list
+                li_li_li_chunked_idxs = list(zip(*_))
+            
+            li_li_chunked_idxs = [ sum(li,[]) for li in li_li_li_chunked_idxs ]
 
         self.li_li_chunked_idxs = li_li_chunked_idxs
 
+        # stay the same
+
         # Getting max sizes for rst and key_phrase in each chunk
         li_li_chunk_rst_len = [[np.take(np_rst_lens, idxs).max() for idxs in li_chunked_idxs]
-                                    for li_chunked_idxs in li_li_chunked_idxs]
-        li_li_chunk_key_phrase_len = [[
-            np.take(np_key_phrase_lens, idxs).max()
-            for idxs in li_chunked_idxs] for li_chunked_idxs in li_li_chunked_idxs]
+                                    for li_chunked_idxs in self.li_li_chunked_idxs]
+        
+        li_li_chunk_key_phrase_len = [[ np.take(np_key_phrase_lens, idxs).max() for idxs in li_chunked_idxs] 
+            for li_chunked_idxs in self.li_li_chunked_idxs]
+        
+        li_li_chunk_text_len = [[ np.take(np_txt_lens, idxs).max() for idxs in li_chunked_idxs] 
+            for li_chunked_idxs in self.li_li_chunked_idxs]
         
                     
         #Updating the max_len_rst and max_len_keyphrase 
-        for (li_chunked_idxs, li_chunk_rst_len, li_chunk_key_phrase_len) in zip(li_li_chunked_idxs, li_li_chunk_rst_len, li_li_chunk_key_phrase_len):
+        for (li_chunked_idxs, li_chunk_rst_len, li_chunk_key_phrase_len, li_chunk_text_len) in zip(self.li_li_chunked_idxs, li_li_chunk_rst_len, li_li_chunk_key_phrase_len, li_li_chunk_text_len):
             # iterating through chunk_idx, data_idxs enumerate(self.li_chunked):
 
-            for chunk_idx, data_idxs in enumerate(li_chunked_idxs):
+            for idx, data_idxs in enumerate(li_chunked_idxs):
 
                 for data_idx in data_idxs:
                     dataset_idx = bisect.bisect_right(
@@ -1358,8 +1425,10 @@ class SizedOrderedDistributedBatchSampler(Sampler[List[int]]):
                         sample_idx = data_idx - \
                             self.data_source.cumulative_sizes[dataset_idx - 1]
 
-                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = li_chunk_rst_len[chunk_idx]
-                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = li_chunk_key_phrase_len[chunk_idx]
+                    self.data_source.datasets[dataset_idx].rst_len[sample_idx] = li_chunk_rst_len[idx]
+                    self.data_source.datasets[dataset_idx].key_phrase_len[sample_idx] = li_chunk_key_phrase_len[idx]
+                    self.data_source.datasets[dataset_idx].text_len[sample_idx] = li_chunk_text_len[idx]
+
 
 #endregion
 
@@ -1526,7 +1595,6 @@ def __parse_leaves(tree_leaves ):
 #endregion
 
 #region generation
-
 class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
     r"""
     :class:`transformers.LogitsProcessor` that enforces no repetition of encoder input ids n-grams for the decoder ids.
@@ -1542,8 +1610,7 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
     def __init__(self, key_phrase_ids, key_phrase_start_id, eos_token_id,**kwargs):
         self.batch_size = key_phrase_ids.shape[0]  
         unbatched_key_phrase_ids = torch.unbind(key_phrase_ids, dim=0)
-        # self.tok = kwargs.get('tokenizer',None)
-        
+                
         unbatched_kpstart_pos = [ 
                                   torch.cat( [
                                                 ( kps ==key_phrase_start_id ).nonzero(as_tuple=False),
@@ -1559,8 +1626,8 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
                                                     kpids[end_idx] ==eos_token_id )  ] 
                                         
                                         for kpids, kpstart_pos in zip( unbatched_key_phrase_ids, unbatched_kpstart_pos) ]
-                # splitting on the <kp> or  <|kp|> token
-        self.max_ngram_size = max( len(ids) for ids in self.unbatched_key_phrase_ids )     
+        # splitting on the <kp> or  <|kp|> token
+        self.max_ngram_size = max( len(ids) for ids in sum( self.unbatched_key_phrase_ids, [] ) )     
         
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         
@@ -1582,7 +1649,163 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
             for kp_ids in self.unbatched_key_phrase_ids[idx//num_beams]:
                 
                 if any( torch.equal(kp_ids,input_ids[idx][s:s+len(kp_ids)]) for s in range(0,len(input_ids[idx])-len(kp_ids)+1) ):
-                    ngrams[ tuple(kp_ids[:-1].tolist()) ].extend( kp_ids[-1:].tolist() )
+                    ngrams[ tuple(kp_ids[:-1].tolist()) ].extend( kp_ids[-1:].tolist() ) 
+                    # map. keys hold up to the pneultimate tokens, value is the final token from a keyphrase that has already been written
+                    # thus we match on the key and check for the value not occuring as the next token in generated text
+                    
+            generated_kps_ids.append(ngrams)
+        
+        #Here we check for banned tokens for every ngram size  
+        banned_batch_tokens = [
+                sum([ 
+                        _get_generated_ngrams(generated_kps_ids[hypo_idx], input_ids[hypo_idx], ngram_size, cur_len)
+                            for ngram_size in range(1, self.max_ngram_size)]    
+                    ,[])
+                    for hypo_idx in range(num_hypos)
+                    ]
+        
+        for i, banned_tokens in enumerate(banned_batch_tokens):
+            scores[i, banned_tokens] = -float("inf")
+
+        return scores
+
+
+        
+class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
+    r"""
+    :class:`transformers.LogitsProcessor` that enforces no repetition of encoder input ids n-grams for the decoder ids.
+    See `ParlAI <https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/torch_generator_agent.py#L1350>`__.
+    Args:
+        encoder_ngram_size (:obj:`int`):
+            All ngrams of size :obj:`ngram_size` can only occur within the encoder input ids.
+        encoder_input_ids (:obj:`int`):
+            The encoder_input_ids that should not be repeated within the decoder ids.
+        key_phrase_ids (:list : list tensors) a list of tensors on the same device as 
+    """
+
+    #Class 1) Extract each word from KeyPhrase set (break phrases up). 
+            #  Remove small words like an, but, because e.g. conjuctions
+            #  During generation, if a key subphrase appears in the text, within the previous sentence then do not allow it to be remade
+                # Importantly even block the generation of its first token
+
+    def __init__(self, key_phrase_ids, key_phrase_start_id, eos_token_id, tokenizer, span=10 ,**kwargs):
+        
+        self.batch_size = key_phrase_ids.shape[0]  
+        self.span = torch.as_tensor([10], dtype=torch.long, device=key_phrase_ids.device)
+        self.tokenizer =  tokenizer
+
+        unbatched_key_phrase_ids = torch.unbind(key_phrase_ids, dim=0)
+
+        #TODO: Getting a BatchEncoding object which provides a word_ids function to identify subwords within the kps
+        unbatched_kpstrings = [ tokenizer.decode( kps ) for kps in unbatched_key_phrase_ids ]
+        
+        # Remove stop words from 
+        stop_words = nltk.corpus.stopwords.words('english') + [w.capitalize() for w in nltk.corpus.stopwords.words('english') ]
+        
+        stopwords_dict = Counter(stop_words)
+            # Fastest way to remove stop words in python
+            # https://stackoverflow.com/questions/19560498/faster-way-to-remove-stop-words-in-python
+        unbatched_kpsstrings_exstopwords = [
+            ' '.join([word for word in text.split() if word not in stopwords_dict])
+            for text in unbatched_kpstrings
+        ]
+
+        #removing kp start token
+        unbatched_kpsstrings_exstopwords = [ text.replace(tokenizer.keyphrase_start_token, '') for text in unbatched_kpsstrings_exstopwords ]
+        
+        # removing duplicate words
+        unbatched_kpsstrings_exstopwords = [
+            ' '.join(OrderedDict.fromkeys(text.split()))
+
+            for text in unbatched_kpsstrings_exstopwords
+        ]
+
+        # Get batch encoding objects excl. stop words
+        unbatched_batchencodings = [
+            tokenizer( kps_string) for kps_string in unbatched_kpsstrings_exstopwords
+        ]
+
+        #Returns a list of token spans for each batch
+        # token span captures the start and end of each word
+        unbatched_kw_tokenspans = [
+            
+            [ batchenc.word_to_tokens(idx) for idx in range( max( batchenc.words() ) ) ]
+
+            for batchenc in unbatched_batchencodings
+        ]
+
+        # For each batchenc, Retreiving specific ids relating to each kw
+
+        self.unbatched_key_words_ids = [
+            [ torch.as_tensor( batchenc['input_ids'][ ts.start:ts.end ], dtype=torch.long, device=key_phrase_ids.device) for ts in li_ts ]
+                
+                for batchenc, li_ts in zip( unbatched_batchencodings, unbatched_kw_tokenspans)
+        ]
+
+
+        self.max_ngram_size = max( len(ids) for ids in sum( self.unbatched_key_words_ids, [] ) )     
+        
+        self.sentence_marker_id = torch.as_tensor( tokenizer.encode("."), dtype=torch.long, device=key_phrase_ids.device)
+        
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        
+        # B x num_beams
+        num_hypos = scores.shape[0]
+        num_beams = num_hypos // self.batch_size
+        cur_len = input_ids.shape[-1]
+        input_ids = input_ids.clone()
+        
+        #Here we create a temporary kp_ngrams_mentioned
+            # We only block kps if they have been mentioned in the text
+            # This should be a list of dictionaries
+            # One for each batch size
+            # each dictionary contains keys=key_phrase excl final token values=list of final tokens of key_phrases 
+        
+            #Edit we now change it to only consider kws that have been mentioned in the previous sentence.
+            # This is because sub-parts of a keyphrase may appear more than  once
+
+        #Edit input_ids to only consider the prev sentence or prev n tokens
+        # Detect the index of a sentence ending punctuation marker. 
+            # If this exists then set this position as posx
+            
+            # If this doesn't exists then default to set a position up to 10 prev tokens as posx
+        
+        # Replace all tokens before posx with the pad token. Then allow code to continue
+        
+        
+        if self.span.device != input_ids.device:
+            self.span = self.span.to(input_ids.device)
+            self.sentence_marker_id = self.sentence_marker_id.to(input_ids.device)
+
+        
+        for idx in range(num_hypos):
+            # Detecting position from which we will mask all prior tokens
+            prev_sentence_marker_pos = torch.nonzero( input_ids[idx].eq( self.sentence_marker_id), as_tuple=True )[0]
+            
+            if len(prev_sentence_marker_pos) > 0 :
+                prev_sentence_marker_pos = prev_sentence_marker_pos[-1]
+            
+                # Ensuring its a minimum of n spaces back
+                idx_implied_by_span = torch.clamp_min( input_ids[idx].shape[-1]-self.span, 0)
+                idx_mask = torch.minimum(prev_sentence_marker_pos, idx_implied_by_span) 
+                
+            else: # no sentence markers in text
+                idx_mask = torch.clamp_min( input_ids[idx].shape[-1]-self.span , 0 )
+
+            #Then masking all words before this position
+            input_ids[idx][:idx_mask] = self.tokenizer.pad_token_id
+            
+
+        generated_kps_ids = []
+        for idx in range(num_hypos):
+            ngrams = collections.defaultdict(list)
+            
+            for kp_ids in self.unbatched_key_words_ids[idx//num_beams]:
+                
+                if any( torch.equal(kp_ids,input_ids[idx][s:s+len(kp_ids)]) for s in range(0,len(input_ids[idx])-len(kp_ids)+1) ):
+                    ngrams[ tuple(kp_ids[:-1].tolist()) ].extend( kp_ids[-1:].tolist() ) 
+                    # map. keys hold up to the pneultimate tokens, value is the final token from a keyphrase that has already been written
+                    # thus we match on the key and check for the value not occuring as the next token in generated text
                     
             generated_kps_ids.append(ngrams)
         
@@ -1602,11 +1825,11 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
 
 #endregion
 
-# region Degenerate Losses Mixin
+#region Degenerate Losses Mixin
 class DegenerateLossMixin():
 
 
-    def _compute_token_level_unlikelihood_loss(self, tgt_log_probs, target_tokens, kp_cands, tkn_pad_idx=-100, step_i=0):
+    def _compute_token_level_unlikelihood_loss(self, lm_logits, target, kp_cands, tkn_pad_idx=-100):
         #https://github.com/BorealisAI/keyphrase-generation/blob/c65c45938f6056b590e89fbc3186ebe8eb1c136a/keyphrase_generation/models/copy_seq2seq_attn.py#L462
         
         """
@@ -1615,106 +1838,155 @@ class DegenerateLossMixin():
         - which forms the negative list at that time step
         - loss is calculated by penalizing the probability of predicting these words present the negative candidate list
         """
-        #HERE
-        #TODO: 
-            # Code can be kept the same for Context
-            # But for keywords, we can't simply look at the last n tokens since key phrases have <kp> tokens in between
-            # M1: pass kp_cands to this method.
-            # Furthermore, must remember to mask over the RST section. 
-                # One quick way to do this is based on the target_tokens
-                # the RST section responds to any section that has -100 as the index
 
-        #TODO: Might be best to have key phrase tokens simply passed in, ignoring the <kp>
+        # lm_logits is Collapsed it to a 2d tensor:
+        batch_size, max_tgt_len, tgt_vocab_size = lm_logits.size() #[batch_size , max_tgt_len , tgt_vocab_size]
+        lm_logits = lm_logits.view(-1, tgt_vocab_size) #[(batch_size * max_tgt_len) , tgt_vocab_size]
 
-        # tgt_log_probs is [batch_size , max_tgt_len , tgt_vocab_size]
-        # Collapse it to a 2d tensor:
-        # to get tensor of dim [(batch_size * max_tgt_len) x tgt_vocab_size]
-        batch_size, max_tgt_len, tgt_vocab_size = tgt_log_probs.size()
-        tgt_log_probs = tgt_log_probs.view(-1, tgt_log_probs.size(-1))
+        # get a zero matrix of the same size size as lm_logits ---> [(batch_size * max_tgt_len), tgt_vocab_size]
+        # for each row, fill 1s in the positions that correspond to the candidate token ids
+        # negative_targets ---> is a k-hot vector with the token idx of the candidates as 1
+        negative_targets = torch.zeros_like(
+                        lm_logits,  requires_grad=False)
+
+        # Get the context candidates
+        ctx_cands = target.unsqueeze(1).expand(
+            target.size(0), target.size(1), target.size(1)) #[batch_size , max_tgt_len , max_tgt_len]
+
+        # removing all negative indexes from target. replacing with ctx_cands
+        ctx_cands = ctx_cands.masked_fill( ctx_cands<0, tkn_pad_idx ) #[batch_size , max_tgt_len , max_tgt_len]
+
+        # get the lower triangular matrix, with padding tokens inserted elsewhere
+        # Each word has following candidates: all words before it in the sentence
+        ctx_cands = ctx_cands.tril(-1) + torch.full_like(ctx_cands,tkn_pad_idx).triu() #[batch_size , max_tgt_len , max_tgt_len]
+
+        # -- taken from https://github.com/facebookresearch/unlikelihood_training/blob/master/custom/candidate_penalty_ce_loss.py
+
+        # Don't include the target for that timestep as a negative target
+        # i.e., remove it if it was a part of the candidate list
+        ctx_cands = ctx_cands.masked_fill(
+            ctx_cands == target.unsqueeze(2), tkn_pad_idx)
+
+        if self.config.prev_context_len > 0:
+            
+            # to consider only a pre-specified previous context size
+            # len(mask_generator) == max_tgt_len
+            mask_generator = [0] + [1]*self.config.prev_context_len + \
+                [0]*(max_tgt_len-self.config.prev_context_len-1)
+            # https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.linalg.toeplitz.html
+            mask = toeplitz(mask_generator, np.zeros_like(mask_generator))
+            # with the above mask, only the prev n words in the context are considered
+            mask = torch.tensor(mask, dtype=ctx_cands.dtype,
+                                requires_grad=False, device=ctx_cands.device)
+            # create the same mask for the entire batch
+            mask = mask.unsqueeze(0).expand(
+                batch_size, max_tgt_len, max_tgt_len)
+
+            # incorporate the previous-N-context-only mask
+            ctx_cands = mask * ctx_cands
+
+        # reshape to [(batch_size * max_tgt_len), max_tgt_len]
+        ctx_cands = ctx_cands.view(-1, ctx_cands.size(-1))
+
+        negative_targets.scatter_(1, ctx_cands, 1) 
         
-        with torch.no_grad():
-            # The first timestep is just the @START@ token, which is not included in the likelihoods
-            # i.e., we do not ask the model to predict the @START@ token
-            # target = target_tokens[:, (step_i+1):] #TODO: check this sequence hasn't already been shifted
-            target= target_tokens
+        # adjusting for tokens in the keyphrase set of tokens
+        #Don't include to kp_cands if it is acc the target at this timestep
+        kp_cands = kp_cands.unsqueeze(1).expand( kp_cands.size(0), target.size(1), kp_cands.size(1))
+        kp_cands = kp_cands.masked_fill(kp_cands == target.unsqueeze(2), tkn_pad_idx)
+        kp_cands = kp_cands.view(-1, kp_cands.size(-1))
+        negative_targets.scatter_(1, kp_cands, 1) 
 
-            # Get the context candidates
-            ctx_cands = target.unsqueeze(1).expand(
-                target.size(0), target.size(1), target.size(1))
-
-            # removing all negative indexes from target
-            ctx_cands = ctx_cands.masked_fill( ctx_cands<0, tkn_pad_idx )
-
-            # get the lower triangular matrix
-            # ctx_cands = (ctx_cands.tril(-1) + tkn_pad_idx)
-            ctx_cands = ctx_cands.tril(-1) + torch.full_like(ctx_cands,tkn_pad_idx).triu()
-
-            # what is the point of these 2 lines (?)
-            # -- taken from https://github.com/facebookresearch/unlikelihood_training/blob/master/custom/candidate_penalty_ce_loss.py
-            # NOTE: this line below assumes padding index si 1
-            # ctx_cands_ = ctx_cands_ * ctx_cands_.triu()
-            # ctx_cands = ctx_cands.tril(-1) + ctx_cands_
-
-            # Don't include the target for that timestep as a negative target
-            # i.e., remove it if it was a part of the candidate list
-            ctx_cands = ctx_cands.masked_fill(
-                ctx_cands == target.unsqueeze(2), tkn_pad_idx)
-
-            if self.config.prev_context_len > 0:
-                
-                # to consider only a pre-specified previous context size
-                # len(mask_generator) == max_tgt_len
-                mask_generator = [0] + [1]*self.config.prev_context_len + \
-                    [0]*(max_tgt_len-self.config.prev_context_len-1)
-                # https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.linalg.toeplitz.html
-                mask = toeplitz(mask_generator, np.zeros_like(mask_generator))
-                # with the above mask, only the prev n words in the context are considered
-                mask = torch.tensor(mask, dtype=ctx_cands.dtype,
-                                    requires_grad=False, device=ctx_cands.device)
-                # create the same mask for the entire batch
-                mask = mask.unsqueeze(0).expand(
-                    batch_size, max_tgt_len, max_tgt_len)
-
-                # incorporate the previous-N-context-only mask
-                ctx_cands = mask * ctx_cands
-
-            # reshape to [(batch_size * max_tgt_len), max_tgt_len]
-            ctx_cands = ctx_cands.view(-1, ctx_cands.size(-1))
-
-            # get a zero matrix of the same size size as tgt_log_probs ---> [(batch_size * max_tgt_len), tgt_vocab_size]
-            # for each row, fill 1s in the positions that correspond to the candidate token ids
-            # negative_targets ---> is a k-hot vector with the token idx of the candidates as 1
-            negative_targets = torch.zeros_like(
-                tgt_log_probs).scatter_(1, ctx_cands, 1)
-            
-            # adjusting for tokens in the keyphrase set of tokens
-            #Don't include to kp_cands if it is acc the target at this timestep
-            kp_cands = kp_cands.unsqueeze(1).expand( 
-                kp_cands.size(0), target.size(1), kp_cands.size(1))
-            
-            kp_cands = kp_cands.masked_fill(
-                kp_cands == target.unsqueeze(2), tkn_pad_idx)
-
-            kp_cands = kp_cands.view(-1, kp_cands.size(-1))
-
-            negative_targets.scatter_(1, kp_cands, 1)
-
-            #ensuring pad token is not included in negative targets
-            negative_targets[:, tkn_pad_idx]= 0
-
+        #ensuring pad token is not included in negative targets
+        negative_targets[:, tkn_pad_idx] = 0 
+        
         # - compute loss
-        # tgt_log_probs refer to log of probabilities, exp() of it gives the actual prob. values
-        # [(batch_size * max_tgt_len) x tgt_vocab_size]
-        one_minus_probs = torch.clamp((1.0 - tgt_log_probs.exp()), min=1e-6)
+        # lm_logits refer to log of probabilities, exp() of it gives the actual prob. values
+        lm_logits_exp = lm_logits.clamp(max=10.0, min=-10.0).exp()
+        one_minus_probs = torch.clamp( 1.0 - lm_logits_exp/logsumexp(lm_logits, dim=-1 ,keepdim=True), min=6.2e-5)
+        
+        loss = ( -torch.log(one_minus_probs) )*negative_targets # [(batch_size x max_tgt_len) , tgt_vocab_size]
+        loss = loss.view(batch_size, max_tgt_len, tgt_vocab_size)
+        
+        
+        # only keep the losses that aren't masked by -100 in the target
+        #TODO - remove the use of a mask for TPU
+        mask =   ~target.eq(-100)
+        mask = mask.unsqueeze(-1).expand(batch_size, max_tgt_len, tgt_vocab_size)
+        
+        # loss = torch.masked_select(loss, mask)
+        loss = loss[mask]
 
-        # only keep the probabilities at the negative token indices
-        # [(batch_size * max_tgt_len) x tgt_vocab_size]
-        loss = -torch.log(one_minus_probs)*negative_targets
-
-        loss = loss.sum(-1)/negative_targets.sum(-1) # Summing over each training datum
-        loss = loss.reshape(batch_size, max_tgt_len)
-        loss = loss.sum(-1).mean() #Sum within each batch then average across the batch
+        loss =  loss.mean()
 
         return loss
 
+#endregion
+
+# #region pytorch patching and lightning
+class TQDMProgressBar_1(TQDMProgressBar):
+    def __init__(self) -> None:
+        super().__init__()
+
+
+    def get_metrics(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> Dict[str, Union[int, str]]:
+        items = super().get_metrics(trainer, pl_module)
+        
+        if pl_module.debugging:
+            for k in list(items.keys()):
+                if "grad_2.0" in k: items.pop(k)
+        return items
+
+def _format_checkpoint_name(
+    cls,
+    filename: Optional[str],
+    metrics: Dict[str, _METRIC],
+    prefix: str = "",
+    auto_insert_metric_name: bool = True,
+    ) -> str:
+    if not filename:
+        # filename is not set, use default name
+        filename = "{epoch}" + cls.CHECKPOINT_JOIN_CHAR + "{step}"
+
+    # check and parse user passed keys in the string
+    groups = re.findall(r"(\{.*?)[:\}]", filename)
+    if len(groups) >= 0:
+        for group in groups:
+            name = group[1:]
+
+            if auto_insert_metric_name:
+                filename = filename.replace(group, name.replace("/","_") + "={" + name)
+
+            if name not in metrics:
+                metrics[name] = 0
+        filename = filename.format(**metrics)
+
+    if prefix:
+        filename = cls.CHECKPOINT_JOIN_CHAR.join([prefix, filename])
+
+    return filename
+
+
+import torch.nn.functional as F
+
+def linear_combination(x, y, label_smoothing):
+    return label_smoothing * x + (1 - label_smoothing) * y
+
+
+def reduce_loss(loss, reduction='mean'):
+    return loss.mean() if reduction == 'mean' else loss.sum() if reduction == 'sum' else loss
+
+
+class CrossEntropyLoss(nn.Module):
+    def __init__(self, label_smoothing: float = 0.1, reduction='mean'):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, preds, target):
+        n = preds.size()[-1]
+        log_preds = F.log_softmax(preds, dim=-1)
+        loss = reduce_loss(-log_preds.sum(dim=-1), self.reduction)
+        nll = F.nll_loss(log_preds, target, reduction=self.reduction)
+        return linear_combination(loss / n, nll, self.label_smoothing)
 #endregion
