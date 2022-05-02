@@ -375,8 +375,8 @@ class RstModelMixin():
 
     li_adding = 'also, moreover, furthermore, additionally, besides, in addition'.split(', ')
     li_comparing = 'similarly, likewise, in the same way'.split(', ')
-    li_generalizing = 'on the whole, in general, broadly speaking, as a rule, in most cases'
-    li_showing_cause_effect = 'therefore, thus, consequently, hence, as a result'
+    li_generalizing = 'on the whole, in general, broadly speaking, as a rule, in most cases'.split(', ')
+    li_showing_cause_effect = 'therefore, thus, consequently, hence, as a result'.split(', ')
     li_contrasting = 'however, although, whereas, despite this fact, on one hand, on the other hand, on the contrary, still, nonetheless, instead, alternatively, in contrast, but'.split(', ')
     li_sequencing = "firstly, at first, first of all, in the first place, to begin with, in the beginning, once upon a time, secondly, thirdly, subsequently, earlier, meanwhile, later, afterwards, what's more, for a start".split(', ')
     li_emphasizing = 'above all, specially, in particular, specifically, as a matter of fact, more importantly'.split(', ')
@@ -817,7 +817,7 @@ class RstTokenizerMixin():
 class EmbeddingRstPos(nn.Module, RstTokenizerMixin):
     
     def __init__(self, max_rst_index=62, max_rst_level=12, rst_encoding_ndim=768,
-                    init_val=0.05, std=0.02):
+                    init_val=0.025, std=0.02):
         
         super(EmbeddingRstPos, self).__init__()
 
@@ -1627,7 +1627,11 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
                                         
                                         for kpids, kpstart_pos in zip( unbatched_key_phrase_ids, unbatched_kpstart_pos) ]
         # splitting on the <kp> or  <|kp|> token
-        self.max_ngram_size = max( len(ids) for ids in sum( self.unbatched_key_phrase_ids, [] ) )     
+        _ =  sum( self.unbatched_key_phrase_ids, [] )  
+        if len(_)  > 0:   
+            self.max_ngram_size = max( len(ids) for ids in _ )
+        else:
+            self.max_ngram_size = 1
         
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         
@@ -1635,6 +1639,7 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
         num_hypos = scores.shape[0]
         num_beams = num_hypos // self.batch_size
         cur_len = input_ids.shape[-1]
+        input_ids = input_ids.clone()
         
         #Here we create a temporary kp_ngrams_mentioned
             # We only block kps if they have been mentioned in the text
@@ -1665,6 +1670,11 @@ class KeyPhraseNoRepeatLogitsProcessor(LogitsProcessor):
                     ]
         
         for i, banned_tokens in enumerate(banned_batch_tokens):
+
+            # EOS/pad_token token should never appear in banned_batch_tokens
+            if self.tokenizer.pad_token_id in banned_tokens:
+                banned_tokens.remove(self.tokenizer.pad_token_id)
+
             scores[i, banned_tokens] = -float("inf")
 
         return scores
@@ -1743,7 +1753,11 @@ class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
         ]
 
 
-        self.max_ngram_size = max( len(ids) for ids in sum( self.unbatched_key_words_ids, [] ) )     
+        _ =  sum( self.unbatched_key_phrase_ids, [] )  
+        if len(_)  > 0:   
+            self.max_ngram_size = max( len(ids) for ids in _ )
+        else:
+            self.max_ngram_size = 1
         
         self.sentence_marker_id = torch.as_tensor( tokenizer.encode("."), dtype=torch.long, device=key_phrase_ids.device)
         
@@ -1780,7 +1794,7 @@ class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
         
         for idx in range(num_hypos):
             # Detecting position from which we will mask all prior tokens
-            prev_sentence_marker_pos = torch.nonzero( input_ids[idx].eq( self.sentence_marker_id), as_tuple=True )[0]
+            prev_sentence_marker_pos = torch.nonzero( input_ids[idx].eq(self.sentence_marker_id), as_tuple=True )[0]
             
             if len(prev_sentence_marker_pos) > 0 :
                 prev_sentence_marker_pos = prev_sentence_marker_pos[-1]
@@ -1809,16 +1823,22 @@ class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
                     
             generated_kps_ids.append(ngrams)
         
+        
         #Here we check for banned tokens for every ngram size  
         banned_batch_tokens = [
                 sum([ 
                         _get_generated_ngrams(generated_kps_ids[hypo_idx], input_ids[hypo_idx], ngram_size, cur_len)
-                            for ngram_size in range(1, self.max_ngram_size)]    
+                            for ngram_size in range(1, self.max_ngram_size )]    
                     ,[])
                     for hypo_idx in range(num_hypos)
                     ]
         
         for i, banned_tokens in enumerate(banned_batch_tokens):
+            # EOS/pad_token token should never appear in banned_batch_tokens
+            if self.tokenizer.pad_token_id in banned_tokens:
+                banned_tokens.remove(self.tokenizer.pad_token_id)
+            
+            # setting weight to -inf to remove prob of predicting these tokens
             scores[i, banned_tokens] = -float("inf")
 
         return scores
@@ -1829,7 +1849,7 @@ class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
 class DegenerateLossMixin():
 
 
-    def _compute_token_level_unlikelihood_loss(self, lm_logits, target, kp_cands, tkn_pad_idx=-100):
+    def _compute_token_level_unlikelihood_loss(self, lm_logits, target, kp_cands, tkn_pad_idx=-100, label_smoothing=0.0):
         #https://github.com/BorealisAI/keyphrase-generation/blob/c65c45938f6056b590e89fbc3186ebe8eb1c136a/keyphrase_generation/models/copy_seq2seq_attn.py#L462
         
         """
@@ -1916,6 +1936,10 @@ class DegenerateLossMixin():
         
         # loss = torch.masked_select(loss, mask)
         loss = loss[mask]
+
+        if label_smoothing>0.0:
+            loss = loss * (1-label_smoothing)
+
 
         loss =  loss.mean()
 

@@ -309,13 +309,14 @@ class RSTGPT2_Config(GPT2Config):
                  base_model_name='gpt2',
                  model_name="RSTGPT2",
                  scale_grad_by_freq=True,
-                 max_len_rst=36,
+                 
+                 max_rst_level=11,
                  max_len_kp=64,
                  max_len_utt=270,
                  rst_tree_aligned_attention=False,
                  rst_segment_method='None',
                  
-                 max_rst_level=11,
+                 
 
                  embed_tkn_pdrop=0.15,
                  embed_kp_pdrop=0.15,
@@ -338,8 +339,13 @@ class RSTGPT2_Config(GPT2Config):
         self.model_name = model_name
         self.scale_grad_by_freq = scale_grad_by_freq
         self.max_len_utt = max_len_utt
-        self.max_len_rst = max_len_rst
+        self.max_rst_level = max_rst_level
+        self.max_rst_pos = 2**(self.max_rst_level+1) - 1 - 1
+        self.max_len_rst = (self.max_len_utt//5) #Since each edu should be roughly 5 words long.
+                                                    # and we model the parent EDU's of leaf nodes,
+                                                    # But each tree with n leaf nodes has roughly 2n nodes overall
         self.max_len_kp = max_len_kp
+
         self.rst_tree_aligned_attention = rst_tree_aligned_attention
         self.rst_segment_method = rst_segment_method
         self.rst_rel_li = ['Attribution',
@@ -348,8 +354,7 @@ class RSTGPT2_Config(GPT2Config):
                            'Explanation', 'Joint', 'Manner-Means', 'Topic-Comment',
                            'Summary', 'Temporal', 'Topic-Change', 'same-unit', 'textual-organization']
         self.rst_ns_li = ['NN', 'NS', 'SN'] 
-        self.max_rst_level = max_rst_level
-        self.max_rst_pos = 2**(self.max_rst_level+1) - 1 - 1
+
         
 
         self.rst_added_tokens = 2
@@ -423,6 +428,7 @@ class RSTGPT2_Config(GPT2Config):
         self.max_rst_pos = 2**(self.max_rst_level+1) - 1 - 1
 
         self.pad_token_id= self.eos_token_id
+        self.max_len_rst = self.max_len_utt//5 #Since each edu should be roughly 5 words long
 
         self.pad_values = {'rst_start_token': self.eos_token_id,
                            'rst_rel': len(self.rst_rel_li),
@@ -947,8 +953,8 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
         elif not is_encoder_decoder and self.rst_tree_aligned_attention:
 
             # attention mask
-            curr_utt_len = model_kwargs.get(
-                'attention_mask').shape[1] + 1 - model_kwargs['context_rst_rstpos'].shape[1] - model_kwargs['context_kp_rstpos'].shape[1]
+            curr_utt_len = model_kwargs.get('attention_mask').shape[1] \
+                + 1 - (model_kwargs['context_rst_rstpos'].shape[1] + 1) - model_kwargs['context_kp_rstpos'].shape[1]
 
             attention_mask = self.tokenizer.prepare_attention_mask(
                 curr_edu_pos=outputs['curr_edu_pos'],
@@ -974,8 +980,7 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
                 f'./models/{model_name}/version_{model_version}/checkpoints')
 
             mparams = {k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                'base_model_name', 'model_name', 'max_len_kp',
-                'max_len_rst', 'max_len_utt',
+                'base_model_name', 'model_name', 'max_len_kp', 'max_len_utt','max_rst_level',
                 'scale_grad_by_freq', 'rst_tree_aligned_attention']}
 
             for key, value in mparams_new.items():
@@ -1017,7 +1022,6 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
                             default='gpt2', required=False)
         parser.add_argument('--model_name', default='RSTGPT2', required=False)
         parser.add_argument('--max_len_utt', type=int, default=270)
-        parser.add_argument('--max_len_rst', type=int, default=90, help="we reccomend the max_len_rst be set to 2*(max_len_utt/5). This is based on 1) avg min number of words in an edu=5, 2) For a binary tree with l leave edus, the overall tree has 2l nodes.")
         parser.add_argument('--max_len_kp', type=int, default=64)
         parser.add_argument('--scale_grad_by_freq', action='store_true', default=True,
                             help="Inverse the gradients to the emebdding layers based on the occurence of each index in the minibatch ")
@@ -1061,9 +1065,10 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
     # Setting up context lengths
     max_len_utt = 240
-    max_len_rst = int( (max_len_utt/6) *2)
+    max_rst_level = 22
+    max_len_rst = (max_len_utt//5)
     max_len_kp = 64
-    max_rst_pos = 4094 #Binary tree height
+    max_rst_pos = 2**(max_rst_level+1) - 1 - 1
 
     special_token_count = 2
 
@@ -1074,6 +1079,7 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
         
         super().__init__( *args, **kwargs)
         
+        self.max_rst_level = kwargs.get('max_rst_level', self.max_rst_level)
         self.max_len_rst = kwargs.get('max_len_rst', self.max_len_rst)
         self.max_len_kp = kwargs.get('max_len_kp',self.max_len_kp)
         self.max_len_utt = kwargs.get('max_len_utt', self.max_len_utt)
@@ -1677,9 +1683,8 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
                         pos.item()) + [pos.item()], device=prev_mask.device)
                     
                     pos_tree_aligned_attn_rst = (
-                        context_rst_rstpos[..., None] == li_parent_tree).any(-1).squeeze()
+                        context_rst_rstpos[..., None] == li_parent_tree).any(-1).squeeze() 
 
-                    #TODO: This method disregards the <|kp|> token that starts generation
                     pos_tree_aligned_attn_kp = (
                         context_kp_rstpos[..., None] == li_parent_tree).any(-1).squeeze()
                     
@@ -1694,12 +1699,12 @@ class RSTTokenizer(GPT2TokenizerFast, utils.EffeciencyMixin, utils.RstTokenizerM
 
                 # next word should attend to all previous utterance words under causal attention
                 attention_mask = torch.cat((attention_mask_context, attention_mask_context.new_ones(
-                    (attention_mask_context.shape[0], 1, curr_utt_len))), axis=-1)
+                    (attention_mask_context.shape[0], 1, curr_utt_len))), axis=-1) # ( bs , 1, context_rst_rstpos + context_kp_rstpos + curr_utt_len)
 
                 # appending to new attention_mask if it exists otherwise just return the attention
-                prev_mask = torch.nn.functional.pad(prev_mask, (0, 1), value=0)
+                prev_mask = torch.nn.functional.pad(prev_mask, (0, 1), value=0) # ( bs , context + curr_utt_len  , context + curr_utt_len + 1 )
 
-                attention_mask = torch.cat([prev_mask, attention_mask], axis=1)
+                attention_mask = torch.cat([prev_mask, attention_mask], axis=1) # (bs, context + curr_utt_len , context + curr_utt_len ) (bs, 1,  )
 
         return attention_mask
 
@@ -1776,7 +1781,6 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                  tpu_nodes=None,
                  tpu_cores=None,
                  static_graph_optim = False,
-                 learning_rate=1e-4,
                  warmup_proportion=0.1,
                  workers=0,
                  mode='train_new',
@@ -1862,7 +1866,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             else:
                 self.max_epochs = max_epochs
                 self.warmup_proportion = warmup_proportion
-                self.learning_rate = learning_rate
+                
 
                 self.create_data_loaders(['train', 'val', 'inference'])
                 self.tokenizer.inference_mode = True
@@ -1891,7 +1895,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
         parser.add_argument('--accumulate_grad_batches', default=1, type=int)
         parser.add_argument('--batch_size', default=20, type=int)
 
-        parser.add_argument('--learning_rate', default=4e-3, type=float)
+        
         parser.add_argument('--workers', default=6,
                             type=int) 
         
@@ -1945,7 +1949,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             # restore/update param files from the checkpoint
             if "hyper_parameters" in checkpoint.keys() and tparams['override'] == False:
                 tparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'learning_rate', 'splits', 'tag', 'optimizer']})
+                     'splits', 'tag', 'optimizer']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
                     'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_kp','max_rst_level','ull_loss_tkn',
@@ -1972,10 +1976,10 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             # restore/update param files from the checkpoint
             try:
                 tparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'learning_rate', 'precision']})
+                    'precision']})
 
                 mparams.update({k: v for k, v in checkpoint['hyper_parameters'].items() if k in [
-                    'base_model_name', 'model_name', 'max_len_utt', 'max_len_rst', 'max_len_kp']})
+                    'base_model_name', 'model_name', 'max_len_utt', 'max_rst_level', 'max_len_kp']})
             except KeyError:
                 pass
 
@@ -2059,7 +2063,7 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                                                     val_check_interval=tparams['val_check_interval'],
                                                     limit_train_batches=2000 if debugging else 1.0,
                                                     limit_val_batches=40 if debugging else 1.0,
-                                                    log_every_n_steps= 10 if debugging else 500,
+                                                    log_every_n_steps= 10 if debugging else 200,
                                                     replace_sampler_ddp=False,
                                                     num_sanity_val_steps=2 if debugging else 0,
 
@@ -2309,7 +2313,8 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
                     decoded_text = self.model.generate_plus(
                         encoded_input, generation_params, self.tokenizer)
                 except Exception as e:
-                    decoded_text = "ERROR"
+                    # decoded_text = "ERROR"
+                    decoded_text = traceback.format_exc()
                     
 
                 datum = {
@@ -2374,7 +2379,9 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
     
         optimizer = Adafactor(self.model.parameters(), scale_parameter=True,
                                 relative_step=True, warmup_init=True, lr=None,
-                                weight_decay=0.01) # Works better for small models
+                                weight_decay=0.005,
+                                clip_threshold=0.5 if self.units * self.nodes >1 else 1.0
+                                ) # Works better for small models
 
         # optimizer = Adafactor(self.model.parameters(), scale_parameter=False,
         #                         relative_step=False, warmup_init=False, lr=1e-3,
@@ -2389,11 +2396,13 @@ class RSTGPT2_TrainingModule(pl.LightningModule):
             optimizer.load_state_dict(optimizer_states[0])
    
         
-        return {'optimizer': optimizer, "frequency": "1", "monitor": "val_loss"}
+        return {'optimizer': optimizer, "frequency": "1",
+                    #  "monitor": "val_loss"
+                }
         
     def return_params(self):
         params = {}
-        keys = ['batch_size', 'accumulate_grad_batches', 'learning_rate', 'max_epochs', 'dir_data','tag']
+        keys = ['batch_size', 'accumulate_grad_batches', 'max_epochs', 'dir_data','tag']
 
         params = {
             k: self.__dict__[k] for k in keys if k in self.__dict__.keys()
@@ -2771,7 +2780,7 @@ if __name__ == '__main__':
 
     if tparams.gpus not in [0, 1]:
         os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] =  '6536' #'65502'
+        os.environ['MASTER_PORT'] =  '6537' #'65502'
 
     try:
         main(vars(tparams), vars(mparams))
@@ -2780,8 +2789,8 @@ if __name__ == '__main__':
 
 
 ##New codes
-#  CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --max_rst_level 22 --label_smoothing 0.1 --batch_size 8 --version 31 --workers 8 --max_len_utt 272 --max_len_rst 32 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss"
-#  CUDA_VISIBLE_DEVICES=0 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 1  --batch_size 12 --version 32 --workers 6 --max_len_utt 272 --max_len_rst 32 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention" --max_rst_level 22
+#  CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --label_smoothing 0.0 --batch_size 8 --version 33 --workers 8 --max_len_utt 272 --max_rst_level 22 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss"
+#  CUDA_VISIBLE_DEVICES=3,4 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --label_smoothing 0.0 --batch_size 8 --version 34 --workers 8 --max_len_utt 272 --max_rst_level 22 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention"
 
-# python3 train_RSTGPT.py --tpu_cores 1 --tpu_nodes 1 --static_graph_optim  --batch_size 12 --version 41 --workers 6 --max_len_utt 272 --max_len_rst 64 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss" --max_rst_level 22 --label_smoothing 0.1
+# python3 train_RSTGPT.py --tpu_cores 1 --tpu_nodes 1 --static_graph_optim  --batch_size 12 --version 41 --workers 6 --max_len_utt 272 --max_rst_level 64 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss" --max_rst_level 22 --label_smoothing 0.1
 # python3 train_RSTGPT.py --tpu_cores 1 --tpu_nodes 1 --static_graph_optim  --batch_size 12 --version 42 --workers 6 --max_len_utt 272 --max_len_rst 64 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention" --max_rst_level 22 --label_smoothing 0.0
