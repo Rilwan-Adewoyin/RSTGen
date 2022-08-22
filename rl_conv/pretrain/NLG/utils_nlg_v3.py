@@ -1849,7 +1849,7 @@ class KeySubPhraseNoRepeatWithinSpanLogitsProcessor(LogitsProcessor):
 class DegenerateLossMixin():
 
 
-    def _compute_token_level_unlikelihood_loss(self, lm_logits, target, kp_cands, tkn_pad_idx=-100, label_smoothing=0.0):
+    def _compute_token_level_unlikelihood_loss_context(self, lm_logits, target, kp_cands, tkn_pad_idx=-100, label_smoothing=0.0, prev_context_len=10, loss_scale=None):
         #https://github.com/BorealisAI/keyphrase-generation/blob/c65c45938f6056b590e89fbc3186ebe8eb1c136a/keyphrase_generation/models/copy_seq2seq_attn.py#L462
         
         """
@@ -1887,12 +1887,12 @@ class DegenerateLossMixin():
         ctx_cands = ctx_cands.masked_fill(
             ctx_cands == target.unsqueeze(2), tkn_pad_idx)
 
-        if self.config.prev_context_len > 0:
+        if prev_context_len > 0:
             
             # to consider only a pre-specified previous context size
             # len(mask_generator) == max_tgt_len
-            mask_generator = [0] + [1]*self.config.prev_context_len + \
-                [0]*(max_tgt_len-self.config.prev_context_len-1)
+            mask_generator = [0] + [1]*prev_context_len + [0]*(max_tgt_len-prev_context_len-1)
+
             # https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.linalg.toeplitz.html
             mask = toeplitz(mask_generator, np.zeros_like(mask_generator))
             # with the above mask, only the prev n words in the context are considered
@@ -1910,6 +1910,66 @@ class DegenerateLossMixin():
 
         negative_targets.scatter_(1, ctx_cands, 1) 
         
+        # adjusting for tokens in the keyphrase set of tokens
+        # Don't include kp_cands if it is acc the target at this timestep
+        # Don't include kp_cands at all, since the ul_loss_kp covers this case (changed final value in scatter_ to 0)
+        kp_cands = kp_cands.unsqueeze(1).expand( kp_cands.size(0), target.size(1), kp_cands.size(1))
+        kp_cands = kp_cands.masked_fill(kp_cands == target.unsqueeze(2), tkn_pad_idx)
+        kp_cands = kp_cands.view(-1, kp_cands.size(-1))
+        negative_targets.scatter_(1, kp_cands, 0) 
+
+        #ensuring pad token is not included in negative targets
+        negative_targets[:, tkn_pad_idx] = 0 
+        
+        # - compute loss
+        # lm_logits refer to log of probabilities, exp() of it gives the actual prob. values
+        lm_logits_exp = lm_logits.clamp(max=10.0, min=-10.0).exp()
+        one_minus_probs = torch.clamp( 1.0 - lm_logits_exp/logsumexp(lm_logits, dim=-1 ,keepdim=True), min=6.2e-5)
+        
+        loss = ( -torch.log(one_minus_probs) )*negative_targets # [(batch_size x max_tgt_len) , tgt_vocab_size]
+        loss = loss.view(batch_size, max_tgt_len, tgt_vocab_size)
+        
+        # scaling the loss
+        if loss_scale != None:
+            loss = loss*loss_scale
+
+        
+        # only keep the losses that aren't masked by -100 in the target
+        #TODO - remove the use of a mask for TPU
+        mask =   ~target.eq(-100)
+        mask = mask.unsqueeze(-1).expand(batch_size, max_tgt_len, tgt_vocab_size)
+        
+        # loss = torch.masked_select(loss, mask)
+        loss = loss[mask]
+
+        if label_smoothing>0.0:
+            loss = loss * (1-label_smoothing)
+
+
+        loss =  loss.mean()
+
+        return loss
+
+    def _compute_token_level_unlikelihood_loss_keyphrase(self, lm_logits, target, kp_cands, tkn_pad_idx=-100, label_smoothing=0.0):
+        #https://github.com/BorealisAI/keyphrase-generation/blob/c65c45938f6056b590e89fbc3186ebe8eb1c136a/keyphrase_generation/models/copy_seq2seq_attn.py#L462
+        
+        """
+        Calculate the token level unlikelihood loss
+        - At each time step, we look at all the words in the the ground truth from the previous time steps
+        - which forms the negative list at that time step
+        - loss is calculated by penalizing the probability of predicting these words present the negative candidate list
+        """
+
+        # lm_logits is Collapsed it to a 2d tensor:
+        batch_size, max_tgt_len, tgt_vocab_size = lm_logits.size() #[batch_size , max_tgt_len , tgt_vocab_size]
+        lm_logits = lm_logits.view(-1, tgt_vocab_size) #[(batch_size * max_tgt_len) , tgt_vocab_size]
+
+        # get a zero matrix of the same size size as lm_logits ---> [(batch_size * max_tgt_len), tgt_vocab_size]
+        # for each row, fill 1s in the positions that correspond to the candidate token ids
+        # negative_targets ---> is a k-hot vector with the token idx of the candidates as 1
+        negative_targets = torch.zeros_like(
+                        lm_logits,  requires_grad=False)
+       
         # adjusting for tokens in the keyphrase set of tokens
         #Don't include to kp_cands if it is acc the target at this timestep
         kp_cands = kp_cands.unsqueeze(1).expand( kp_cands.size(0), target.size(1), kp_cands.size(1))

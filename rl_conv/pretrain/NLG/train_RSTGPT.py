@@ -325,8 +325,9 @@ class RSTGPT2_Config(GPT2Config):
                  attn_pdrop=0.15,
                  resid_pdrop=0.15,
                  
-                 ull_loss_tkn=False,
-                 prev_context_len=None,
+                 ull_loss_kp=False,
+                 ull_weight_context_len=0,
+                 
 
                  label_smoothing=0.1,
                  **kwargs):
@@ -366,8 +367,8 @@ class RSTGPT2_Config(GPT2Config):
         self.attn_pdrop = attn_pdrop
         self.resid_pdrop = resid_pdrop
 
-        self.ull_loss_tkn = ull_loss_tkn
-        self.prev_context_len = prev_context_len
+        self.ull_loss_kp = ull_loss_kp
+        self.ull_weight_context_len = ull_weight_context_len
 
         self.label_smoothing = label_smoothing
         self.pad_token_id= self.eos_token_id
@@ -419,7 +420,7 @@ class RSTGPT2_Config(GPT2Config):
     
     def reset_params(self):
         """
-            Patch. When extending the config class with extra parameters GPT2s methodology means that at first default params are loaded into the classes init,
+            #PATCH. When extending the config class with extra parameters GPT2s methodology means that at first default params are loaded into the classes init,
             then extra params are added outside of init
 
             This raises issues for attributes which are calculated during init method. Here we recalculate those attributes
@@ -493,7 +494,17 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
         self.max_len_utt = config.max_len_utt
         self.rst_tree_aligned_attention = config.rst_tree_aligned_attention
         self.rst_segment_method = config.rst_segment_method
-        self.register_buffer( "ul_weight", torch.as_tensor([1.0], dtype=torch.float, device=self.device ) )
+        
+        
+        if self.config.ull_loss_kp:
+            self.register_buffer( "ull_weight_kp", torch.as_tensor([1],
+                     dtype=torch.float, device=self.device ) )
+
+        if self.config.ull_loss_context_len>0:
+            self.register_buffer( "ull_weight_context", torch.as_tensor([1/self.config.ull_loss_context],
+                     dtype=torch.float, device=self.device ) )
+        #TODO: here this ull_weight_contex should be 1/ull_loss_context_len but 1/seq_len for token i, i<ull_loss_context_len
+
 
         self.transformer.forward = types.MethodType(
             GPT2_forward, self.transformer)
@@ -641,17 +652,34 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
             lm_loss = self.loss_fct(
                 shift_lm_logits.view(-1, shift_lm_logits.size(-1)), shift_labels.view(-1))
 
-            if self.config.ull_loss_tkn:
+            loss = lm_loss
+
+            if self.config.ull_loss_kp:
                 
                 #Replacing the kp start tokens with pad tokens
                 kp_cands = key_phrase_ids.masked_fill( key_phrase_ids==self.tokenizer.keyphrase_start_token_id.to(key_phrase_ids.device),
                                                          self.config.pad_values['key_phrase_ids'] )
                 #kp_cands = key_phrase_ids
-                ul_loss_token = self._compute_token_level_unlikelihood_loss(    
-                                    shift_lm_logits, shift_labels, kp_cands, tkn_pad_idx=self.config.pad_values['input_ids_utt'] )
-                loss = lm_loss + self.ul_weight * ul_loss_token
-            else:
-                loss = lm_loss
+                ul_loss_kp = self._compute_token_level_unlikelihood_loss_keyphrase(    
+                                    shift_lm_logits, shift_labels, kp_cands, 
+                                    tkn_pad_idx=self.config.pad_values['input_ids_utt'] )
+
+                loss += self.ull_weight_kp * ul_loss_kp
+            
+            if self.config.ull_loss_context_len>0:
+
+                #Replacing the kp start tokens with pad tokens
+                kp_cands = key_phrase_ids.masked_fill( key_phrase_ids==self.tokenizer.keyphrase_start_token_id.to(key_phrase_ids.device),
+                                                         self.config.pad_values['key_phrase_ids'] )
+                #kp_cands = key_phrase_ids
+                ul_loss_context = self._compute_token_level_unlikelihood_loss_context(    
+                                    shift_lm_logits, shift_labels, kp_cands, 
+                                    tkn_pad_idx=self.config.pad_values['input_ids_utt'],
+                                    prev_context_len = self.config.prev_context_len,
+                                    loss_scale=self.ull_weight_context )
+
+                loss +=  ul_loss_context
+
 
         if not return_dict:
             raise NotImplementedError("return dict")
@@ -1038,7 +1066,7 @@ class RSTGPT2(DegenerateLossMixin, RstModelMixin, GPT2LMHeadModel):
         parser.add_argument('--embed_kp_pdrop',type=float, default=0.1, help="We drop specific indices from embedding")
         parser.add_argument('--embed_rst_pdrop',type=float, default=0.1, help="We drop specific indices from embedding")
 
-        parser.add_argument('--ull_loss_tkn', default=False, action='store_true')
+        parser.add_argument('--ull_loss_tkn', default=False, action='store_true', help='ull loss on words that appear in the keyphrases' )
         parser.add_argument('--prev_context_len', type=int, default=0, help="lookback length for ull token loss")
 
         parser.add_argument('--label_smoothing', type=float, default=0.1, help="")
@@ -2791,6 +2819,7 @@ if __name__ == '__main__':
 ##New codes
 #  CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --label_smoothing 0.0 --batch_size 8 --version 33 --workers 8 --max_len_utt 272 --max_rst_level 22 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss"
 #  CUDA_VISIBLE_DEVICES=3,4 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --label_smoothing 0.0 --batch_size 8 --version 34 --workers 8 --max_len_utt 272 --max_rst_level 22 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention"
+#  CUDA_VISIBLE_DEVICES=1,2 python3 train_RSTGPT.py --gpu_nodes 1 --gpus 2 --label_smoothing 0.05 --batch_size 8 --version 1 --workers 8 --max_len_utt 272 --max_rst_level 22 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --ull_loss_kp --ull_loss_context_len 12 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention"
 
 # python3 train_RSTGPT.py --tpu_cores 1 --tpu_nodes 1 --static_graph_optim  --batch_size 12 --version 41 --workers 6 --max_len_utt 272 --max_rst_level 64 --max_len_kp 64 --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss" --max_rst_level 22 --label_smoothing 0.1
 # python3 train_RSTGPT.py --tpu_cores 1 --tpu_nodes 1 --static_graph_optim  --batch_size 12 --version 42 --workers 6 --max_len_utt 272 --max_len_rst 64 --max_len_kp 64 --rst_tree_aligned_attention --rst_segment_method segbot --ull_loss_tkn --prev_context_len 0 --scale_grad_by_freq --val_check_interval 0.33 --tag "RSTGPT2 with regularisation, unlikelihood loss, aligned attention" --max_rst_level 22 --label_smoothing 0.0
