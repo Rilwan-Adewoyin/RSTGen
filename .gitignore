@@ -14,6 +14,7 @@ src/DialogueAct/__pycache__/utils.cpython-38.pyc
 src/DialogueAct/log
 src/DialogueAct/cache/*
 src/DialogueAct/cachedata
+
 #NLG
 src/NLG/dataset/*
 src/NLG/dataset_v2/*
@@ -32,7 +33,7 @@ src/Dyploc/*
 src/GRUEN/*
 src/pair-emnlp2020/*
 
-src/NLG/Archived
+src/Archived
 
 src/.ipynb_checkpoints
 *bash.exe.stackdump
@@ -44,7 +45,6 @@ src/.ipynb_checkpoints
 *vscode
 *vscode/launch.json
 *vscode/settings.json
-*src*
 *temp*
 
 models/*
