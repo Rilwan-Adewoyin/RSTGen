@@ -13,7 +13,7 @@ I provided the post-processed dataset we created below. This downloads RST-Annot
 ```python .data/download_data.py```
 
 This script will download all the files from the shared [Google Drive link](https://drive.google.com/drive/folders/1seqNux3ycMLl-FMqbDRa3F5LhP7r61vG?usp=sharing). 
-The files, which are compressed with .tar.gz compression, will be saved to the local directory `./data/data_files`.
+The files, which are compressed with .tar.gz compression, will be decompressed and saved to the local directory `./data/data_files`.
 
 Training:
 ---------
