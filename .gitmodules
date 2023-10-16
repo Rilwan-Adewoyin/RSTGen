@@ -1,11 +1,11 @@
-[submodule "rl_conv/pretrain/Switchboard-Corpus"]
-	path = rl_conv/pretrain/Switchboard-Corpus
+[submodule "src/Switchboard-Corpus"]
+	path = src/Switchboard-Corpus
 	url = git@github.com:Akanni96/Switchboard-Corpus.git
 	
-[submodule "rl_conv/pretrain/MRDA-Corpus"]
-	path = rl_conv/pretrain/MRDA-Corpus
+[submodule "src/MRDA-Corpus"]
+	path = src/MRDA-Corpus
 	url = git@github.com:NathanDuran/MRDA-Corpus.git
 
-[submodule "rl_conv/pretrain/DockerImages/feng_hirst_rst_parser"]
-	path = rl_conv/pretrain/DockerImages/feng_hirst_rst_parser
+[submodule "src/DockerImages/feng_hirst_rst_parser"]
+	path = src/DockerImages/feng_hirst_rst_parser
 	url = git@github.com:Akanni96/feng-hirst-rst-parser.git
