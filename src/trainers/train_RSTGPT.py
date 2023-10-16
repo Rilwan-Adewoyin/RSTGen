@@ -12,8 +12,8 @@ os.environ['TOKENIZERS_PARALLELISM'] = "true"
 
 from transformers.utils import logging
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
-from utils_nlg_v3 import EmbeddingRstPos, RstModelMixin, DegenerateLossMixin, RstTokenizerMixin, TQDMProgressBar_1, _format_checkpoint_name
-import utils_nlg_v3 as utils
+from rst_frameworks.utils import EmbeddingRstPos, RstModelMixin, DegenerateLossMixin, RstTokenizerMixin, TQDMProgressBar_1, _format_checkpoint_name
+from rst_frameworks import utils
 import operator
 import functools
 import string
@@ -44,7 +44,7 @@ from pytorch_lightning.plugins import DDPPlugin, TPUSpawnPlugin
 from sklearn.preprocessing import LabelEncoder
 
 from torch.nn import CrossEntropyLoss
-# from utils_nlg_v3 import CrossEntropyLoss
+# from rst_frameworks.utils import CrossEntropyLoss
 
 from torch import logsumexp
 from transformers import GPT2Config, GPT2TokenizerFast
@@ -63,15 +63,15 @@ import pytorch_lightning as pl
 T_co = TypeVar('T_co', covariant=True)
 
 mp1 = os.path.abspath(os.path.join('..'))
-mp2 = "../DockerImages/feng_hirst_rst_parser"
-mp3 = "../DockerImages/feng_hirst_rst_parser/src"
-mp4 = "../DockerImages/feng_hirst_rst_parser/model"
+mp2 = "../feng_hirst_rst_parser"
+mp3 = "../feng_hirst_rst_parser/src"
+mp4 = "../feng_hirst_rst_parser/model"
 modules_paths = [mp1, mp2, mp3, mp4]
 for path_ in modules_paths:
     if path_ not in sys.path:
         sys.path.append(path_)
         
-from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
+from feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
 logger = logging.get_logger(__name__)
 from nltk.tokenize.treebank import TreebankWordDetokenizer
@@ -79,7 +79,7 @@ from nltk.tokenize.treebank import TreebankWordDetokenizer
 from torch import nn
 from transformers.modeling_utils import Conv1D
 
-from utils_nlg_v3 import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
+from rst_frameworks.utils import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype):
     """

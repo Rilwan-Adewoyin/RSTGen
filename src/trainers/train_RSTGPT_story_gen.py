@@ -3,8 +3,8 @@ import os
 os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
 os.environ['TOKENIZERS_PARALLELISM'] = "true"
 
-import train_RSTGPT
-from train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
+from trainers import train_RSTGPT
+from trainers.train_RSTGPT import RSTGPT2, RSTGPT2_Config, RSTTokenizer, RSTGPT2_TrainingModule
 
 import string
 import argparse
@@ -41,8 +41,8 @@ from transformers.optimization import Adafactor, AdafactorSchedule, AdamW
 from transformers.tokenization_utils_base import AddedToken
 import transformers
 
-import utils_nlg_v3 as utils
-from utils_nlg_v3 import mpatch_save_model
+from rst_frameworks import utils
+from rst_frameworks.utils import mpatch_save_model
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 
 from torch.nn.modules.batchnorm import _BatchNorm
@@ -51,9 +51,9 @@ from torch.nn.modules.batchnorm import _BatchNorm
 T_co = TypeVar('T_co', covariant=True)
 
 mp1 = os.path.abspath(os.path.join('..'))
-mp2 = "../DockerImages/feng_hirst_rst_parser"
-mp3 = "../DockerImages/feng_hirst_rst_parser/src"
-mp4 = "../DockerImages/feng_hirst_rst_parser/model"
+mp2 = "../feng_hirst_rst_parser"
+mp3 = "../feng_hirst_rst_parser/src"
+mp4 = "../feng_hirst_rst_parser/model"
 modules_paths = [mp1, mp2, mp3, mp4]
 from nltk.tokenize.treebank import TreebankWordDetokenizer
 

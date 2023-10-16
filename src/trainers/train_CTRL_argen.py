@@ -35,11 +35,11 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 import pickle
 
 import argparse
-import utils_nlg_v3 as utils
+from rst_frameworks import utils
 import random 
 from typing import TypeVar, Iterator
 T_co = TypeVar('T_co', covariant=True)
-from utils_nlg_v3 import EmbeddingRstPos, mpatch_save_model, SaveModelCallBack
+from rst_frameworks.utils import EmbeddingRstPos, mpatch_save_model, SaveModelCallBack
 
 from torch.utils.data.sampler import Sampler
 from torch.utils.data.dataset import Dataset

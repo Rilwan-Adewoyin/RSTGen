@@ -19,20 +19,10 @@ import traceback
 import syntok.segmenter as segmenter
 
 # Docker Images Parser and RST tree labeller
-mp1 = os.path.abspath(os.path.join('..'))
-mp2 = "../DockerImages/feng_hirst_rst_parser"
-mp3 = "../DockerImages/feng_hirst_rst_parser/src"
-mp4 = "../DockerImages/feng_hirst_rst_parser/model"
-modules_paths = [mp1, mp2, mp3, mp4]
+from feng_hirst_rst_parser.src import parser_wrapper3
+from feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
-for path_ in modules_paths:
-    if path_ not in sys.path:
-        sys.path.append(path_)
-
-from DockerImages.feng_hirst_rst_parser.src import parser_wrapper3
-from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
-
-from utils_nlg_v3 import non_parseable_remover, edu_fixer, position_edus, _tree_to_rst_code, _parse_trees
+from rst_frameworks.utils import non_parseable_remover, edu_fixer, position_edus, _tree_to_rst_code, _parse_trees
 from pair_repo.compute_topic_signatures import TopicSignatureConstruction
 
 import string
@@ -63,7 +53,7 @@ def main( batch_process_size = 10, mp_count=1 ):
     #     # "train":['dyploc_pair_rst'],
     # }
 
-    dir_sourcedset = "./dataset_cmv/dyploc"
+    dir_sourcedset = ".data_files/dataset_cmv/dyploc"
     
     batch_size = batch_process_size
     
@@ -97,43 +87,19 @@ def main( batch_process_size = 10, mp_count=1 ):
                 _a =  pool.imap( preprocess , _chunks(batch_li_records, cs) )
                 res_1, res_2  = tee( _a , 2)
                 
-                # res_dyploc_to_ctrl = pool.imap( convert_dyploc_to_ctrl, res_1  )
-
-                # #imap paths: 
-                #     # nlg: rst_tree_parse_records, dyploc_to_nlg
-                #     # pair: salience_keywords_parse,  dyploc_to_pair
-                #     # nlg_pair: rst_tree_parse_records, salience_keywords_parse, dyploc_to_pair_nlg
-                #     # ctrl: convert_dyploc_to_ctrl
-
                 # # setting up imap pipes
                 _b = pool.imap( salience_keywords_parse, res_2)
                 rrs_1, rrs_2 = tee( _b, 2 )
                 
                 res_dyploc_to_pair = pool.imap( convert_dyploc_to_pair, rrs_2 )
                 
-                # res_rst_edu = pool.imap( rst_tree_parse_records, rrs_1)
-                
-                # res_rst_skw_edu = pool.imap( non_parseable_remover, res_rst_edu ) # removing text with grammar so bad that it can not be parsed properly                
-                # _c = pool.imap( position_edus, res_rst_skw_edu)
-                # rrse_1, rrse_2 = tee(_c, 2)
-
-                # res_dyploc_to_rst = pool.imap( convert_dyploc_to_rst, rrse_1 )
-                # res_dyploc_to_pair_rst = pool.imap( convert_dyploc_to_pair_rst, rrse_2  )
-                
                 # getting results
                 dict_li_records = {}
 
-                # if "dyploc_ctrl" in model_formats:
-                #     dict_li_records['dyploc_ctrl'] = sum( list(res_dyploc_to_ctrl), [] )  
-                                    
-                # if "dyploc_rst" in model_formats:
-                #     dict_li_records['dyploc_rst'] = sum( list(res_dyploc_to_rst), [] )
                                                             
                 if "dyploc_pair" in model_formats:
                     dict_li_records['dyploc_pair'] = sum( list(res_dyploc_to_pair), [] ) 
 
-                # if "dyploc_pair_rst" in model_formats:
-                #     dict_li_records['dyploc_pair_rst']= sum( list(res_dyploc_to_pair_rst), [] )
                 
             #saving
             for m_format in model_formats :
@@ -501,8 +467,6 @@ def pair_template_maker(  kp_plan_str, reference, tokenizer ):
 
         li_kp_str = kp_plan_str.split(' <s>') #words must have space at the front
                    
-        # reference_tokenized = tokenizer.encode( ' '+reference.lower().translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
-        # reference_tokenized = tokenizer.encode( ' '+reference.translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
         reference_tokenized = tokenizer.encode( reference.translate(str.maketrans('', '', string.punctuation)) , add_special_tokens=False )
 
         kp_plan_str_tokenized = tokenizer.batch_encode_plus( li_kp_str,  add_special_tokens=False )['input_ids']

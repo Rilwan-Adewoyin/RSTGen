@@ -33,21 +33,12 @@ import traceback
 from transformers import GPT2TokenizerFast
 from filelock import Timeout, FileLock
 
-# Docker Images Parser and RST tree labeller
-mp1 = os.path.abspath(os.path.join('..'))
-mp2 = "../DockerImages/feng_hirst_rst_parser"
-mp3 = "../DockerImages/feng_hirst_rst_parser/src"
-mp4 = "../DockerImages/feng_hirst_rst_parser/model"
-modules_paths = [mp1, mp2, mp3, mp4]
 
-for path_ in modules_paths:
-    if path_ not in sys.path:
-        sys.path.append(path_)
 import utils_data_setup
 from utils_data_setup import parse_rst_tree, textrank_extractor, position_edus, _parse_trees
 
-from utils_nlg_v3 import non_parseable_remover, _tree_to_rst_code, _parse_trees
-from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
+from rst_frameworks.utils import non_parseable_remover, _tree_to_rst_code, _parse_trees
+from feng_hirst_rst_parser.src.parse2 import DiscourseParser
 import time
 
 import logging

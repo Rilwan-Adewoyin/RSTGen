@@ -6,7 +6,7 @@ import regex as re
     
 # clearning change my view dataset
 def main():
-    dir_data = "./dataset_cmv/"
+    dir_data = ".data/data_files/dataset_cmv/"
     li_fps = glob.glob(os.path.join( dir_data, "nlg*","train","*") ) + \
                 glob.glob(os.path.join( dir_data, "nlg*","val","*") ) +\
                 glob.glob(os.path.join( dir_data, "nlg*","test","*") )

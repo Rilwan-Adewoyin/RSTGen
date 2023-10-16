@@ -49,8 +49,8 @@ from transformers.models.bart.modeling_bart import (
 from transformers.optimization import AdafactorSchedule
 from transformers.tokenization_utils_base import AddedToken
 import string
-import utils_nlg_v3 as utils
-from utils_nlg_v3 import EmbeddingRstPos, RstModelMixin
+from rst_frameworks import utils
+from rst_frameworks.utils import EmbeddingRstPos, RstModelMixin
 
 import torch_optimizer as optim
 import functools
@@ -59,19 +59,19 @@ import operator
 T_co = TypeVar('T_co', covariant=True)
 import sys
 
-from utils_nlg_v3 import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
+from rst_frameworks.utils import SizedOrderedBatchSampler,SizedOrderedDistributedBatchSampler
 
 mp1 = os.path.abspath(os.path.join('..'))
-mp2 = "../DockerImages/feng_hirst_rst_parser"
-mp3 = "../DockerImages/feng_hirst_rst_parser/src"
-mp4 = "../DockerImages/feng_hirst_rst_parser/model"
+mp2 = "../feng_hirst_rst_parser"
+mp3 = "../feng_hirst_rst_parser/src"
+mp4 = "../feng_hirst_rst_parser/model"
 modules_paths = [mp1, mp2, mp3, mp4]
 
 for path_ in modules_paths:
     if path_ not in sys.path:
         sys.path.append(path_)
 
-from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
+from feng_hirst_rst_parser.src.parse2 import DiscourseParser
 import contextlib
 from seg_bot_segmenter import Segmenter, Lang, PointerNetworks
 

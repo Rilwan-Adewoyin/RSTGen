@@ -37,7 +37,7 @@ src/Archived
 
 src/.ipynb_checkpoints
 *bash.exe.stackdump
-*.ipynb
+# *.ipynb
 *temp.py
 *.ipynb_checkpoints
 *_pycache_*

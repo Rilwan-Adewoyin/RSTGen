@@ -23,10 +23,10 @@ from typing import List,Dict
 import json
 import contextlib
 
-from DockerImages.feng_hirst_rst_parser.src.parse2 import DiscourseParser
+from feng_hirst_rst_parser.src.parse2 import DiscourseParser
 
 import nltk
-from utils_nlg_v3 import RstTokenizerMixin, tree_order_func
+from rst_frameworks.utils import RstTokenizerMixin, tree_order_func
 from pair_repo.compute_topic_signatures import TopicSignatureConstruction
 import re
 import string
