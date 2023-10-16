@@ -4,7 +4,7 @@
 */[Dd]ataset/*
 
 #DialogueAct
-rl_conv/pretrain/DialogueAct/combined_data
+rl_conv/pretrain/DialogueAct/combined_data*
 rl_conv/pretrain/DialogueAct/MRDA-Corpus
 rl_conv/pretrain/DialogueAct/Switchboard-Corpus
 rl_conv/pretrain/DialogueAct/MIDAS-Corpus
@@ -13,12 +13,26 @@ rl_conv/pretrain/DialogueAct/models/*
 rl_conv/pretrain/DialogueAct/__pycache__/utils.cpython-38.pyc
 rl_conv/pretrain/DialogueAct/log
 rl_conv/pretrain/DialogueAct/cache/*
-
+rl_conv/pretrain/DialogueAct/cachedata
 #NLG
 rl_conv/pretrain/NLG/dataset/*
+rl_conv/pretrain/NLG/dataset_v2/*
+rl_conv/pretrain/NLG/dataset*
+rl_conv/pretrain/NLG/Evaluation/*
 rl_conv/pretrain/NLG/dataset_opensubs
+rl_conv/pretrain/NLG/dataset_*
+rl_conv/pretrain/NLG/dataset*
 rl_conv/pretrain/NLG/models
+rl_conv/pretrain/NLG/tokenizers
 rl_conv/pretrain/NLG/models/*
+rl_conv/pretrain/NLG/RST_sampler/*
+rl_conv/pretrain/NLG/RSTMarkov/*
+
+rl_conv/pretrain/Dyploc/*
+rl_conv/pretrain/GRUEN/*
+rl_conv/pretrain/pair-emnlp2020/*
+
+rl_conv/pretrain/NLG/Archived
 
 rl_conv/pretrain/.ipynb_checkpoints
 *bash.exe.stackdump
@@ -31,6 +45,9 @@ rl_conv/pretrain/.ipynb_checkpoints
 *vscode/launch.json
 *vscode/settings.json
 *src*
+*temp*
+
+models/*
 
 
 .vscode/launch.json
