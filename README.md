@@ -21,7 +21,7 @@ This is the supporting repository for the paper: [RSTGen: Imbuing Fine-Grained I
    conda activate rstgen
    ```
 
-## Data Download
+## Dataset
 I provided the post-processed dataset we created below. This downloads RST-Annotated texts across multiple sub-reddits:
 
 1. To download the necessary data files, run the `download_data.py` script:
