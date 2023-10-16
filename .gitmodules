@@ -6,6 +6,6 @@
 	path = src/MRDA-Corpus
 	url = git@github.com:NathanDuran/MRDA-Corpus.git
 
-[submodule "src/DockerImages/feng_hirst_rst_parser"]
-	path = src/DockerImages/feng_hirst_rst_parser
+[submodule "src/feng_hirst_rst_parser"]
+	path = src/feng_hirst_rst_parser
 	url = git@github.com:Akanni96/feng-hirst-rst-parser.git
