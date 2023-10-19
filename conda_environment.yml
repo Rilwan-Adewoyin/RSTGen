@@ -275,4 +275,3 @@ dependencies:
       - wrapt==1.12.1
       - yarl==1.6.3
       - zipp==3.4.1
-prefix: /home/akann1w0w1ck/miniconda3/envs/rstgen
